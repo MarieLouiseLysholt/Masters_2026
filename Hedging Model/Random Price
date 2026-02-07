@@ -1,0 +1,51 @@
+import numpy as np
+
+np.random.seed(42)
+
+# Parameters
+crop_price = 200          # EUR per ton
+base_yield = 7.5          # tons per hectare
+temp_mean = 22            # average temperature in celsius
+temp_std = 4              # temperature variability
+temp_damage = 30          # temperature above which yield drops
+strike = 26               # derivative pays above this temperature
+tick = 75                 # EUR paid per degree above strike
+premium = 100             # cost of the derivative
+n_sims = 10000
+
+# Simulate temperatures
+temp = np.random.normal(temp_mean, temp_std, n_sims)
+
+# Calculate yield (drops when temperature exceeds damage threshold)
+yields = np.where(
+    temp <= temp_damage,
+    base_yield,
+    base_yield * np.maximum(1 - 0.1 * (temp - temp_damage), 0)
+)
+
+# Calculate revenue
+revenue = yields * crop_price
+
+# Calculate derivative payoff (pays when hot)
+payoff = np.maximum(tick * (temp - strike), 0)
+
+# Calculate optimal hedge ratio
+cov = np.cov(revenue, payoff)[0, 1]
+var_payoff = np.var(payoff)
+h = -cov / var_payoff
+
+# Calculate hedged revenue
+hedged = revenue + h * (payoff - premium)
+
+# Results
+print("Unhedged")
+print(f"  Mean: {np.mean(revenue):.2f} EUR")
+print(f"  Std dev: {np.std(revenue):.2f} EUR")
+
+print("\nHedged")
+print(f"  Mean: {np.mean(hedged):.2f} EUR")
+print(f"  Std dev: {np.std(hedged):.2f} EUR")
+
+print("\nHedge details")
+print(f"  Hedge ratio: {h:.4f}")
+print(f"  Variance reduction: {(1 - np.var(hedged)/np.var(revenue))*100:.2f}%")
