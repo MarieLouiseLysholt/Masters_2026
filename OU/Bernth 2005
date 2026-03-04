@@ -1,0 +1,480 @@
+"""
+Replication of Benth & Saltyte-Benth (2007):
+"The Volatility of Temperature and Pricing of Weather Derivatives"
+Quantitative Finance, 7(5), 553-561.
+
+Model (eq. 1):
+    dT(t) = ds(t) - kappa*(T(t) - s(t)) dt + sigma(t) dB(t)
+
+Discrete-time equivalent for estimation (eq. 5):
+    T~_{t+1} = alpha * T~_t + e~(t) * eps_t,   T~_t := T_t - s_t
+
+Seasonality s(t) (eq. 2, with I1=0, J1=1 as in paper):
+    s(t) = a + b*t + b1*cos(2*pi*(t - g1)/365)
+
+Variance sigma^2(t) (eq. 3, with I2=J2=4 as in paper):
+    sigma^2(t) = c + sum_i c_i*sin(2*i*pi*t/365) + sum_j d_j*cos(2*j*pi*t/365)
+
+Residuals: i.i.d. standard normal (Brownian motion, not Levy).
+The 2007 paper explicitly restricts to BM for analytical tractability.
+"""
+
+import numpy as np
+import pandas as pd
+from scipy import stats, optimize
+from scipy.stats import chi2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import warnings, pickle
+warnings.filterwarnings("ignore")
+
+np.random.seed(42)
+
+
+# ── Data loading ─────────────────────────────────────────────────────────────
+
+raw    = pd.read_csv("EDA/region_avg_knn_weighted.csv", parse_dates=["date"])
+df_raw = (raw[raw["region_code"] == 11]
+            .set_index("date")
+            .rename(columns={"daily_avg_temperature_knn_weighted": "T"})
+            [["T"]]
+            .dropna())
+# Remove Feb 29 -- paper p.554: "29 February was removed from the sample"
+df_raw = df_raw[~((df_raw.index.month == 2) & (df_raw.index.day == 29))].dropna().copy()
+df_raw["t"] = np.arange(len(df_raw))
+
+# Calibration cutoff: parameters estimated on 2000-2014 only to avoid
+# look-ahead bias when backtesting 2015-2024 in model_comparison.py.
+CALIB_END = "2014-12-31"
+df_calib  = df_raw.loc[:CALIB_END].copy()
+
+print(f"Full data:  N = {len(df_raw):,} obs  ({df_raw.index[0].date()} to {df_raw.index[-1].date()})")
+print(f"Calib data: N = {len(df_calib):,} obs  ({df_calib.index[0].date()} to {df_calib.index[-1].date()})")
+print(f"T (calib): mean={df_calib['T'].mean():.2f}C  std={df_calib['T'].std():.2f}C  "
+      f"range=[{df_calib['T'].min():.1f}, {df_calib['T'].max():.1f}]C")
+
+
+# ── Section 3 -- Seasonality s(t) ────────────────────────────────────────────
+# eq. 2 with I1=0, J1=1  =>  s(t) = a + b*t + b1*cos(2*pi*(t-g1)/365)
+# This is the specification the paper fits to Stockholm (p.555):
+#   a=6.38, b=0.0001, b1=-10.44, g1=154.76
+# The linear trend b*t is the key addition vs. the 2005 paper.
+
+def seasonal_func(t, a, b, b1, g1):
+    return a + b * t + b1 * np.cos(2 * np.pi * (t - g1) / 365)
+
+T_vals = df_calib["T"].values
+t_vals = df_calib["t"].values
+
+popt, _ = optimize.curve_fit(
+    seasonal_func, t_vals, T_vals,
+    p0=[T_vals.mean(), 1e-4, -8.0, 150.0],
+    maxfev=50000
+)
+a_est, b_est, b1_est, g1_est = popt
+
+df_calib["s"] = seasonal_func(t_vals, *popt)
+df_calib["X"] = df_calib["T"] - df_calib["s"]   # de-trended, de-seasonalised
+
+print(f"\n# Seasonality (eq. 2, I1=0, J1=1)")
+print(f"  a={a_est:.4f}C  b={b_est:.6f}C/day  b1={b1_est:.4f}C  g1={g1_est:.4f} days")
+warming_per_decade = b_est * 365 * 10
+print(f"  Implied warming trend: {warming_per_decade:.3f}C per decade")
+
+
+# ── AR(1) on de-trended, de-seasonalised temperature X_t ─────────────────────
+# eq. 5: T~_{t+1} = alpha * T~_t + e~(t)*eps_t
+# alpha estimated by OLS without intercept (paper: "constant was insignificant")
+
+X     = df_calib["X"].values
+X_lag = X[:-1]
+X_cur = X[1:]
+
+alpha_est = np.dot(X_lag, X_cur) / np.dot(X_lag, X_lag)
+kappa_est = -np.log(alpha_est)          # continuous-time mean-reversion speed
+half_life = np.log(2) / kappa_est
+eps_raw   = X_cur - alpha_est * X_lag
+r2_reg    = 1 - np.sum(eps_raw**2) / np.sum((X_cur - X_cur.mean())**2)
+
+print(f"\n# AR(1) (eq. 5)")
+print(f"  alpha={alpha_est:.4f}  kappa={kappa_est:.4f}  half-life={half_life:.1f} days  R2={r2_reg:.4f}")
+
+df_res           = df_calib.iloc[1:].copy()
+df_res["eps"]    = eps_raw
+df_res["eps_sq"] = eps_raw ** 2
+
+
+# ── Section 3 -- Seasonal variance sigma^2(t) ────────────────────────────────
+# eq. 3 with I2=J2=4:
+#   sigma^2(t) = c + sum_{i=1}^{4} c_i*sin(2*i*pi*t/365)
+#                  + sum_{j=1}^{4} d_j*cos(2*j*pi*t/365)
+#
+# Estimation procedure (paper p.555):
+#   Step 1: compute empirical daily variance from eps^2 grouped by DOY (365 values)
+#   Step 2: fit the truncated Fourier series via least squares (nlinfit in MATLAB)
+# The paper constrains the function to be bounded away from zero.
+
+def doy_no_leap(date_idx):
+    """DOY 1-365 with Feb 29 removed: shift leap-year dates from March onward back by 1."""
+    doys = []
+    for d in date_idx:
+        yd      = d.timetuple().tm_yday
+        is_leap = (d.year % 4 == 0) and (d.year % 100 != 0 or d.year % 400 == 0)
+        if d.month > 2 and is_leap:
+            yd -= 1
+        doys.append(max(1, min(365, yd)))
+    return np.array(doys)
+
+df_res["doy"] = doy_no_leap(df_res.index)
+
+doy_idx      = np.arange(1, 366)
+avg_eps2_doy = np.array([
+    df_res.loc[df_res["doy"] == d, "eps_sq"].mean()
+    if (df_res["doy"] == d).any() else np.nan
+    for d in doy_idx
+])
+avg_eps2_doy = pd.Series(avg_eps2_doy).interpolate(method="linear", limit_direction="both").values
+
+# Truncated Fourier series for sigma^2(t) -- eq. 3, I2=J2=4
+def sigma2_fourier(t, c, c1, c2, c3, c4, d1, d2, d3, d4):
+    val = c
+    for i, ci in enumerate([c1, c2, c3, c4], start=1):
+        val = val + ci * np.sin(2 * i * np.pi * t / 365)
+    for j, dj in enumerate([d1, d2, d3, d4], start=1):
+        val = val + dj * np.cos(2 * j * np.pi * t / 365)
+    return val
+
+# Initial guess: constant = mean variance, all Fourier terms = 0
+p0_sigma2 = [avg_eps2_doy.mean()] + [0.0] * 8
+
+try:
+    popt_s2, _ = optimize.curve_fit(
+        sigma2_fourier, doy_idx, avg_eps2_doy,
+        p0=p0_sigma2, maxfev=100000
+    )
+except RuntimeError:
+    print("  WARNING: sigma2 curve_fit did not converge; falling back to p0.")
+    popt_s2 = np.array(p0_sigma2)
+
+# Evaluate on doy_idx; clip to small positive value (paper: "bounded away from zero")
+sigma2_doy_fit = np.maximum(sigma2_fourier(doy_idx, *popt_s2), 1e-4)
+sigma_doy      = np.sqrt(sigma2_doy_fit)
+
+(c_est, c1_est, c2_est, c3_est, c4_est,
+ d1_est, d2_est, d3_est, d4_est) = popt_s2
+
+print(f"\n# Seasonal variance sigma^2(t) (eq. 3, I2=J2=4)")
+print(f"  c={c_est:.4f}  "
+      f"c1={c1_est:.4f}  c2={c2_est:.4f}  c3={c3_est:.4f}  c4={c4_est:.4f}")
+print(f"  d1={d1_est:.4f}  d2={d2_est:.4f}  d3={d3_est:.4f}  d4={d4_est:.4f}")
+print(f"  sigma range: [{sigma_doy.min():.3f}, {sigma_doy.max():.3f}]C  "
+      f"winter/summer ratio: {sigma_doy[:60].mean() / sigma_doy[150:250].mean():.2f}x")
+
+df_res["sigma"] = df_res["doy"].map(dict(zip(doy_idx, sigma_doy)))
+df_res["e"]     = df_res["eps"] / df_res["sigma"]   # standardised residuals
+
+
+# ── Residual distribution -- Normal test + NIG fit (Levy process) ────────────
+# The 2007 paper uses BM (normal residuals) for analytical tractability, but
+# acknowledges normality is rejected. We additionally fit NIG as in the 2005
+# paper so that the Levy-driven version can be compared against the BM version.
+
+from scipy.stats import norminvgauss
+
+e = df_res["e"].dropna().values
+e_mean, e_std = e.mean(), e.std()
+
+def pearson_chi2_normality(data, n_bins=50):
+    mu, s  = data.mean(), data.std()
+    edges  = stats.norm.ppf(np.linspace(0, 1, n_bins + 1), mu, s)
+    edges[0], edges[-1] = -np.inf, np.inf
+    obs, _ = np.histogram(data, bins=edges)
+    exp    = np.full(n_bins, len(data) / n_bins)
+    mask   = exp > 0
+    stat   = np.sum((obs[mask] - exp[mask])**2 / exp[mask])
+    p_val  = 1 - chi2.cdf(stat, mask.sum() - 3)
+    return float(stat), float(p_val)
+
+chi2_stat, chi2_pval = pearson_chi2_normality(e)
+
+print(f"\n# Residual distribution -- Normal test (Section 3 / eq. 5)")
+print(f"  mean={e_mean:.4f}  std={e_std:.4f}")
+print(f"  skewness={stats.skew(e):.4f}  excess kurtosis={stats.kurtosis(e):.4f}")
+print(f"  Pearson chi2: stat={chi2_stat:.2f}  p={chi2_pval:.4f}  "
+      f"-> Normal {'REJECTED' if chi2_pval < 0.05 else 'not rejected'} at 5%")
+print(f"  (Paper acknowledges rejection but retains normal for pricing tractability)")
+
+# NIG fit -- retained from 2005 model for Levy process comparison
+nig_params                        = norminvgauss.fit(e)
+a_nig, b_nig, loc_nig, scale_nig = nig_params
+
+ll_nig   = np.sum(norminvgauss.logpdf(e, *nig_params))
+ll_norm  = np.sum(stats.norm.logpdf(e, e_mean, e_std))
+aic_nig  = -2 * ll_nig  + 2 * 4
+aic_norm = -2 * ll_norm + 2 * 2
+aic_improvement = aic_norm - aic_nig
+
+ks_p_nig  = stats.kstest(e, lambda x: norminvgauss.cdf(x, *nig_params)).pvalue
+ks_p_norm = stats.kstest(e, lambda x: stats.norm.cdf(x, e_mean, e_std)).pvalue
+
+print(f"\n# NIG fit (Levy process, retained from 2005 for comparison)")
+print(f"  a={a_nig:.4f}  b={b_nig:.4f}  loc={loc_nig:.4f}  scale={scale_nig:.4f}")
+print(f"  AIC: NIG={aic_nig:.1f}  Normal={aic_norm:.1f}  DAIC={aic_improvement:.1f}"
+      f"  -> {'NIG preferred' if aic_improvement > 0 else 'Normal preferred'}")
+print(f"  KS p-value: NIG={ks_p_nig:.4f}  Normal={ks_p_norm:.4f}")
+
+
+# ── Hurst exponent ────────────────────────────────────────────────────────────
+
+def estimate_hurst(data, min_bins=10):
+    n   = len(data)
+    Ks  = np.unique(np.logspace(0.5, np.log10(n // min_bins), 40).astype(int))
+    res = []
+    for K in Ks:
+        N_bins = n // K
+        if N_bins < min_bins:
+            continue
+        Xi  = data[:N_bins * K].reshape(N_bins, K).mean(axis=1)
+        f_K = np.sqrt(np.mean(Xi**2))
+        if f_K > 0:
+            res.append((np.log(K), np.log(f_K)))
+    if len(res) < 5:
+        return None, None
+    log_K, log_f = zip(*res)
+    slope, _, r_val, _, _ = stats.linregress(log_K, log_f)
+    return 1 + slope, r_val**2
+
+H_est, r2_hurst = estimate_hurst(df_calib["X"].values)
+
+print(f"\n# Hurst exponent")
+print(f"  H={H_est:.4f}  R2={r2_hurst:.4f}")
+
+
+# ── ACF diagnostics ───────────────────────────────────────────────────────────
+
+def compute_acf(x, max_lag):
+    n, xc = len(x), x - x.mean()
+    return np.array([
+        np.dot(xc[:n-k], xc[k:]) / np.dot(xc, xc) if k > 0 else 1.0
+        for k in range(max_lag + 1)
+    ])
+
+MAX_LAG  = 100
+ci_bound = 1.96 / np.sqrt(len(eps_raw))
+
+acf_eps2 = compute_acf(eps_raw**2, MAX_LAG)
+acf_e2   = compute_acf(e**2,       MAX_LAG)
+
+n_sig_eps2 = np.sum(np.abs(acf_eps2[1:]) > ci_bound)
+n_sig_e2   = np.sum(np.abs(acf_e2[1:])   > ci_bound)
+
+print(f"\n# ACF diagnostics (Figure 5 in paper)")
+print(f"  Lags outside 95% CI:  eps2={n_sig_eps2}/{MAX_LAG}  ->  e2={n_sig_e2}/{MAX_LAG}")
+print(f"  -> Seasonal sigma(t) {'removes' if n_sig_e2 < n_sig_eps2 // 2 else 'partially reduces'} "
+      f"squared-residual autocorrelation.")
+
+
+# ── Model summary ─────────────────────────────────────────────────────────────
+
+print(f"\n# Model summary  [Benth & Saltyte-Benth 2007 + Levy extension]")
+print(f"  s(t) = {a_est:.4f} + {b_est:.6f}*t + ({b1_est:.4f})*cos(2*pi*(t - {g1_est:.1f})/365)")
+print(f"  alpha={alpha_est:.4f}  kappa={kappa_est:.4f}  half-life={half_life:.1f} days")
+print(f"  sigma^2(t): truncated Fourier, I2=J2=4  range=[{sigma_doy.min():.3f}, {sigma_doy.max():.3f}]C")
+print(f"  Noise (BM):  i.i.d. N(0,1)")
+print(f"  Noise (Levy): NIG(a={a_nig:.4f}, b={b_nig:.4f}, loc={loc_nig:.4f}, scale={scale_nig:.4f})")
+print(f"  H={H_est:.3f}")
+
+
+# ── Save model ────────────────────────────────────────────────────────────────
+
+model = {
+    # Seasonality
+    "a": a_est, "b": b_est, "b1": b1_est, "g1": g1_est,
+    # For backward compat with comparison script (a0 = intercept, a1 = amplitude, t0 = phase)
+    "a0": a_est, "a1": b1_est, "t0": g1_est,
+    # AR(1)
+    "alpha": alpha_est, "k": kappa_est, "half_life": half_life,
+    # Variance -- both the fitted DOY array and the Fourier parameters
+    "sigma_doy": sigma_doy, "doy_idx": doy_idx,
+    "sigma2_params": popt_s2,   # (c, c1..c4, d1..d4)
+    # Noise models -- NIG retained for Levy comparison, Normal is 2007 baseline
+    "nig_params": nig_params,   # NIG(a, b, loc, scale) for Levy-driven simulation
+    # Diagnostics
+    "H": H_est, "r2_hurst": r2_hurst,
+    # Data
+    "df": df_raw,
+    "df_calib": df_calib,
+    "df_res": df_res,
+    # Metadata
+    "model_name": "Benth (2007)",
+    "region_code": 11,
+    "calib_end": CALIB_END,
+}
+
+with open("ou_levy_model.pkl", "wb") as f:
+    pickle.dump(model, f)
+print("\nSaved -> ou_levy_model.pkl")
+
+
+# ── Diagnostic figures ────────────────────────────────────────────────────────
+
+BLUE, RED, GRAY = "#2563EB", "#DC2626", "#6B7280"
+plt.rcParams.update({"font.size": 9, "axes.spines.top": False, "axes.spines.right": False})
+
+fig = plt.figure(figsize=(16, 20))
+gs  = gridspec.GridSpec(5, 2, figure=fig, hspace=0.45, wspace=0.3)
+
+# Panel 1: temperature + seasonal fit (last 5 years)
+ax1 = fig.add_subplot(gs[0, :])
+sample = df_calib.iloc[-5 * 365:]
+ax1.plot(sample.index, sample["T"], color=GRAY, lw=0.6, label="Daily avg T")
+ax1.plot(sample.index, sample["s"], color=RED,  lw=1.8, label=r"$s(t)$")
+ax1.set_title("Temperature with Seasonal Component incl. Linear Trend (last 5 years)", fontweight="bold")
+ax1.set_ylabel("C")
+ax1.legend(frameon=False)
+ax1.text(0.01, 0.96,
+         rf"$s(t) = {a_est:.2f} + {b_est:.5f}t + ({b1_est:.2f})\cos\!\left(\frac{{2\pi}}{{365}}(t - {g1_est:.1f})\right)$",
+         transform=ax1.transAxes, va="top", fontsize=9,
+         bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8))
+
+# Panels 2 & 3: residuals and squared residuals
+ax2 = fig.add_subplot(gs[1, 0])
+ax2.plot(df_res.index[-3 * 365:], df_res["eps"].iloc[-3 * 365:], color=BLUE, lw=0.5)
+ax2.axhline(0, color="k", lw=0.5)
+ax2.set_title(r"Raw Residuals $\tilde{\varepsilon}_t$")
+ax2.set_ylabel("C")
+
+ax3 = fig.add_subplot(gs[1, 1])
+ax3.plot(df_res.index[-3 * 365:], df_res["eps_sq"].iloc[-3 * 365:], color=BLUE, lw=0.5)
+ax3.set_title(r"Squared Residuals $\tilde{\varepsilon}_t^2$ (seasonal heteroscedasticity)")
+ax3.set_ylabel("C^2")
+
+# Panel 4: sigma^2(t) -- Fourier fit vs empirical (Figure 4 in paper)
+ax4 = fig.add_subplot(gs[2, 0])
+ax4.bar(doy_idx, avg_eps2_doy, width=1, color=GRAY, alpha=0.5, label="Empirical $\\bar{\\varepsilon}^2$")
+ax4.plot(doy_idx, sigma2_doy_fit, color=RED, lw=2,
+         label=r"Fitted $\hat{\sigma}^2(t)$ (Fourier, $I_2=J_2=4$)")
+ax4.set_xlabel("Day of Year")
+ax4.set_ylabel(r"$\sigma^2$ (C$^2$)")
+ax4.set_title(r"Seasonal Variance $\sigma^2(t)$ -- Truncated Fourier Series (eq. 3)")
+ax4.legend(frameon=False, fontsize=8)
+
+# Panel 5: standardised residuals
+ax5 = fig.add_subplot(gs[2, 1])
+ax5.plot(df_res.index[-3 * 365:], df_res["e"].iloc[-3 * 365:], color=BLUE, lw=0.5)
+ax5.axhline(0, color="k", lw=0.5)
+ax5.set_title(r"Standardised Residuals $e_t = \tilde{\varepsilon}_t / \hat{\sigma}(t)$")
+
+# Panel 6: residual distribution (linear scale) -- Normal + NIG
+ax6 = fig.add_subplot(gs[3, 0])
+x_grid = np.linspace(e.min(), e.max(), 500)
+ax6.hist(e, bins=80, density=True, color=GRAY, alpha=0.5, label="Empirical")
+ax6.plot(x_grid, stats.norm.pdf(x_grid, e_mean, e_std),
+         color=RED,  lw=1.8, ls="--", label="Normal (BM)")
+ax6.plot(x_grid, norminvgauss.pdf(x_grid, *nig_params),
+         color=BLUE, lw=2,          label="NIG (Levy)")
+ax6.set_title(r"Distribution of $e_t$ -- Normal vs NIG")
+ax6.set_xlabel(r"$e_t$")
+ax6.legend(frameon=False, fontsize=8)
+ax6.text(0.02, 0.95,
+         f"skew={stats.skew(e):.3f}\nkurt={stats.kurtosis(e):.3f}\nchi2 p={chi2_pval:.4f}",
+         transform=ax6.transAxes, va="top", fontsize=8,
+         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+
+# Panel 7: distribution (log scale)
+ax7 = fig.add_subplot(gs[3, 1])
+ax7.hist(e, bins=80, density=True, color=GRAY, alpha=0.5, label="Empirical")
+ax7.plot(x_grid, stats.norm.pdf(x_grid, e_mean, e_std),
+         color=RED,  lw=1.8, ls="--", label="Normal (BM)")
+ax7.plot(x_grid, norminvgauss.pdf(x_grid, *nig_params),
+         color=BLUE, lw=2,          label="NIG (Levy)")
+ax7.set_yscale("log")
+ax7.set_ylim(1e-4, 2)
+ax7.set_title(r"Distribution of $e_t$ -- Log Scale (tail behaviour)")
+ax7.set_xlabel(r"$e_t$")
+ax7.legend(frameon=False, fontsize=8)
+ax7.text(0.02, 0.05,
+         f"AIC Normal: {aic_norm:.0f}\nAIC NIG: {aic_nig:.0f}\nDAIC: {aic_improvement:.1f}",
+         transform=ax7.transAxes, fontsize=8,
+         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+
+# Panels 8 & 9: ACF of squared residuals (Figure 5 in paper)
+lags = np.arange(MAX_LAG + 1)
+
+ax8 = fig.add_subplot(gs[4, 0])
+ax8.bar(lags[1:], acf_eps2[1:], width=0.8, color=GRAY)
+ax8.axhline( ci_bound, color=RED, ls="--", lw=1, label="95% CI")
+ax8.axhline(-ci_bound, color=RED, ls="--", lw=1)
+ax8.axhline(0, color="k", lw=0.5)
+ax8.set_title(r"ACF of $\tilde{\varepsilon}_t^2$ (before $\sigma(t)$ correction)")
+ax8.set_xlabel("Lag (days)")
+ax8.set_ylabel("ACF")
+ax8.legend(frameon=False, fontsize=8)
+
+ax9 = fig.add_subplot(gs[4, 1])
+ax9.bar(lags[1:], acf_e2[1:], width=0.8, color=BLUE)
+ax9.axhline( ci_bound, color=RED, ls="--", lw=1, label="95% CI")
+ax9.axhline(-ci_bound, color=RED, ls="--", lw=1)
+ax9.axhline(0, color="k", lw=0.5)
+ax9.set_title(r"ACF of $e_t^2$ (after $\sigma(t)$ correction)")
+ax9.set_xlabel("Lag (days)")
+ax9.set_ylabel("ACF")
+ax9.legend(frameon=False, fontsize=8)
+
+fig.suptitle(
+    "Benth & Saltyte-Benth (2007) -- OU Temperature Model | Paris-Orly (2000-2024)",
+    fontsize=13, fontweight="bold", y=1.01
+)
+fig.savefig("ou_levy_model_diagnostics.png", bbox_inches="tight", dpi=150)
+print("Saved -> ou_levy_model_diagnostics.png")
+
+
+# ── Simulation function ───────────────────────────────────────────────────────
+
+def simulate_ou_levy(model, n_days, n_paths=1000, T0=None, seed=None):
+    """
+    Simulate temperature paths using the calibrated Benth (2007) OU model.
+
+    Noise distribution: NIG (Levy process) using the fitted nig_params.
+    This preserves the Levy-driven simulation from the 2005 model for comparison
+    while using the 2007 seasonality (linear trend + Fourier variance).
+
+    Returns T_paths: ndarray of shape (n_paths, n_days).
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    a, b, b1, g1  = model["a"], model["b"], model["b1"], model["g1"]
+    alpha          = model["alpha"]
+    sigma_doy_arr  = model["sigma_doy"]
+    nig_params     = model["nig_params"]
+
+    if T0 is None:
+        T0 = a
+
+    t_start = int(model["df_calib"]["t"].iloc[-1]) + 1
+    t_vec   = np.arange(t_start, t_start + n_days)
+    s_vec   = a + b * t_vec + b1 * np.cos(2 * np.pi * (t_vec - g1) / 365)
+    doys    = (t_vec % 365).astype(int)
+    sig_vec = sigma_doy_arr[doys]
+
+    # NIG noise -- Levy process (2005 extension retained for comparison)
+    noise = norminvgauss.rvs(*nig_params, size=(n_paths, n_days))
+
+    T_paths       = np.zeros((n_paths, n_days))
+    T_paths[:, 0] = T0
+    for i in range(1, n_days):
+        X_prev        = T_paths[:, i-1] - s_vec[i-1]
+        T_paths[:, i] = s_vec[i] + alpha * X_prev + sig_vec[i] * noise[:, i]
+
+    return T_paths
+
+
+# ── Simulation validation ─────────────────────────────────────────────────────
+
+paths = simulate_ou_levy(model, n_days=365, n_paths=5000, seed=0)
+print(f"\n# Simulation check (5000 paths x 365 days)")
+print(f"  Mean={paths.mean():.2f}C  (calib data: {df_calib['T'].mean():.2f}C)")
+print(f"  Std= {paths.std():.2f}C   (calib data: {df_calib['T'].std():.2f}C)")
