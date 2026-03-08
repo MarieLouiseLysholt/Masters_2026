@@ -1,0 +1,384 @@
+"""
+Replication of Benth & Saltyte-Benth (2007):
+"The Volatility of Temperature and Pricing of Weather Derivatives"
+Quantitative Finance, 7(5), 553-561.
+
+Runs over all configured regions. Outputs:
+  - benth_models/ou_levy_model_{region}.pkl  (one per region, for model_comparison.py)
+  - ou_levy_model_diagnostics.png            (single overview figure across all regions)
+  - ou_levy_model_summary.csv                (cross-region parameter table)
+"""
+
+import os
+import numpy as np
+import pandas as pd
+from scipy import stats, optimize
+from scipy.stats import chi2, norminvgauss
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import warnings, pickle
+warnings.filterwarnings("ignore")
+
+np.random.seed(42)
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+REGIONS    = [11, 24, 27, 28, 32, 44, 52, 53]
+CALIB_END  = "2009-12-31"
+PKL_FOLDER = "benth_models"
+os.makedirs(PKL_FOLDER, exist_ok=True)
+
+BLUE, RED, GRAY = "#2563EB", "#DC2626", "#6B7280"
+plt.rcParams.update({"font.size": 8, "axes.spines.top": False, "axes.spines.right": False})
+
+# ---------------------------------------------------------------------------
+# Load raw data once
+# ---------------------------------------------------------------------------
+
+raw = pd.read_csv("EDA/region_avg.csv", parse_dates=["date"])
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+def remove_feb29(df):
+    return df[~((df.index.month == 2) & (df.index.day == 29))].copy()
+
+def doy_no_leap(date_idx):
+    doys = []
+    for d in date_idx:
+        yd      = d.timetuple().tm_yday
+        is_leap = (d.year % 4 == 0) and (d.year % 100 != 0 or d.year % 400 == 0)
+        if d.month > 2 and is_leap:
+            yd -= 1
+        doys.append(max(1, min(365, yd)))
+    return np.array(doys)
+
+def seasonal_func(t, a, b, b1, g1):
+    return a + b * t + b1 * np.cos(2 * np.pi * (t - g1) / 365)
+
+def sigma2_fourier(t, c, c1, c2, c3, c4, d1, d2, d3, d4):
+    val = c
+    for i, ci in enumerate([c1, c2, c3, c4], start=1):
+        val = val + ci * np.sin(2 * i * np.pi * t / 365)
+    for j, dj in enumerate([d1, d2, d3, d4], start=1):
+        val = val + dj * np.cos(2 * j * np.pi * t / 365)
+    return val
+
+def pearson_chi2_normality(data, n_bins=50):
+    mu, s  = data.mean(), data.std()
+    edges  = stats.norm.ppf(np.linspace(0, 1, n_bins + 1), mu, s)
+    edges[0], edges[-1] = -np.inf, np.inf
+    obs, _ = np.histogram(data, bins=edges)
+    exp    = np.full(n_bins, len(data) / n_bins)
+    mask   = exp > 0
+    stat   = np.sum((obs[mask] - exp[mask])**2 / exp[mask])
+    return float(stat), float(1 - chi2.cdf(stat, mask.sum() - 3))
+
+def estimate_hurst(data, min_bins=10):
+    n   = len(data)
+    Ks  = np.unique(np.logspace(0.5, np.log10(n // min_bins), 40).astype(int))
+    res = []
+    for K in Ks:
+        N_bins = n // K
+        if N_bins < min_bins:
+            continue
+        Xi  = data[:N_bins * K].reshape(N_bins, K).mean(axis=1)
+        f_K = np.sqrt(np.mean(Xi**2))
+        if f_K > 0:
+            res.append((np.log(K), np.log(f_K)))
+    if len(res) < 5:
+        return None, None
+    log_K, log_f = zip(*res)
+    slope, _, r_val, _, _ = stats.linregress(log_K, log_f)
+    return 1 + slope, r_val**2
+
+def compute_acf(x, max_lag):
+    n, xc = len(x), x - x.mean()
+    return np.array([
+        np.dot(xc[:n-k], xc[k:]) / np.dot(xc, xc) if k > 0 else 1.0
+        for k in range(max_lag + 1)
+    ])
+
+MAX_LAG = 100
+
+# ---------------------------------------------------------------------------
+# Per-region calibration loop
+# ---------------------------------------------------------------------------
+
+summary_rows = []
+diag_data    = []   # collects data for the single overview figure
+
+for region in REGIONS:
+    print(f"\n{'='*60}\n  Region {region}\n{'='*60}")
+
+    # ── Data ────────────────────────────────────────────────────────────────
+    df_raw = (raw[raw["region_code"] == region]
+                .set_index("date")
+                .rename(columns={"daily_avg_temperature": "T"})
+                [["T"]]
+                .dropna())
+    df_raw   = remove_feb29(df_raw)
+    df_raw["t"] = np.arange(len(df_raw))
+    df_calib = df_raw.loc[:CALIB_END].copy()
+
+    print(f"Full: N={len(df_raw):,}  Calib: N={len(df_calib):,}")
+    if len(df_calib) < 1000:
+        print(f"  WARNING: insufficient data, skipping.")
+        continue
+
+    # ── Seasonality s(t) ────────────────────────────────────────────────────
+    T_vals, t_vals = df_calib["T"].values, df_calib["t"].values
+    try:
+        popt, _ = optimize.curve_fit(
+            seasonal_func, t_vals, T_vals,
+            p0=[T_vals.mean(), 1e-4, -8.0, 150.0],
+            maxfev=50000)
+    except RuntimeError:
+        print("  WARNING: seasonality fit did not converge, using p0.")
+        popt = np.array([T_vals.mean(), 1e-4, -8.0, 150.0])
+
+    a_est, b_est, b1_est, g1_est = popt
+    df_calib["s"] = seasonal_func(t_vals, *popt)
+    df_calib["X"] = df_calib["T"] - df_calib["s"]
+    print(f"s(t): a={a_est:.3f}  b={b_est:.6f}  b1={b1_est:.3f}  g1={g1_est:.1f}  "
+          f"trend={b_est*365*10:.3f} C/decade")
+
+    # ── AR(1) step 1: preliminary OLS alpha to get initial residuals ─────────
+    # Needed only to fit sigma^2(t). The final alpha uses the martingale
+    # estimator (eq. 6) weighted by 1/sigma^2(t), computed after sigma fit.
+    X            = df_calib["X"].values
+    X_lag, X_cur = X[:-1], X[1:]
+    alpha_ols    = np.dot(X_lag, X_cur) / np.dot(X_lag, X_lag)
+    eps_prelim   = X_cur - alpha_ols * X_lag
+
+    df_res             = df_calib.iloc[1:].copy()
+    df_res["eps"]      = eps_prelim
+    df_res["eps_sq"]   = eps_prelim ** 2
+
+    # ── Seasonal variance sigma^2(t) ─────────────────────────────────────────
+    df_res["doy"] = doy_no_leap(df_res.index)
+    doy_idx       = np.arange(1, 366)
+    avg_eps2_doy  = np.array([
+        df_res.loc[df_res["doy"] == d, "eps_sq"].mean()
+        if (df_res["doy"] == d).any() else np.nan for d in doy_idx])
+    avg_eps2_doy  = (pd.Series(avg_eps2_doy)
+                      .interpolate(method="linear", limit_direction="both").values)
+
+    try:
+        popt_s2, _ = optimize.curve_fit(
+            sigma2_fourier, doy_idx, avg_eps2_doy,
+            p0=[avg_eps2_doy.mean()] + [0.0]*8, maxfev=100000)
+    except RuntimeError:
+        print("  WARNING: sigma2 fit did not converge, using constant variance.")
+        popt_s2 = np.array([avg_eps2_doy.mean()] + [0.0]*8)
+
+    sigma2_doy_fit = np.maximum(sigma2_fourier(doy_idx, *popt_s2), 1e-4)
+    sigma_doy      = np.sqrt(sigma2_doy_fit)
+    print(f"sigma(t): [{sigma_doy.min():.3f}, {sigma_doy.max():.3f}] C  "
+          f"winter/summer={sigma_doy[:60].mean()/sigma_doy[150:250].mean():.2f}x")
+
+    # ── AR(1) step 2: martingale estimator weighted by 1/sigma^2(t) ──────────
+    # Eq. 6 in Schiller et al. (2012) / Alaton eq. 3.26.
+    # sigma^2 for each residual day is looked up from the fitted DOY array.
+    doy_lag = np.array([doy_no_leap([d])[0] for d in df_calib.index[:-1]])
+    sig2_lag = sigma2_doy_fit[doy_lag - 1]        # sigma^2 at t-1
+
+    s_vals   = seasonal_func(df_calib["t"].values, a_est, b_est, b1_est, g1_est)
+    Tm_lag   = s_vals[:-1]
+    Tm_cur   = s_vals[1:]
+
+    # Martingale weights: Y_{t-1} = (s(t-1) - T_{t-1}) / sigma^2(t-1)
+    Y_lag    = (Tm_lag - X_lag - Tm_lag) / sig2_lag   # simplifies to -X_lag / sig2_lag
+    num      = np.dot(Y_lag, (X_cur   - Tm_cur))
+    den      = np.dot(Y_lag, (X_lag   - Tm_lag))
+    # Note: X = T - s(t), so T - s(t) = X and s(t) - T = -X
+    # Rewrite using X directly: Y_lag = -X_lag / sig2_lag
+    Y_lag    = -X_lag / sig2_lag
+    num      = np.sum(Y_lag * X_cur)
+    den      = np.sum(Y_lag * X_lag)
+    alpha_est = float(num / den)
+
+    # Guard against degenerate estimates
+    alpha_est = float(np.clip(alpha_est, 0.80, 0.9999))
+    kappa_est = -np.log(alpha_est)
+    half_life =  np.log(2) / kappa_est
+    eps_raw   = X_cur - alpha_est * X_lag
+    print(f"AR(1) martingale: alpha={alpha_est:.4f}  half-life={half_life:.1f} days  "
+          f"(OLS alpha was {alpha_ols:.4f})")
+
+    # Update df_res with final residuals
+    df_res["eps"]    = eps_raw
+    df_res["eps_sq"] = eps_raw ** 2
+    df_res["sigma"]  = df_res["doy"].map(dict(zip(doy_idx, sigma_doy)))
+    df_res["e"]      = df_res["eps"] / df_res["sigma"]
+
+    # ── Residual diagnostics + NIG fit ───────────────────────────────────────
+    e             = df_res["e"].dropna().values
+    e_mean, e_std = e.mean(), e.std()
+    chi2_stat, chi2_pval = pearson_chi2_normality(e)
+    nig_params    = norminvgauss.fit(e)
+    ll_nig        = np.sum(norminvgauss.logpdf(e, *nig_params))
+    ll_norm       = np.sum(stats.norm.logpdf(e, e_mean, e_std))
+    aic_nig       = -2*ll_nig  + 2*4
+    aic_norm      = -2*ll_norm + 2*2
+    print(f"Residuals: skew={stats.skew(e):.3f}  kurt={stats.kurtosis(e):.3f}  "
+          f"chi2 p={chi2_pval:.4f}  ΔAIC(norm-NIG)={aic_norm-aic_nig:.1f}")
+
+    # ── Hurst + ACF ──────────────────────────────────────────────────────────
+    H_est, r2_hurst = estimate_hurst(df_calib["X"].values)
+    ci_bound  = 1.96 / np.sqrt(len(eps_raw))
+    acf_eps2  = compute_acf(eps_raw**2, MAX_LAG)
+    acf_e2    = compute_acf(e**2,       MAX_LAG)
+    print(f"Hurst: H={H_est:.4f}")
+
+    # ── Save pkl ─────────────────────────────────────────────────────────────
+    model = {
+        "a": a_est, "b": b_est, "b1": b1_est, "g1": g1_est,
+        "a0": a_est, "a1": b1_est, "t0": g1_est,  # backward compat
+        "alpha": alpha_est, "k": kappa_est, "half_life": half_life,
+        "sigma_doy": sigma_doy, "doy_idx": doy_idx,
+        "sigma2_params": popt_s2,
+        "nig_params": nig_params,
+        "H": H_est, "r2_hurst": r2_hurst,
+        "df": df_raw, "df_calib": df_calib, "df_res": df_res,
+        "model_name": "Benth (2007)",
+        "region_code": region,
+        "calib_end": CALIB_END,
+    }
+    pkl_path = os.path.join(PKL_FOLDER, f"ou_levy_model_{region}.pkl")
+    with open(pkl_path, "wb") as f:
+        pickle.dump(model, f)
+    print(f"Saved -> {pkl_path}")
+
+    # ── Collect for overview figure ───────────────────────────────────────────
+    diag_data.append({
+        "region": region,
+        "doy_idx": doy_idx, "avg_eps2_doy": avg_eps2_doy,
+        "sigma2_doy_fit": sigma2_doy_fit,
+        "e": e, "e_mean": e_mean, "e_std": e_std,
+        "nig_params": nig_params, "chi2_pval": chi2_pval,
+        "aic_norm": aic_norm, "aic_nig": aic_nig,
+        "acf_eps2": acf_eps2, "acf_e2": acf_e2, "ci_bound": ci_bound,
+        "a_est": a_est, "b_est": b_est, "b1_est": b1_est, "g1_est": g1_est,
+        "alpha_est": alpha_est, "half_life": half_life, "H_est": H_est,
+    })
+
+    summary_rows.append({
+        "region": region,
+        "a": round(a_est, 4),
+        "b_C_per_decade": round(b_est*365*10, 3),
+        "b1": round(b1_est, 3),
+        "g1": round(g1_est, 1),
+        "alpha": round(alpha_est, 4),
+        "half_life_days": round(half_life, 1),
+        "sigma_min": round(sigma_doy.min(), 3),
+        "sigma_max": round(sigma_doy.max(), 3),
+        "H": round(H_est, 4),
+        "nig_preferred": aic_norm > aic_nig,
+        "normal_rejected_5pct": chi2_pval < 0.05,
+    })
+
+# ---------------------------------------------------------------------------
+# Cross-region summary CSV
+# ---------------------------------------------------------------------------
+
+summary = pd.DataFrame(summary_rows).set_index("region")
+summary.to_csv("ou_levy_model_summary.csv")
+print(f"\nSaved -> ou_levy_model_summary.csv")
+print(summary.to_string())
+
+# ---------------------------------------------------------------------------
+# Single overview figure
+# 4 panel rows x N_regions columns:
+#   Row 1 — sigma^2(t): empirical vs Fourier fit
+#   Row 2 — residual distribution (log scale): Normal vs NIG
+#   Row 3 — ACF(eps^2) before sigma(t) correction
+#   Row 4 — ACF(e^2)   after  sigma(t) correction
+# ---------------------------------------------------------------------------
+
+N   = len(diag_data)
+lags = np.arange(MAX_LAG + 1)
+
+fig, axes = plt.subplots(4, N, figsize=(3.0 * N, 13))
+fig.suptitle(
+    "Benth (2007) — Calibration Overview Across All Regions (2000–2014)",
+    fontsize=12, fontweight="bold", y=1.005
+)
+
+ROW_LABELS = [
+    r"$\sigma^2(t)$ fit",
+    "Residual dist (log)",
+    r"ACF($\tilde{\varepsilon}^2$) before",
+    r"ACF($e^2$) after",
+]
+
+for col, d in enumerate(diag_data):
+    region = d["region"]
+
+    # ── Row 0: sigma^2(t) ────────────────────────────────────────────────────
+    ax = axes[0, col]
+    ax.bar(d["doy_idx"], d["avg_eps2_doy"], width=1, color=GRAY, alpha=0.4)
+    ax.plot(d["doy_idx"], d["sigma2_doy_fit"], color=RED, lw=1.5)
+    ax.set_title(f"R{region}", fontweight="bold", fontsize=9)
+    ax.tick_params(labelsize=6)
+    ax.set_xlabel("DOY", fontsize=7)
+    if col == 0:
+        ax.set_ylabel("°C²", fontsize=8)
+
+    # ── Row 1: residual distribution (log scale) ─────────────────────────────
+    ax = axes[1, col]
+    e      = d["e"]
+    x_grid = np.linspace(np.percentile(e, 0.5), np.percentile(e, 99.5), 300)
+    ax.hist(e, bins=60, density=True, color=GRAY, alpha=0.4)
+    ax.plot(x_grid, stats.norm.pdf(x_grid, d["e_mean"], d["e_std"]),
+            color=RED, lw=1.4, ls="--")
+    ax.plot(x_grid, norminvgauss.pdf(x_grid, *d["nig_params"]),
+            color=BLUE, lw=1.4)
+    ax.set_yscale("log")
+    ax.set_ylim(1e-4, 2)
+    ax.tick_params(labelsize=6)
+    winner = "NIG" if d["aic_nig"] < d["aic_norm"] else "N"
+    ax.text(0.97, 0.97,
+            f"p={d['chi2_pval']:.3f}\n{winner}✓",
+            transform=ax.transAxes, ha="right", va="top", fontsize=6,
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.8))
+    if col == 0:
+        ax.set_ylabel("Density (log)", fontsize=8)
+
+    # ── Row 2: ACF(eps^2) before correction ──────────────────────────────────
+    ax = axes[2, col]
+    ax.bar(lags[1:], d["acf_eps2"][1:], width=0.8, color=GRAY)
+    ax.axhline( d["ci_bound"], color=RED, ls="--", lw=0.8)
+    ax.axhline(-d["ci_bound"], color=RED, ls="--", lw=0.8)
+    ax.axhline(0, color="k", lw=0.4)
+    ax.tick_params(labelsize=6)
+    if col == 0:
+        ax.set_ylabel(r"ACF", fontsize=8)
+
+    # ── Row 3: ACF(e^2) after correction ─────────────────────────────────────
+    ax = axes[3, col]
+    ax.bar(lags[1:], d["acf_e2"][1:], width=0.8, color=BLUE)
+    ax.axhline( d["ci_bound"], color=RED, ls="--", lw=0.8)
+    ax.axhline(-d["ci_bound"], color=RED, ls="--", lw=0.8)
+    ax.axhline(0, color="k", lw=0.4)
+    ax.set_xlabel("Lag", fontsize=7)
+    ax.tick_params(labelsize=6)
+    if col == 0:
+        ax.set_ylabel(r"ACF", fontsize=8)
+
+# Row label annotations on the far left
+for row, label in enumerate(ROW_LABELS):
+    axes[row, 0].annotate(
+        label, xy=(-0.38, 0.5), xycoords="axes fraction",
+        fontsize=7, fontweight="bold", rotation=90,
+        va="center", ha="center")
+
+fig.tight_layout()
+fig.savefig("ou_levy_model_diagnostics.png", bbox_inches="tight", dpi=150)
+plt.close(fig)
+print("Saved -> ou_levy_model_diagnostics.png")
+print(f"\nDone. Calibrated {len(diag_data)}/{len(REGIONS)} regions.")

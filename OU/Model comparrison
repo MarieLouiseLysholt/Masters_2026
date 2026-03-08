@@ -29,15 +29,14 @@ np.random.seed(42)
 # Configuration
 # ---------------------------------------------------------------------------
 
+REGIONS    = [11])
 N_SIMS     = 10_000   # MC paths per valuation  (paper: 100,000)
 N_HIST     = 20       # max years of estimation history  (paper uses 30; limited by data start 2000)
 N_HIST_MIN = 8        # minimum history to enter backtest
-MIN_INDEX  = 50.0     # exclude contracts with Y_actual < 50 degree-days (paper Sec. 4.1, fn. 4)
-T_REF      = 10.0     # reference temperature deg C.
-                      # Paper uses 65F (18.3C) for US, 18C for EU CME contracts.
-                      # 10C is the thesis-specific choice for French wheat cold-stress threshold.
+MIN_INDEX  = 50     # exclude contracts with Y_actual < 50 degree-days (paper Sec. 4.1, fn. 4)
+T_REF      = 18     # reference temperature deg C (EU CME standard, matching Schiller 2012)
 OMEGA      = 2 * np.pi / 365
-TEST_START = 2015     # first out-of-sample year (paper tests 1983-2005; thesis window 2015-2024)
+TEST_START = 2010     # first out-of-sample year (paper tests 1983-2005; thesis window 2015-2024)
 
 CONTRACTS = [
     ("Summer",    "CDD",  5,  1,  9, 30),
@@ -55,45 +54,21 @@ CONTRACTS = [
 ]
 
 BLUE, RED, GRAY = "#2563EB", "#DC2626", "#6B7280"
-COLORS = {"IM": GRAY, "Alaton": BLUE, "Benth": RED}
-LABELS = {"IM": "Index Modelling", "Alaton": "Alaton (2002)", "Benth": "Benth (2007)"}
+COLORS = {"HBA": GRAY, "Alaton": BLUE, "Benth": RED}
+LABELS = {"HBA": "Burn Analysis (HBA)", "Alaton": "Alaton (2002)", "Benth": "Benth (2007)"}
 plt.rcParams.update({"font.size": 9, "axes.spines.top": False, "axes.spines.right": False})
 
 # ---------------------------------------------------------------------------
-# Load models
+# Load models  (region-specific, set globals used by predict functions)
 # ---------------------------------------------------------------------------
 
-with open("alaton_model.pkl",  "rb") as f: alaton = pickle.load(f)
-with open("ou_levy_model.pkl", "rb") as f: benth  = pickle.load(f)
-
-df       = alaton["df"][["T"]].copy().sort_index()
-t_origin = df.index[0]
-df["t"]  = (df.index - t_origin).days + 1   # absolute day count, Alaton only
-
-# ---------------------------------------------------------------------------
-# Benth model parameters  (2007: linear trend + Fourier variance + NIG noise)
-# ---------------------------------------------------------------------------
-
-_NIG_A, _NIG_B, _NIG_LOC, _NIG_SCALE = benth["nig_params"]
-_NIG_MEAN  = float(norminvgauss.mean(_NIG_A, _NIG_B, loc=_NIG_LOC, scale=_NIG_SCALE))
-_NIG_STD   = float(norminvgauss.std (_NIG_A, _NIG_B, loc=_NIG_LOC, scale=_NIG_SCALE))
-# Paper Section 3.3: "we will use the same estimate (6) from the Alaton model for the Benth
-# model in order to make the comparison fair." alpha = exp(-a) where a is Alaton's estimate.
-_B_ALPHA   = float(np.exp(-alaton["a"]))
-_B_SIGDOY  = np.array(benth["sigma_doy"])   # shape (365,), index = doy-1
-
-# 2007-specific: linear trend parameters
-_B_A   = float(benth["a"])    # intercept
-_B_B   = float(benth["b"])    # slope (C/day) -- KEY addition vs 2005
-_B_B1  = float(benth["b1"])   # cosine amplitude
-_B_G1  = float(benth["g1"])   # cosine phase offset (days)
-
-# Build a date -> t lookup from the stored df_raw so we can map
-# any forecast date to the same absolute t used during calibration.
-# df_raw["t"] = np.arange(len(df_raw)) after removing Feb 29.
-_B_DF      = benth["df"].copy()   # full dataset 2000-2024 with 't' column
-_B_T_LAST  = int(_B_DF["t"].iloc[-1])
-_B_DATE_LAST = _B_DF.index[-1]
+# These module-level names are re-assigned at the start of each region iteration.
+# The predict functions reference them by name at call time, so this is safe.
+alaton = benth = None
+df = None
+_NIG_A = _NIG_B = _NIG_LOC = _NIG_SCALE = None
+_NIG_MEAN = _NIG_STD = _B_ALPHA = _B_SIGDOY = None
+_B_A = _B_B = _B_B1 = _B_G1 = _B_DF = None
 
 def date_to_t(date):
     """
@@ -130,10 +105,7 @@ def benth_doy(date):
     if leap and date.month > 2: doy -= 1
     return max(1, min(365, doy))
 
-print(f"N = {len(df):,} obs  ({df.index[0].date()} to {df.index[-1].date()})")
-print(f"T: mean={df['T'].mean():.2f}C  std={df['T'].std():.2f}C")
-print(f"Benth (2007): a={_B_A:.4f}  b={_B_B:.6f}/day  b1={_B_B1:.4f}  g1={_B_G1:.2f}")
-print(f"  Implied warming: {_B_B*365*10:.3f}C/decade")
+
 
 # ---------------------------------------------------------------------------
 # Period helpers
@@ -162,16 +134,11 @@ def nearest(df_, ts):
     return df_.index[df_.index.get_indexer([ts], method="nearest")[0]]
 
 # ---------------------------------------------------------------------------
-# Index Modelling  (Schiller 2012, eq. 1-2)
+# Burn Analysis (HBA)  -- plain historical mean, no trend (Section 3.1)
+# KEY distinction vs Index Modelling: forecast = Y_bar, not beta0+beta1*(n+1)
 # ---------------------------------------------------------------------------
 
-def ols_trend(Y):
-    n, i = len(Y), np.arange(1, len(Y) + 1, dtype=float)
-    b1 = np.sum((i - (n+1)/2) * (Y - Y.mean())) / np.sum((i - (n+1)/2)**2)
-    b0 = Y.mean() - (n+1)/2 * b1
-    return float(b0 + b1 * (n + 1))   # forecast for year n+1
-
-def im_predict(contract, year, timing):
+def hba_predict(contract, year, timing):
     _, itype, *_ = contract
     s, e  = period_dates(contract, year)
     n_d   = (e - s).days + 1
@@ -192,10 +159,10 @@ def im_predict(contract, year, timing):
     if len(Y_full) < 5: return None
 
     if timing == "180":
-        return ols_trend(np.array(Y_full[-N_HIST:]))
+        return float(np.mean(Y_full[-N_HIST:]))          # HBA: plain mean
     else:  # mid
         hi = hdd_cdd(df.loc[(df.index >= s) & (df.index <= mid_d), "T"], itype)
-        return hi + ols_trend(np.array(Y_sec[-N_HIST:]))
+        return hi + float(np.mean(Y_sec[-N_HIST:]))      # HBA: plain mean of second-half history
 
 # ---------------------------------------------------------------------------
 # Alaton simulation  (Gaussian OU, exact one-day step)
@@ -312,36 +279,78 @@ def benth_predict(contract, year, timing):
     return hi + float(idx.mean())
 
 # ---------------------------------------------------------------------------
-# Backtest loop
+# Backtest loop  (over all regions)
 # ---------------------------------------------------------------------------
 
 records = []
-for contract in CONTRACTS:
-    cname, itype, *_ = contract
-    n_ok = 0
-    print(f"{cname} ({itype}) ...", end=" ", flush=True)
-    for year in sorted(y for y in df.index.year.unique() if y >= TEST_START):
-        s_act = get_temps(df, contract, year)
-        if not is_complete(s_act, contract, year, thr=0.95): continue
-        hist  = sum(1 for yr in range(year - N_HIST - 10, year)
-                    if is_complete(get_temps(df, contract, yr), contract, yr))
-        if hist < N_HIST_MIN: continue
-        Y = hdd_cdd(s_act, itype)
-        if Y < MIN_INDEX: continue
 
-        for timing in ["180", "mid"]:
-            for mk, fn in [("IM",     im_predict),
-                           ("Alaton", alaton_predict),
-                           ("Benth",  benth_predict)]:
-                pred = fn(contract, year, timing)
-                if pred and pred > 0:
-                    d = (pred - Y) / Y
-                    records.append({"year": year, "contract": cname,
-                                    "itype": itype, "model": mk,
-                                    "timing": timing, "Y_actual": Y,
-                                    "Y_pred": pred, "delta": d, "delta_sq": d**2})
-        n_ok += 1
-    print(n_ok)
+for region in REGIONS:
+    print(f"\n{'='*60}\n  Region {region}\n{'='*60}")
+
+    # ── Load region-specific models ──────────────────────────────────────────
+    with open(f"alaton_models/alaton_model_{region}.pkl", "rb") as f:
+        alaton = pickle.load(f)
+    with open(f"benth_models/ou_levy_model_{region}.pkl", "rb") as f:
+        benth = pickle.load(f)
+
+    # Temperature data (use Alaton's full df as ground truth)
+    df       = alaton["df"][["T"]].copy().sort_index()
+    t_origin = df.index[0]
+    df["t"]  = (df.index - t_origin).days + 1   # absolute day count, Alaton only
+
+    # ── Re-initialise Benth globals for this region ───────────────────────────
+    _NIG_A, _NIG_B, _NIG_LOC, _NIG_SCALE = benth["nig_params"]
+    _NIG_MEAN  = float(norminvgauss.mean(_NIG_A, _NIG_B, loc=_NIG_LOC, scale=_NIG_SCALE))
+    _NIG_STD   = float(norminvgauss.std (_NIG_A, _NIG_B, loc=_NIG_LOC, scale=_NIG_SCALE))
+    # Paper Section 3.3: use Alaton's a for Benth for a fair comparison
+    _B_ALPHA   = float(np.exp(-alaton["a"]))
+    _B_SIGDOY  = np.array(benth["sigma_doy"])
+    _B_A       = float(benth["a"])
+    _B_B       = float(benth["b"])
+    _B_B1      = float(benth["b1"])
+    _B_G1      = float(benth["g1"])
+    _B_DF      = benth["df"].copy()
+
+    print(f"N={len(df):,}  Benth: a={_B_A:.4f}  b={_B_B:.6f}  "
+          f"warming={_B_B*365*10:.3f}C/decade")
+
+    # Sanity check: s(t) at summer and winter dates vs observed mean T
+    for label, date_str in [("2015-01-15", "2015-01-15"), ("2015-07-15", "2015-07-15"),
+                             ("2020-01-15", "2020-01-15"), ("2020-07-15", "2020-07-15")]:
+        test_date = pd.Timestamp(date_str)
+        if test_date in _B_DF.index:
+            t_abs  = int(_B_DF.loc[test_date, "t"])
+            s_val  = float(benth_s_vec(np.array([t_abs]))[0])
+            t_obs  = float(df.loc[test_date, "T"])
+            print(f"  s({label})={s_val:.2f}C  observed={t_obs:.2f}C  diff={s_val-t_obs:+.2f}C")
+
+    for contract in CONTRACTS:
+        cname, itype, *_ = contract
+        n_ok = 0
+        print(f"  {cname} ({itype}) ...", end=" ", flush=True)
+        for year in sorted(y for y in df.index.year.unique() if y >= TEST_START):
+            s_act = get_temps(df, contract, year)
+            if not is_complete(s_act, contract, year, thr=0.95): continue
+            hist  = sum(1 for yr in range(year - N_HIST - 10, year)
+                        if is_complete(get_temps(df, contract, yr), contract, yr))
+            if hist < N_HIST_MIN: continue
+            Y = hdd_cdd(s_act, itype)
+            if Y < MIN_INDEX: continue
+
+            for timing in ["180", "mid"]:
+                for mk, fn in [("HBA",    hba_predict),
+                               ("Alaton", alaton_predict),
+                               ("Benth",  benth_predict)]:
+                    pred = fn(contract, year, timing)
+                    if pred and pred > 0:
+                        d = (pred - Y) / Y
+                        records.append({"region": region, "year": year,
+                                        "contract": cname, "itype": itype,
+                                        "model": mk, "timing": timing,
+                                        "Y_actual": Y, "Y_pred": pred,
+                                        "delta": d, "delta_sq": d**2})
+            n_ok += 1
+        print(n_ok)
 
 res = pd.DataFrame(records)
 print(f"\nTotal evaluations: {len(res):,}")
@@ -355,7 +364,7 @@ print(f"  {'Model':<22} {'MRE 180':>10} {'MRE mid':>9} {'MSRE 180':>10} {'MSRE m
 print("  " + "-" * 68)
 for itype in ["HDD", "CDD"]:
     print(f"\n  {itype}")
-    for m in ["IM", "Alaton", "Benth"]:
+    for m in ["HBA", "Alaton", "Benth"]:
         rows = {t: res[(res.itype == itype) & (res.timing == t) & (res.model == m)]
                 for t in ["180", "mid"]}
         n = len(rows["180"])
@@ -382,9 +391,9 @@ print(f"\n# Table 5 -- Mann-Whitney U  (H1: row MSRE < col MSRE)")
 for timing in ["180", "mid"]:
     print(f"\n  {'180 days ahead' if timing == '180' else 'Mid period'}")
     sub = res[res.timing == timing]
-    for mx in ["IM", "Alaton", "Benth"]:
+    for mx in ["HBA", "Alaton", "Benth"]:
         row = f"  {LABELS[mx]:<22}"
-        for my in ["IM", "Alaton", "Benth"]:
+        for my in ["HBA", "Alaton", "Benth"]:
             if mx == my: row += f"  {'—':>10}"; continue
             p = mw_pval(sub[sub.model == mx]["delta_sq"].values,
                         sub[sub.model == my]["delta_sq"].values)
@@ -397,9 +406,9 @@ for timing in ["180", "mid"]:
 
 print(f"\n# Figure 5 -- Regression: delta_mid = a*delta_180 + b")
 reg = {}
-for m in ["IM", "Alaton", "Benth"]:
-    d180 = res[(res.timing == "180") & (res.model == m)].set_index(["year","contract"])["delta"]
-    dmid = res[(res.timing == "mid")  & (res.model == m)].set_index(["year","contract"])["delta"]
+for m in ["HBA", "Alaton", "Benth"]:
+    d180 = res[(res.timing == "180") & (res.model == m)].set_index(["region","year","contract"])["delta"]
+    dmid = res[(res.timing == "mid")  & (res.model == m)].set_index(["region","year","contract"])["delta"]
     mg   = pd.concat([d180.rename("d180"), dmid.rename("dmid")], axis=1).dropna()
     sl, ic, r, pv, _ = stats.linregress(mg["d180"], mg["dmid"])
     reg[m] = (mg["d180"].values, mg["dmid"].values, sl, ic, r)
@@ -411,7 +420,7 @@ for m in ["IM", "Alaton", "Benth"]:
 
 # Figure 1: MRE/MSRE bar charts (Table 4 replica)
 fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-fig.suptitle("Table 4 Replica — MRE & MSRE by Model | Region 11\n"
+fig.suptitle("Table 4 Replica — MRE & MSRE by Model | All Regions\n"
              "Schiller, Seidler & Wimmer (2012)", fontweight="bold")
 
 for (ri, ci, itype, metric, timing) in [
@@ -422,11 +431,11 @@ for (ri, ci, itype, metric, timing) in [
 ]:
     ax   = axes[ri, ci]
     vals = [abs(res[(res.itype == itype) & (res.timing == timing) &
-                    (res.model == m)][metric].mean()) for m in ["IM","Alaton","Benth"]]
+                    (res.model == m)][metric].mean()) for m in ["HBA","Alaton","Benth"]]
     ax.bar(range(3), [v*100 for v in vals],
-           color=[COLORS[m] for m in ["IM","Alaton","Benth"]], alpha=0.85, width=0.6)
+           color=[COLORS[m] for m in ["HBA","Alaton","Benth"]], alpha=0.85, width=0.6)
     ax.set_xticks(range(3))
-    ax.set_xticklabels(["Index\nModelling","Alaton\n(2002)","Benth\n(2007)"], fontsize=8)
+    ax.set_xticklabels(["Burn Analysis\n(HBA)","Alaton\n(2002)","Benth\n(2007)"], fontsize=8)
     ax.set_ylabel("MRE (%) " if metric == "delta" else "MSRE (%)")
     tlbl = "180 Days Ahead" if timing == "180" else "Mid Period"
     ax.set_title(f"{itype} — {'MRE' if metric=='delta' else 'MSRE'} — {tlbl}", fontweight="bold")
@@ -439,9 +448,9 @@ print("\nSaved -> backtest_table4.png")
 
 # Figure 2: scatter delta_mid vs delta_180
 fig2, axes2 = plt.subplots(1, 3, figsize=(16, 5))
-fig2.suptitle("Figure 5 Replica — Mid-period vs 180-days-ahead relative errors | Region 11",
+fig2.suptitle("Figure 5 Replica — Mid-period vs 180-days-ahead relative errors | All Regions",
               fontweight="bold")
-for ax, m in zip(axes2, ["IM","Alaton","Benth"]):
+for ax, m in zip(axes2, ["HBA","Alaton","Benth"]):
     x, y, sl, ic, r = reg[m]
     ax.scatter(x, y, s=5, alpha=0.4, color=COLORS[m])
     xl = np.array([np.percentile(x,1), np.percentile(x,99)])
@@ -450,7 +459,7 @@ for ax, m in zip(axes2, ["IM","Alaton","Benth"]):
     ax.axhline(0, color=GRAY, lw=0.5, ls="--"); ax.axvline(0, color=GRAY, lw=0.5, ls="--")
     ax.set_xlim(xl); ax.set_ylim(np.percentile(y,1), np.percentile(y,99))
     ax.set_xlabel("delta_180"); ax.set_ylabel("delta_mid")
-    ax.set_title(f"({chr(97+['IM','Alaton','Benth'].index(m))}) {LABELS[m]}", fontweight="bold")
+    ax.set_title(f"({chr(97+['HBA','Alaton','Benth'].index(m))}) {LABELS[m]}", fontweight="bold")
     ax.legend(frameon=False, fontsize=8)
 fig2.tight_layout()
 fig2.savefig("backtest_figure5.png", bbox_inches="tight", dpi=150)
@@ -458,10 +467,10 @@ print("Saved -> backtest_figure5.png")
 
 # Figure 3: MSRE by contract
 fig3, axes3 = plt.subplots(1, 2, figsize=(14, 6))
-fig3.suptitle("Figure 6 Replica — MSRE by Contract | Region 11", fontweight="bold")
+fig3.suptitle("Figure 6 Replica — MSRE by Contract | All Regions", fontweight="bold")
 for ax, (timing, tlbl) in zip(axes3, [("180","180 Days Ahead"),("mid","Mid Period")]):
     x, w = np.arange(len(CONTRACTS)), 0.27
-    for j, m in enumerate(["IM","Alaton","Benth"]):
+    for j, m in enumerate(["HBA","Alaton","Benth"]):
         vals = [res[(res.timing==timing)&(res.model==m)&(res.contract==c[0])]["delta_sq"].mean()
                 if len(res[(res.timing==timing)&(res.model==m)&(res.contract==c[0])]) else np.nan
                 for c in CONTRACTS]
