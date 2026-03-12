@@ -41,7 +41,7 @@ np.random.seed(42)
 # ---------------------------------------------------------------------------
 
 REGIONS    = [11, 24, 27, 28, 32, 44, 52, 53]
-CALIB_END  = "2009-12-31"
+CALIB_END  = "2014-12-31"
 PKL_FOLDER = "hba_models"
 os.makedirs(PKL_FOLDER, exist_ok=True)
 
