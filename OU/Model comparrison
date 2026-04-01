@@ -1,735 +1,927 @@
 """
-Backtesting comparison replicating Section 4 of:
-    Schiller, Seidler & Wimmer (2012):
-    "Temperature Models for Pricing Weather Derivatives"
+Replication of Barnor, Kampouridis & Kanellopoulos (2026)
+"Machine learning for temperature forecasting in weather derivatives"
+Artificial Intelligence Review, https://doi.org/10.1007/s10462-026-11539-0
 
-Models: HBA, Alaton (2002), Benth (2007), NN-OU (CalibNet Model C)
-Contracts: 12 standard HDD/CDD contracts (Table 3)
-Metrics: MRE, MSRE, Mann-Whitney U test, scatter regression (Figures 5-6)
+5 models across French NUTS-2 regions:
+  HBA        — Historical Burn Analysis (naive DOY-mean, benchmark)
+  Alaton     — Alaton et al. (2002) OU with Gaussian innovations
+  Benth      — Benth & Šaltyte Benth (2005) OU with NIG innovations
+  XGB        — Paper XGBoost (Barnor et al. 2026), recursive §3.2.3
+  WaveletFNN — Wavelet-enhanced FNN, same Table 2 features, recursive §3.2.3
 
-Two valuation times per contract-year:
-    (a) 180 days before measurement period start
-    (b) Midpoint of measurement period (first half known, second half predicted)
+T_REF = 18.0°C  (European/Japanese standard, paper Section 2.1)
 """
 
 import numpy as np
 import pandas as pd
-from scipy import stats
-from scipy.stats import norminvgauss, mannwhitneyu
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import pickle, warnings
-
-import torch
-import torch.nn as nn
+import datetime
+from pathlib import Path
+from scipy.stats import friedmanchisquare, wilcoxon as scipy_wilcoxon
+from scipy.stats import skew as sp_skew, kurtosis as sp_kurt
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.cluster import KMeans
+import pickle, warnings, os
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
-torch.manual_seed(42)
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# CONFIGURATION
+# ===========================================================================
 
-REGIONS    = [11, 24, 27, 28, 32, 44, 52, 53]
-N_SIMS     = 10_000   # MC paths per valuation  (paper: 100,000)
-N_HIST     = 45       # max years of estimation history  (paper uses 30; limited by data start 2000)
-N_HIST_MIN = 8        # minimum history to enter backtest
-MIN_INDEX  = 50.0     # exclude contracts with Y_actual < 50 degree-days (paper Sec. 4.1, fn. 4)
-T_REF      = 10.0     # reference temperature deg C (EU CME standard, matching Schiller 2012)
-OMEGA      = 2 * np.pi / 365
-TEST_START = 2015     # first out-of-sample year (paper tests 1983-2005; thesis window 2015-2024)
+REGIONS      = [11, 24, 27, 28, 32, 44, 52, 53]
+T_REF        = 18.0
+OMEGA        = 2 * np.pi / 365
+RAW_CSV      = "EDA/region_avg.csv"
+EXTENDED_CSV = "EDA/region_temp_extended.csv"   # pre-computed features (wavelet trained on this)
+EXTENDED_CSV = "EDA/region_temp_extended.csv"
+ALATON_DIR   = "alaton_models"
+BENTH_DIR    = "benth_models"
+PAPER_XGB_DIR    = Path(r"C:\Users\victo\Downloads\Python\Projects\Masters_2026\Outputs\xgBoost_rolling_exports")
+WAVELET_FNN_DIR  = Path(r"C:\Users\victo\Downloads\Python\Projects\Masters_2026\Outputs\WaveletFNN_rolling_exports")
 
-CONTRACTS = [
-    ("Summer",    "CDD",  5,  1,  9, 30),
-    ("May",       "CDD",  5,  1,  5, 31),
-    ("June",      "CDD",  6,  1,  6, 30),
-    ("July",      "CDD",  7,  1,  7, 31),
-    ("August",    "CDD",  8,  1,  8, 31),
-    ("September", "CDD",  9,  1,  9, 30),
-    ("Winter",    "HDD", 11,  1,  3, 31),
-    ("November",  "HDD", 11,  1, 11, 30),
-    ("December",  "HDD", 12,  1, 12, 31),
-    ("January",   "HDD",  1,  1,  1, 31),
-    ("February",  "HDD",  2,  1,  2, 28),
-    ("March",     "HDD",  3,  1,  3, 31),
+OOS_START    = 2015
+OOS_END      = 2024
+TEST_YEARS   = list(range(OOS_START, OOS_END + 1))
+MIN_INDEX    = 15.0
+N_BOOTSTRAP  = 1_000
+N_HARMONICS  = 3
+
+MODEL_ORDER  = ["HBA", "Alaton", "Benth", "XGB", "WaveletFNN"]
+LABELS       = {
+    "HBA":        "Burn Analysis (HBA)",
+    "Alaton":     "Alaton (2002)",
+    "Benth":      "Benth (2007)",
+    "XGB":        "XGBoost (Barnor et al. 2026)",
+    "WaveletFNN": "Wavelet FNN",
+}
+
+HORIZONS = {
+    "30":(0,30), "60":(0,60), "90":(0,90), "120":(0,120), "180":(0,180),
+    "270":(0,270), "365":(0,365), "ISL":(90,180), "IISL":(180,270),
+    "mid90":(135,225), "-270":(95,365), "-180":(185,365), "-120":(245,365),
+    "-90":(275,365), "-60":(305,365), "-30":(335,365),
+}
+HORIZON_NAMES = list(HORIZONS.keys())
+
+FEATURE_COLS = [
+    "dayofyear", "pdtn_doy", "de_trend_seas",
+    "dts_doyavge", "dts_doyvar",
+    "yday", "IIdays_ago", "IIIdays_ago", "IVdays_ago",
+    "Vdays_ago", "VIdays_ago", "VIIdays_ago",
+    "last_year", "last_2year", "last_3year", "last_4year", "last_5year",
+    "h1_last_year", "h1_last_2years", "h1_last_3years",
+    "h1_last_4years", "h1_last_5years",
+    "h1_ly_2days", "h1_ly_3day", "h1_ly_4day",
+    "h1_ly_5day", "h1_ly_6day", "h1_ly_7day",
+    "h1_ly_next_1day", "h1_ly_next_2days", "h1_ly_next_3days",
+    "h1_ly_next_4days", "h1_ly_next_5days",
+    "h1_ly_next_6days", "h1_ly_next_7days",
+    "diff_1year", "diff_2year", "diff_3year", "diff_4year", "diff_5year",
+    "diff_yday", "diff_2days", "diff_3days", "diff_4days",
+    "diff_5days", "diff_6days", "diff_7days",
+    "last_7_1day_deltas_mean", "last_7_1day_deltas_min",
+    "last_7_1day_deltas_max",
 ]
 
-BLUE, RED, GRAY, GREEN = "#2563EB", "#DC2626", "#6B7280", "#16A34A"
-COLORS = {"HBA": GRAY, "Alaton": BLUE, "Benth": RED, "NN-OU": GREEN}
-LABELS = {"HBA": "Burn Analysis (HBA)", "Alaton": "Alaton (2002)",
-          "Benth": "Benth (2007)", "NN-OU": "NN-OU (CalibNet)"}
-MODEL_ORDER = ["HBA", "Alaton", "Benth", "NN-OU"]
 
-NN_PKL_DIR = "Outputs/OUNNParametersRegionSpecificModels"   # folder containing NN PKLs
+# ===========================================================================
+# WAVELET FEATURE TRANSFORMER
+# Required for unpickling the WaveletFNN pipeline PKLs.
+# ===========================================================================
 
-plt.rcParams.update({"font.size": 9, "axes.spines.top": False, "axes.spines.right": False})
+class WaveletFeatureTransformer(BaseEstimator, TransformerMixin):
+    def __init__(self, n_wavelets=3, wavelet="mexican_hat", include_original=True):
+        self.n_wavelets = n_wavelets
+        self.wavelet = wavelet
+        self.include_original = include_original
 
-# ---------------------------------------------------------------------------
-# Load models  (region-specific, set globals used by predict functions)
-# ---------------------------------------------------------------------------
+    def fit(self, X, y=None):
+        X = self._to_numpy(X)
+        self.n_features_in_ = X.shape[1]
+        return self
 
-# These module-level names are re-assigned at the start of each region iteration.
-# The predict functions reference them by name at call time, so this is safe.
-alaton = benth = None
-df = None
-_NIG_A = _NIG_B = _NIG_LOC = _NIG_SCALE = None
-_NIG_MEAN = _NIG_STD = _B_ALPHA = _B_SIGDOY = None
-_B_A = _B_B = _B_B1 = _B_G1 = _B_DF = None
+    def transform(self, X):
+        X = self._to_numpy(X)
+        n_samples, n_features = X.shape
+        t = np.linspace(-1.0, 1.0, n_samples)
+        features = []
+        if self.include_original:
+            features.append(X)
+        for j in range(n_features):
+            x = X[:, j]
+            for i in range(self.n_wavelets):
+                if self.n_wavelets == 1:
+                    shift = 0.0
+                else:
+                    shift = -0.75 + i * (1.5 / (self.n_wavelets - 1))
+                scale = 0.25 + 0.20 * i
+                tau = (t - shift) / scale
+                if self.wavelet == "mexican_hat":
+                    psi = (1.0 - tau**2) * np.exp(-0.5 * tau**2)
+                elif self.wavelet == "morlet":
+                    psi = np.cos(5.0 * tau) * np.exp(-0.5 * tau**2)
+                else:
+                    raise ValueError(f"Unknown wavelet type: {self.wavelet}")
+                features.append((x * psi).reshape(-1, 1))
+        X_out = np.hstack(features).astype(float)
+        if not np.isfinite(X_out).all():
+            raise ValueError("WaveletFeatureTransformer produced NaN/inf.")
+        return X_out
 
-# ── NN-OU globals ────────────────────────────────────────────────────────────
-_NN_MODEL       = None   # loaded CalibNetFlexible instance
-_NN_BETA        = None   # seasonal mean OLS coefficients (from PKL)
-_NN_XMEAN       = None   # residual mean used for standardisation
-_NN_XSTD        = None   # residual std  used for standardisation
-_NN_VOLMULT     = None   # vol correction multiplier (Model B)
-_NN_TDFREE      = None   # Student-t degrees of freedom (Model C)
-_NN_WINDOW      = None   # rolling input window length
-_NN_DOYHARMONICS = None  # DOY harmonics for input features
-_NN_KHARMONICS  = None   # seasonal mean harmonics
-_NN_DATASTART   = None   # pd.Timestamp of first date in NN training series
+    @staticmethod
+    def _to_numpy(X):
+        if isinstance(X, pd.DataFrame):
+            X = X.to_numpy()
+        return np.asarray(X, dtype=float)
 
-# ---------------------------------------------------------------------------
-# CalibNetFlexible  (must match the architecture used in the notebook)
-# ---------------------------------------------------------------------------
 
-class CalibNetFlexible(nn.Module):
-    """Time-varying kappa / sigma OU calibration network.
-    Matches the notebook's CalibNetFlexible: arbitrary depth, activation choice.
-    """
-    ACTIVATIONS = {
-        "tanh":       nn.Tanh,
-        "relu":       nn.ReLU,
-        "leakyrelu":  lambda: nn.LeakyReLU(0.1),
-        "elu":        nn.ELU,
-    }
+# ===========================================================================
+# SECTION 1: DATA LOADING AND PREPROCESSING
+# ===========================================================================
 
-    def __init__(self, in_dim: int, hidden: int = 32,
-                 activation: str = "leakyrelu", n_layers: int = 1,
-                 kappa_max: float = 0.5):
-        super().__init__()
-        self.kappa_max = kappa_max
-        act_cls = self.ACTIVATIONS.get(activation, nn.LeakyReLU)
-        layers: list = [nn.Linear(in_dim, hidden), act_cls()]
-        for _ in range(n_layers - 1):
-            layers += [nn.Linear(hidden, hidden), act_cls()]
-        layers.append(nn.Linear(hidden, 2))
-        self.net      = nn.Sequential(*layers)
-        self.softplus = nn.Softplus()
-
-    def forward(self, x):
-        raw   = self.net(x)
-        kappa = self.kappa_max * torch.sigmoid(raw[:, 0]) + 1e-6
-        sigma = self.softplus(raw[:, 1])               + 1e-6
-        return kappa, sigma
-
-def date_to_t(date):
-    """
-    Map a calendar date to the absolute integer t used in the Benth model.
-    t=0 for the first day in the calibration dataset (after removing Feb 29).
-    For dates within the stored df, look up directly.
-    For dates beyond the stored data, extrapolate by counting non-Feb29 days.
-    """
-    date = pd.Timestamp(date)
-    if date in _B_DF.index:
-        return int(_B_DF.loc[date, "t"])
-    # Extrapolate: count non-Feb29 days from dataset start to target date
-    dr = pd.date_range(_B_DF.index[0], date, freq="D")
-    dr = dr[~((dr.month == 2) & (dr.day == 29))]
-    return len(dr) - 1
-
-def date_range_to_t(dates):
-    """Vectorised version of date_to_t for a DatetimeIndex."""
-    return np.array([date_to_t(d) for d in dates])
-
-# ---------------------------------------------------------------------------
-# Benth seasonality function  (eq. 2, 2007 paper)
-# s(t) = a + b*t + b1*cos(2*pi*(t - g1)/365)
-# where t is the ABSOLUTE day count, not DOY.
-# ---------------------------------------------------------------------------
-
-def benth_s_vec(t_abs_arr):
-    """Vectorised s(t) for an array of absolute t values."""
-    return _B_A + _B_B * t_abs_arr + _B_B1 * np.cos(2 * np.pi * (t_abs_arr - _B_G1) / 365)
-
-def benth_doy(date):
-    doy  = date.timetuple().tm_yday
-    leap = (date.year % 4 == 0 and (date.year % 100 != 0 or date.year % 400 == 0))
-    if leap and date.month > 2: doy -= 1
+def _doy_noleap(date):
+    doy = date.timetuple().tm_yday
+    if (date.year % 4 == 0 and (date.year % 100 != 0 or date.year % 400 == 0)):
+        if date.month > 2:
+            doy -= 1
     return max(1, min(365, doy))
 
+def load_region(region):
+    raw = pd.read_csv(RAW_CSV, parse_dates=["date"])
+    raw = raw.rename(columns={"daily_avg_temperature": "T"})
+    df = (raw[raw["region_code"] == region][["date", "T"]]
+          .dropna(subset=["date"]).sort_values("date").reset_index(drop=True))
+    df = df[~((df["date"].dt.month == 2) & (df["date"].dt.day == 29))].copy()
+    df = df.reset_index(drop=True)
+    df["doy"] = df["date"].apply(_doy_noleap)
+    df["t_idx"] = np.arange(len(df), dtype=float)
+    if df["T"].isna().any():
+        doy_means = df.dropna(subset=["T"]).groupby("doy")["T"].mean().to_dict()
+        for pos in df[df["T"].isna()].index.tolist():
+            doy_val = int(df.at[pos, "doy"])
+            T_avy = doy_means.get(doy_val, float(df["T"].mean()))
+            nbrs = []
+            for off in list(range(-7, 0)) + list(range(1, 8)):
+                p = pos + off
+                if 0 <= p < len(df) and not pd.isna(df.at[p, "T"]):
+                    nbrs.append(df.at[p, "T"])
+            T_avd = float(np.mean(nbrs)) if nbrs else T_avy
+            df.at[pos, "T"] = (T_avy + T_avd) / 2.0
+    return df
+
+def get_train_test_for_year(df, test_year):
+    df_train = df[df["date"].dt.year < test_year].copy().reset_index(drop=True)
+    df_test = df[df["date"].dt.year == test_year].copy().reset_index(drop=True)
+    return df_train, df_test
 
 
-# ---------------------------------------------------------------------------
-# Period helpers
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# SECTION 2: DETRENDING / DESEASONALIZING
+# Used to compute trend+seasonal coefficients for converting de_trend_seas
+# predictions back to actual temperatures (needed by both XGB and WaveletFNN).
+# ===========================================================================
 
-def period_dates(contract, year):
-    _, _, sm, sd, em, ed = contract
-    start    = pd.Timestamp(year=year, month=sm, day=sd)
-    end_year = year + 1 if sm > em else year
-    return start, pd.Timestamp(year=end_year, month=em, day=ed)
+def _detrend_linear(df_train):
+    """OLS linear detrend: T = intercept + slope * t_idx + residual."""
+    t = df_train["t_idx"].values; T = df_train["T"].values
+    mask = ~np.isnan(T)
+    A = np.column_stack([np.ones(mask.sum()), t[mask]])
+    coefs, _, _, _ = np.linalg.lstsq(A, T[mask], rcond=None)
+    intercept, slope = coefs[0], coefs[1]
+    detrended = T - (intercept + slope * t)
+    return intercept, slope, detrended
 
-def get_temps(df_, contract, year):
-    s, e = period_dates(contract, year)
-    return df_.loc[(df_.index >= s) & (df_.index <= e), "T"]
+def _deseasonalize_fourier(doy, detrended, n_harmonics=N_HARMONICS):
+    """Fourier deseasonalization on DOY."""
+    mask = ~np.isnan(detrended)
+    cols = [np.ones(mask.sum())]
+    for k in range(1, n_harmonics + 1):
+        cols.append(np.sin(2 * np.pi * k * doy[mask] / 365.0))
+        cols.append(np.cos(2 * np.pi * k * doy[mask] / 365.0))
+    X = np.column_stack(cols)
+    coefs, _, _, _ = np.linalg.lstsq(X, detrended[mask], rcond=None)
+    cols_all = [np.ones(len(doy))]
+    for k in range(1, n_harmonics + 1):
+        cols_all.append(np.sin(2 * np.pi * k * doy / 365.0))
+        cols_all.append(np.cos(2 * np.pi * k * doy / 365.0))
+    seasonal = np.column_stack(cols_all) @ coefs
+    return coefs, detrended - seasonal
 
-def is_complete(series, contract, year, thr=0.85):
-    s, e = period_dates(contract, year)
-    return len(series) >= thr * ((e - s).days + 1)
+def _build_feature_df(df):
+    """Build Table 2 features from preprocessed data with de_trend_seas."""
+    df = df.copy().sort_values("date").set_index("date")
+    dts = df["de_trend_seas"]
+    df["pdtn_doy"] = df["dayofyear"].shift(-1)
+    last_doy = df["dayofyear"].iloc[-1]
+    df.iloc[-1, df.columns.get_loc("pdtn_doy")] = 1 if last_doy == 365 else last_doy + 1
+    df["pdtn_doy"] = df["pdtn_doy"].astype(int)
+    doy_stats = df.groupby("dayofyear")["de_trend_seas"].agg(["mean", "var"])
+    df["dts_doyavge"] = df["dayofyear"].map(doy_stats["mean"])
+    df["dts_doyvar"] = df["dayofyear"].map(doy_stats["var"])
+    df["yday"] = dts.shift(1)
+    for name, lag in [("IIdays_ago",2),("IIIdays_ago",3),("IVdays_ago",4),
+                      ("Vdays_ago",5),("VIdays_ago",6),("VIIdays_ago",7)]:
+        df[name] = dts.shift(lag)
+    for name, lag in [("last_year",365),("last_2year",730),("last_3year",1095),
+                      ("last_4year",1460),("last_5year",1825)]:
+        df[name] = dts.shift(lag)
+    for name, lag in [("h1_last_year",364),("h1_last_2years",729),("h1_last_3years",1094),
+                      ("h1_last_4years",1459),("h1_last_5years",1824)]:
+        df[name] = dts.shift(lag)
+    for name, lag in [("h1_ly_2days",366),("h1_ly_3day",367),("h1_ly_4day",368),
+                      ("h1_ly_5day",369),("h1_ly_6day",370),("h1_ly_7day",371)]:
+        df[name] = dts.shift(lag)
+    for name, lag in [("h1_ly_next_1day",363),("h1_ly_next_2days",362),("h1_ly_next_3days",361),
+                      ("h1_ly_next_4days",360),("h1_ly_next_5days",359),
+                      ("h1_ly_next_6days",358),("h1_ly_next_7days",357)]:
+        df[name] = dts.shift(lag)
+    for name, lag in [("diff_1year",365),("diff_2year",730),("diff_3year",1095),
+                      ("diff_4year",1460),("diff_5year",1825)]:
+        df[name] = dts - dts.shift(lag)
+    for name, lag in [("diff_yday",1),("diff_2days",2),("diff_3days",3),("diff_4days",4),
+                      ("diff_5days",5),("diff_6days",6),("diff_7days",7)]:
+        df[name] = dts - dts.shift(lag)
+    diff_1d = dts - dts.shift(1)
+    df["last_7_1day_deltas_mean"] = diff_1d.rolling(7).mean()
+    df["last_7_1day_deltas_min"] = diff_1d.rolling(7).min()
+    df["last_7_1day_deltas_max"] = diff_1d.rolling(7).max()
+    return df
 
-def hdd_cdd(temps, itype):
-    if itype == "HDD": return float(np.maximum(T_REF - temps.values, 0).sum())
-    return float(np.maximum(temps.values - T_REF, 0).sum())
-
-def nearest(df_, ts):
-    if ts in df_.index: return ts
-    return df_.index[df_.index.get_indexer([ts], method="nearest")[0]]
-
-# ---------------------------------------------------------------------------
-# Burn Analysis (HBA)  -- plain historical mean, no trend (Section 3.1)
-# KEY distinction vs Index Modelling: forecast = Y_bar, not beta0+beta1*(n+1)
-# ---------------------------------------------------------------------------
-
-def hba_predict(contract, year, timing):
-    _, itype, *_ = contract
-    s, e  = period_dates(contract, year)
-    n_d   = (e - s).days + 1
-    mid_d = nearest(df, s + pd.Timedelta(days=n_d // 2 - 1))
-
-    Y_full, Y_sec = [], []
-    for yr in range(year - N_HIST - 5, year):
-        temps = get_temps(df, contract, yr)
-        if not is_complete(temps, contract, yr): continue
-        sy, ey    = period_dates(contract, yr)
-        nd_yr     = (ey - sy).days + 1
-        mid_yr    = sy + pd.Timedelta(days=nd_yr // 2 - 1)
-        t_sec     = temps[temps.index > mid_yr]
-        if len(t_sec) == 0: continue
-        Y_full.append(hdd_cdd(temps, itype))
-        Y_sec.append(hdd_cdd(t_sec, itype))
-
-    if len(Y_full) < 5: return None
-
-    if timing == "180":
-        return float(np.mean(Y_full[-N_HIST:]))          # HBA: plain mean
-    else:  # mid
-        hi = hdd_cdd(df.loc[(df.index >= s) & (df.index <= mid_d), "T"], itype)
-        return hi + float(np.mean(Y_sec[-N_HIST:]))      # HBA: plain mean of second-half history
-
-# ---------------------------------------------------------------------------
-# Alaton simulation  (Gaussian OU, exact one-day step)
-# ---------------------------------------------------------------------------
-
-def alaton_predict(contract, year, timing):
-    _, itype, *_ = contract
-    s, e  = period_dates(contract, year)
-    n_d   = (e - s).days + 1
-    a     = float(alaton["a"])
-    A, B, C, phi = alaton["A"], alaton["B"], alaton["C"], alaton["phi"]
-    sm    = alaton["sigma_monthly"]
-    rng   = np.random.default_rng()
-
-    def Tm(t_arr): return A + B*t_arr + C*np.sin(OMEGA*t_arr + phi)
-
-    if timing == "180":
-        v0      = nearest(df, s - pd.Timedelta(days=180))
-        T0, t0  = float(df.loc[v0, "T"]), int(df.loc[v0, "t"])
-        total   = 180 + n_d
-        dates   = pd.date_range(v0, periods=total, freq="D")
-        tm      = Tm(np.arange(t0, t0 + total))
-        sig     = np.array([sm[d.month] for d in dates])
-        cstd    = sig * np.sqrt((1 - np.exp(-2*a)) / (2*a))
-        noise   = rng.standard_normal((N_SIMS, total))
-        P       = np.empty((N_SIMS, total)); P[:, 0] = T0
-        for i in range(1, total):
-            P[:, i] = tm[i] + np.exp(-a)*(P[:, i-1] - tm[i-1]) + cstd[i]*noise[:, i]
-        paths = P[:, -n_d:]
-        hi    = 0.0
-    else:
-        mid_d   = nearest(df, s + pd.Timedelta(days=n_d // 2 - 1))
-        T0, t0  = float(df.loc[mid_d, "T"]), int(df.loc[mid_d, "t"]) + 1
-        rem     = n_d - n_d // 2
-        dates   = pd.date_range(mid_d + pd.Timedelta(days=1), periods=rem, freq="D")
-        tm      = Tm(np.arange(t0, t0 + rem))
-        sig     = np.array([sm[d.month] for d in dates])
-        cstd    = sig * np.sqrt((1 - np.exp(-2*a)) / (2*a))
-        noise   = rng.standard_normal((N_SIMS, rem))
-        P       = np.empty((N_SIMS, rem)); P[:, 0] = T0
-        for i in range(1, rem):
-            P[:, i] = tm[i] + np.exp(-a)*(P[:, i-1] - tm[i-1]) + cstd[i]*noise[:, i]
-        paths = P
-        hi    = hdd_cdd(df.loc[(df.index >= s) & (df.index <= mid_d), "T"], itype)
-
-    idx = np.maximum(T_REF - paths, 0).sum(1) if itype == "HDD" \
-          else np.maximum(paths - T_REF, 0).sum(1)
-    return hi + float(idx.mean())
-
-# ---------------------------------------------------------------------------
-# Benth simulation  (NIG Levy-OU, 2007: linear trend + Fourier variance)
-# ---------------------------------------------------------------------------
-
-def benth_predict(contract, year, timing):
-    _, itype, *_ = contract
-    s, e  = period_dates(contract, year)
-    n_d   = (e - s).days + 1
-    rng   = np.random.default_rng()
-
-    if timing == "180":
-        v0    = nearest(df, s - pd.Timedelta(days=180))
-        T0    = float(df.loc[v0, "T"])
-        total = 180 + n_d
-        dates = pd.date_range(v0, periods=total, freq="D")
-
-        # Absolute t values for each forecast date -- needed for linear trend b*t
-        t_abs = date_range_to_t(dates)
-        sv    = benth_s_vec(t_abs)                         # s(t) with linear trend
-
-        # Seasonal sigma from DOY (Fourier fitted, stored as 365-element array)
-        doys  = np.array([benth_doy(d) for d in dates])
-        sigv  = _B_SIGDOY[doys - 1]
-
-        eps   = (norminvgauss.rvs(_NIG_A, _NIG_B, loc=_NIG_LOC, scale=_NIG_SCALE,
-                                  size=(N_SIMS, total), random_state=rng)
-                 - _NIG_MEAN) / _NIG_STD
-        P     = np.empty((N_SIMS, total)); P[:, 0] = T0
-        for i in range(1, total):
-            P[:, i] = sv[i] + _B_ALPHA*(P[:, i-1] - sv[i-1]) + sigv[i]*eps[:, i]
-        paths = P[:, -n_d:]
-        hi    = 0.0
-
-    else:  # mid-measurement
-        mid_d = nearest(df, s + pd.Timedelta(days=n_d // 2 - 1))
-        T0    = float(df.loc[mid_d, "T"])
-        rem   = n_d - n_d // 2
-        dates = pd.date_range(mid_d + pd.Timedelta(days=1), periods=rem, freq="D")
-
-        # Absolute t values for forecast dates
-        t_abs = date_range_to_t(dates)
-        sv    = benth_s_vec(t_abs)                         # s(t) with linear trend
-
-        doys  = np.array([benth_doy(d) for d in dates])
-        sigv  = _B_SIGDOY[doys - 1]
-
-        eps   = (norminvgauss.rvs(_NIG_A, _NIG_B, loc=_NIG_LOC, scale=_NIG_SCALE,
-                                  size=(N_SIMS, rem), random_state=rng)
-                 - _NIG_MEAN) / _NIG_STD
-
-        # Initial X0 = T0 - s(t_mid) using the correct absolute t for mid_d
-        t_mid = date_to_t(mid_d)
-        s_mid = float(benth_s_vec(np.array([t_mid]))[0])
-        X0    = T0 - s_mid
-
-        P     = np.empty((N_SIMS, rem))
-        P[:, 0] = sv[0] + _B_ALPHA*X0 + sigv[0]*eps[:, 0]
-        for i in range(1, rem):
-            P[:, i] = sv[i] + _B_ALPHA*(P[:, i-1] - sv[i-1]) + sigv[i]*eps[:, i]
-        paths = P
-        hi    = hdd_cdd(df.loc[(df.index >= s) & (df.index <= mid_d), "T"], itype)
-
-    idx = np.maximum(T_REF - paths, 0).sum(1) if itype == "HDD" \
-          else np.maximum(paths - T_REF, 0).sum(1)
-    return hi + float(idx.mean())
-
-# ---------------------------------------------------------------------------
-# NN-OU simulation  (CalibNet Model C: time-varying κ/σ + vol correction + Student-t)
-# ---------------------------------------------------------------------------
-
-def _nn_seasonal(dates_idx):
-    """Reconstruct s(t) for a DatetimeIndex using stored beta.
-    FIX: t is measured as calendar days from _NN_DATASTART / 365, exactly
-    matching how beta was calibrated. This prevents the trend from restarting
-    at zero on each forecast call (bug in the notebook's simulate_final_modelC).
+def compute_calib_context(df_train):
     """
-    n   = len(dates_idx)
-    doy = dates_idx.dayofyear.values.astype(float)
-    t   = np.array([(d - _NN_DATASTART).days for d in dates_idx]) / 365.0
-    parts = [np.ones(n), t]
-    for k in range(1, _NN_KHARMONICS + 1):
-        parts.append(np.sin(2 * np.pi * k * doy / 365.0))
-        parts.append(np.cos(2 * np.pi * k * doy / 365.0))
-    return np.column_stack(parts) @ _NN_BETA
-
-def _nn_doy_features(dates_idx):
-    """DOY Fourier features fed into the NN at each step."""
-    doy = dates_idx.dayofyear.values.astype(float)
-    feats = []
-    for k in range(1, _NN_DOYHARMONICS + 1):
-        feats.append(np.sin(2 * np.pi * k * doy / 365.0))
-        feats.append(np.cos(2 * np.pi * k * doy / 365.0))
-    return np.column_stack(feats).astype(np.float32)
-
-def _nn_kappa_sigma_sequence(dates_idx, init_window_xz):
-    """Pre-compute deterministic kappa(t) / sigma(t) sequence for the forecast window.
-
-    FIX: Rather than updating the rolling history with per-path realisations
-    (which collapses all paths to the same NN input after step 1), we advance
-    the window with the zero-mean OU expectation: x_{t+1} = (1-kappa)*x_t.
-    This gives a single deterministic parameter trajectory, which is the correct
-    interpretation — kappa and sigma are market parameters, not path-specific.
+    Compute detrending/deseasonalizing on training data, build feature df,
+    and return everything needed for recursive ML forecasting.
+    Used by Paper XGBoost (trained from region_avg.csv with fresh detrending).
     """
-    total      = len(dates_idx)
-    doy_feats  = _nn_doy_features(dates_idx)
-    kappa_seq  = np.empty(total, dtype=np.float32)
-    sigma_seq  = np.empty(total, dtype=np.float32)
-    rolling    = init_window_xz.copy()  # shape (WINDOW,)
+    df = df_train.copy()
+    # Need dayofyear column (load_region uses 'doy', rename for feature builder)
+    if "dayofyear" not in df.columns and "doy" in df.columns:
+        df["dayofyear"] = df["doy"]
 
-    _NN_MODEL.eval()
-    with torch.no_grad():
-        for i in range(total):
-            inp   = np.concatenate([rolling[-_NN_WINDOW:], doy_feats[i]])[None, :]
-            inp_t = torch.tensor(inp, dtype=torch.float32)
-            k_t, s_t = _NN_MODEL(inp_t)
-            kappa_seq[i] = float(k_t.item())
-            sigma_seq[i] = float(s_t.item()) * _NN_VOLMULT
-            # Advance with OU expectation (zero-mean residual drift)
-            x_next = rolling[-1] * (1.0 - kappa_seq[i])
-            rolling = np.append(rolling, np.float32(x_next))
+    trend_int, trend_slope, detrended = _detrend_linear(df)
+    fourier_coefs, dts_residual = _deseasonalize_fourier(
+        df["dayofyear"].values, detrended, N_HARMONICS)
+    df["de_trend_seas"] = dts_residual
 
-    return kappa_seq, sigma_seq
+    feat_df = _build_feature_df(df)
+    working_df = feat_df.sort_index(ascending=False).head(365 * 5)
 
-def nn_predict(contract, year, timing):
-    """NN-OU Model C: CalibNet + volatility correction + Student-t innovations."""
-    _, itype, *_ = contract
-    s, e  = period_dates(contract, year)
-    n_d   = (e - s).days + 1
+    return {
+        "trend_intercept": float(trend_int),
+        "trend_slope": float(trend_slope),
+        "fourier_coefs": fourier_coefs,
+        "n_harmonics": N_HARMONICS,
+        "n_calib_days": len(df),
+        "working_df": working_df,
+    }
 
-    # Student-t scale: standardise to unit variance (E[t^2] = df/(df-2))
-    t_scale = float(np.sqrt((_NN_TDFREE - 2.0) / _NN_TDFREE))
 
-    def build_init_window(anchor_date):
-        """Build initial rolling window of standardised residuals ending at anchor_date."""
-        w_dates  = pd.date_range(anchor_date - pd.Timedelta(days=_NN_WINDOW - 1),
-                                 periods=_NN_WINDOW, freq="D")
-        hist_T   = np.array([float(df.loc[nearest(df, d), "T"]) for d in w_dates])
-        hist_s   = _nn_seasonal(w_dates)
-        return ((hist_T - hist_s - _NN_XMEAN) / _NN_XSTD).astype(np.float32)
+def compute_wavelet_calib_context(region, calib_year, df_train_raw):
+    """
+    Build calibration context for WaveletFNN using region_temp_extended.csv,
+    which is the same data source the wavelet models were trained on.
 
-    if timing == "180":
-        v0    = nearest(df, s - pd.Timedelta(days=180))
-        T0    = float(df.loc[v0, "T"])
-        total = 180 + n_d
-        dates = pd.date_range(v0, periods=total, freq="D")
+    df_train_raw: the region's training data from region_avg.csv (for actual T).
 
-        s_fut            = _nn_seasonal(dates)
-        init_xz          = build_init_window(v0)
-        kappa_seq, sig_seq = _nn_kappa_sigma_sequence(dates, init_xz)
+    Steps:
+      1. Read pre-computed features from region_temp_extended.csv
+      2. Filter to region and dates <= calib_year (matching wavelet training)
+      3. Build working_df from last 5 years (features already computed)
+      4. Derive trend+seasonal = T_actual - de_trend_seas, fit OLS+Fourier
+         to get coefficients for converting predictions back to actual °C
+    """
+    ext = pd.read_csv(EXTENDED_CSV)
+    ext["date"] = pd.to_datetime(ext["date"])
 
-        x0z  = float((T0 - s_fut[0] - _NN_XMEAN) / _NN_XSTD)
-        eps  = (np.random.standard_t(df=_NN_TDFREE, size=(N_SIMS, total))
-                * t_scale).astype(np.float32)
+    # Find region column
+    region_col = None
+    for c in ["region_code", "name"]:
+        if c in ext.columns:
+            region_col = c; break
+    if region_col is None:
+        raise ValueError("Cannot find region column in region_temp_extended.csv")
 
-        Xz          = np.empty((N_SIMS, total), dtype=np.float32)
-        Xz[:, 0]    = x0z
-        for i in range(1, total):
-            Xz[:, i] = Xz[:, i-1] * (1.0 - kappa_seq[i]) + sig_seq[i] * eps[:, i]
+    ext = ext[ext[region_col] == region].copy()
+    # Remove Feb 29
+    ext = ext[~((ext["date"].dt.month == 2) & (ext["date"].dt.day == 29))].copy()
+    ext = ext.sort_values("date").reset_index(drop=True)
 
-        paths = Xz[:, -n_d:] * _NN_XSTD + _NN_XMEAN + s_fut[-n_d:]
-        hi    = 0.0
+    # Filter to calibration period
+    calib_end = pd.Timestamp(f"{calib_year}-12-31")
+    ext_calib = ext[ext["date"] <= calib_end].copy()
 
-    else:  # mid-measurement
-        mid_d = nearest(df, s + pd.Timedelta(days=n_d // 2 - 1))
-        T0    = float(df.loc[mid_d, "T"])
-        rem   = n_d - n_d // 2
-        dates = pd.date_range(mid_d + pd.Timedelta(days=1), periods=rem, freq="D")
+    if len(ext_calib) < 365 * 6:
+        return None
 
-        s_fut  = _nn_seasonal(dates)
-        s_mid  = float(_nn_seasonal(pd.DatetimeIndex([mid_d]))[0])
-        init_xz = build_init_window(mid_d)
-        kappa_seq, sig_seq = _nn_kappa_sigma_sequence(dates, init_xz)
+    # Ensure dayofyear exists
+    if "dayofyear" not in ext_calib.columns:
+        ext_calib["dayofyear"] = ext_calib["date"].apply(_doy_noleap)
 
-        x0z  = float((T0 - s_mid - _NN_XMEAN) / _NN_XSTD)
-        eps  = (np.random.standard_t(df=_NN_TDFREE, size=(N_SIMS, rem))
-                * t_scale).astype(np.float32)
+    # Build working_df: last 5 years, date-indexed, with all feature cols
+    ext_calib = ext_calib.set_index("date")
+    working_df = ext_calib.sort_index(ascending=False).head(365 * 5)
 
-        Xz       = np.empty((N_SIMS, rem), dtype=np.float32)
-        Xz[:, 0] = x0z * (1.0 - kappa_seq[0]) + sig_seq[0] * eps[:, 0]
-        for i in range(1, rem):
-            Xz[:, i] = Xz[:, i-1] * (1.0 - kappa_seq[i]) + sig_seq[i] * eps[:, i]
+    # Ensure diff_yday exists for create_feat rolling stats
+    if "diff_yday" not in working_df.columns:
+        dts_sorted = ext_calib.sort_index()["de_trend_seas"]
+        ext_calib["diff_yday"] = dts_sorted - dts_sorted.shift(1)
+        working_df = ext_calib.sort_index(ascending=False).head(365 * 5)
 
-        paths = Xz * _NN_XSTD + _NN_XMEAN + s_fut
-        hi    = hdd_cdd(df.loc[(df.index >= s) & (df.index <= mid_d), "T"], itype)
+    # Derive trend+seasonal coefficients for back-conversion:
+    # trend_seasonal(t) = T_actual(t) - de_trend_seas(t)
+    # Fit: trend_seasonal = intercept + slope*t_idx + Fourier(doy)
+    raw_train = df_train_raw.copy()
+    raw_train = raw_train[~((raw_train["date"].dt.month == 2) & (raw_train["date"].dt.day == 29))].copy()
+    raw_train = raw_train.sort_values("date").reset_index(drop=True)
 
-    idx = np.maximum(T_REF - paths, 0).sum(1) if itype == "HDD" \
-          else np.maximum(paths - T_REF, 0).sum(1)
-    return hi + float(idx.mean())
+    # Align by date: merge actual T from region_avg with de_trend_seas from extended
+    ext_flat = ext[ext["date"] <= calib_end][["date", "de_trend_seas"]].copy()
+    ext_flat = ext_flat.sort_values("date").reset_index(drop=True)
+    merged = pd.merge(raw_train[["date", "T"]], ext_flat, on="date", how="inner")
 
-records = []
+    if len(merged) < 365:
+        return None
+
+    merged["t_idx"] = np.arange(len(merged), dtype=float)
+    merged["doy"] = merged["date"].apply(_doy_noleap)
+    merged["trend_seas"] = merged["T"] - merged["de_trend_seas"]
+
+    # Fit OLS + Fourier to trend_seas
+    t = merged["t_idx"].values
+    doy = merged["doy"].values
+    ts = merged["trend_seas"].values
+    mask = ~np.isnan(ts)
+
+    # Linear trend
+    A_lin = np.column_stack([np.ones(mask.sum()), t[mask]])
+    lin_coefs, _, _, _ = np.linalg.lstsq(A_lin, ts[mask], rcond=None)
+    trend_int, trend_slope = lin_coefs[0], lin_coefs[1]
+    detrended_ts = ts - (trend_int + trend_slope * t)
+
+    # Fourier on residual
+    cols = [np.ones(mask.sum())]
+    for k in range(1, N_HARMONICS + 1):
+        cols.append(np.sin(2 * np.pi * k * doy[mask] / 365.0))
+        cols.append(np.cos(2 * np.pi * k * doy[mask] / 365.0))
+    X_four = np.column_stack(cols)
+    fourier_coefs, _, _, _ = np.linalg.lstsq(X_four, detrended_ts[mask], rcond=None)
+
+    return {
+        "trend_intercept": float(trend_int),
+        "trend_slope": float(trend_slope),
+        "fourier_coefs": fourier_coefs,
+        "n_harmonics": N_HARMONICS,
+        "n_calib_days": len(merged),
+        "working_df": working_df,
+    }
+
+
+
+# ===========================================================================
+# SECTION 3: OU MODEL LOADERS AND FORECASTERS
+# ===========================================================================
+
+def load_alaton(region, calib_year):
+    with open(os.path.join(ALATON_DIR, f"alaton_model_{region}_calib_{calib_year}.pkl"), "rb") as f:
+        return pickle.load(f)
+
+def load_benth(region, calib_year):
+    with open(os.path.join(BENTH_DIR, f"ou_levy_model_{region}_calib_{calib_year}.pkl"), "rb") as f:
+        return pickle.load(f)
+
+def _t_idx_for_dates(dates, t_origin):
+    t_vals = []
+    for d in dates:
+        dr = pd.date_range(t_origin, d, freq="D")
+        mask = ~((dr.month == 2) & (dr.day == 29))
+        t_vals.append(int(mask.sum()) - 1)
+    return np.array(t_vals, dtype=float)
+
+def alaton_seasonal_mean(t_idx, A, B, C, phi):
+    return A + B * t_idx + C * np.sin(OMEGA * t_idx + phi)
+
+def benth_seasonal_mean(t_idx, a, b, b1, g1):
+    return a + b * t_idx + b1 * np.cos(2 * np.pi * (t_idx - g1) / 365.0)
+
+def forecast_hba(df_train, doy_stats, test_dates):
+    return np.array([doy_stats[_doy_noleap(d)] for d in test_dates], dtype=float)
+
+def forecast_alaton(alaton_params, df_train, test_dates):
+    A, B, C, phi = [float(alaton_params[k]) for k in ("A", "B", "C", "phi")]
+    a = float(alaton_params["a"]); exp_a = np.exp(-a)
+    df_pkl = alaton_params["df"].copy()
+    t_origin = df_pkl.index[0] if isinstance(df_pkl.index[0], pd.Timestamp) else pd.Timestamp(df_pkl.index[0])
+    test_t = _t_idx_for_dates(pd.DatetimeIndex(test_dates), t_origin)
+    T_last = float(df_train.iloc[-1]["T"])
+    t_last = float(_t_idx_for_dates(pd.DatetimeIndex([df_train.iloc[-1]["date"]]), t_origin)[0])
+    forecasts = np.empty(len(test_dates)); T_prev, t_prev = T_last, t_last
+    for i, t_curr in enumerate(test_t):
+        T_m_prev = alaton_seasonal_mean(np.array([t_prev]), A, B, C, phi)[0]
+        T_m_curr = alaton_seasonal_mean(np.array([t_curr]), A, B, C, phi)[0]
+        T_curr = T_m_curr + exp_a * (T_prev - T_m_prev)
+        forecasts[i] = T_curr; T_prev = T_curr; t_prev = t_curr
+    return forecasts
+
+def forecast_benth(benth_params, df_train, test_dates):
+    a_par, b_par, b1, g1 = [float(benth_params[k]) for k in ("a", "b", "b1", "g1")]
+    k = float(benth_params["alpha"]); exp_k = np.exp(-k)
+    df_pkl = benth_params["df"].copy()
+    t_origin = df_pkl.index[0] if isinstance(df_pkl.index[0], pd.Timestamp) else pd.Timestamp(df_pkl.index[0])
+    test_t = _t_idx_for_dates(pd.DatetimeIndex(test_dates), t_origin)
+    T_last = float(df_train.iloc[-1]["T"])
+    t_last = float(_t_idx_for_dates(pd.DatetimeIndex([df_train.iloc[-1]["date"]]), t_origin)[0])
+    forecasts = np.empty(len(test_dates)); T_prev, t_prev = T_last, t_last
+    for i, t_curr in enumerate(test_t):
+        s_prev = benth_seasonal_mean(np.array([t_prev]), a_par, b_par, b1, g1)[0]
+        s_curr = benth_seasonal_mean(np.array([t_curr]), a_par, b_par, b1, g1)[0]
+        T_curr = s_curr + exp_k * (T_prev - s_prev)
+        forecasts[i] = T_curr; T_prev = T_curr; t_prev = t_curr
+    return forecasts
+
+
+# ===========================================================================
+# SECTION 4: ML MODEL SHARED HELPERS (XGB + WaveletFNN)
+# ===========================================================================
+
+def _next_date_skip_feb29(d):
+    nxt = d + datetime.timedelta(days=1)
+    if nxt.month == 2 and nxt.day == 29:
+        nxt = nxt + datetime.timedelta(days=1)
+    return nxt
+
+def _compute_trend_seasonal_single(t_idx, doy, trend_int, trend_slope,
+                                     fourier_coefs, n_harmonics):
+    trend = trend_int + trend_slope * t_idx
+    cols = [1.0]
+    for k in range(1, n_harmonics + 1):
+        cols.append(np.sin(2 * np.pi * k * doy / 365.0))
+        cols.append(np.cos(2 * np.pi * k * doy / 365.0))
+    return trend + np.dot(cols, fourier_coefs)
+
+def _create_feat(df, pdtn):
+    """Paper author's create_feat for recursive walk-forward (shared by XGB & WaveletFNN)."""
+    df = df.sort_index(ascending=False)
+    today = df.index.max()
+    today_row = df.loc[[today]]
+
+    dayofyear = int(today_row["pdtn_doy"].iloc[0])
+    pdtn_doy = 1 if dayofyear == 365 else dayofyear + 1
+    de_trend_seas = pdtn
+    dts_doyavge = df[df["dayofyear"] == dayofyear]["dts_doyavge"].iloc[0]
+    dts_doyvar = df[df["dayofyear"] == dayofyear]["dts_doyvar"].iloc[0]
+
+    yday = today_row["de_trend_seas"].iloc[0]
+    IIdays_ago = df["de_trend_seas"].iloc[1]; IIIdays_ago = df["de_trend_seas"].iloc[2]
+    IVdays_ago = df["de_trend_seas"].iloc[3]; Vdays_ago = df["de_trend_seas"].iloc[4]
+    VIdays_ago = df["de_trend_seas"].iloc[5]; VIIdays_ago = df["de_trend_seas"].iloc[6]
+
+    last_year = df["de_trend_seas"].iloc[364]; last_2year = df["de_trend_seas"].iloc[729]
+    last_3year = df["de_trend_seas"].iloc[1094]; last_4year = df["de_trend_seas"].iloc[1459]
+    last_5year = df["de_trend_seas"].iloc[1824]
+
+    h1_last_year = df["de_trend_seas"].iloc[363]; h1_last_2years = df["de_trend_seas"].iloc[728]
+    h1_last_3years = df["de_trend_seas"].iloc[1093]; h1_last_4years = df["de_trend_seas"].iloc[1458]
+    h1_last_5years = df["de_trend_seas"].iloc[1823]
+
+    h1_ly_2days = df["de_trend_seas"].iloc[365]; h1_ly_3day = df["de_trend_seas"].iloc[366]
+    h1_ly_4day = df["de_trend_seas"].iloc[367]; h1_ly_5day = df["de_trend_seas"].iloc[368]
+    h1_ly_6day = df["de_trend_seas"].iloc[369]; h1_ly_7day = df["de_trend_seas"].iloc[370]
+
+    h1_ly_next_1day = df["de_trend_seas"].iloc[362]; h1_ly_next_2days = df["de_trend_seas"].iloc[361]
+    h1_ly_next_3days = df["de_trend_seas"].iloc[360]; h1_ly_next_4days = df["de_trend_seas"].iloc[359]
+    h1_ly_next_5days = df["de_trend_seas"].iloc[358]; h1_ly_next_6days = df["de_trend_seas"].iloc[357]
+    h1_ly_next_7days = df["de_trend_seas"].iloc[356]
+
+    diff_1year = pdtn - last_year; diff_2year = pdtn - last_2year
+    diff_3year = pdtn - last_3year; diff_4year = pdtn - last_4year
+    diff_5year = pdtn - last_5year
+    diff_yday = pdtn - yday; diff_2days = pdtn - IIdays_ago
+    diff_3days = pdtn - IIIdays_ago; diff_4days = pdtn - IVdays_ago
+    diff_5days = pdtn - Vdays_ago; diff_6days = pdtn - VIdays_ago
+    diff_7days = pdtn - VIIdays_ago
+
+    last_7_1day_deltas_mean = df["diff_yday"].iloc[0:7].mean()
+    last_7_1day_deltas_min = df["diff_yday"].iloc[0:7].min()
+    last_7_1day_deltas_max = df["diff_yday"].iloc[0:7].max()
+
+    return [[
+        dayofyear, pdtn_doy, de_trend_seas, dts_doyavge, dts_doyvar,
+        yday, IIdays_ago, IIIdays_ago, IVdays_ago, Vdays_ago, VIdays_ago, VIIdays_ago,
+        last_year, last_2year, last_3year, last_4year, last_5year,
+        h1_last_year, h1_last_2years, h1_last_3years, h1_last_4years, h1_last_5years,
+        h1_ly_2days, h1_ly_3day, h1_ly_4day, h1_ly_5day, h1_ly_6day, h1_ly_7day,
+        h1_ly_next_1day, h1_ly_next_2days, h1_ly_next_3days,
+        h1_ly_next_4days, h1_ly_next_5days, h1_ly_next_6days, h1_ly_next_7days,
+        diff_1year, diff_2year, diff_3year, diff_4year, diff_5year,
+        diff_yday, diff_2days, diff_3days, diff_4days, diff_5days, diff_6days, diff_7days,
+        last_7_1day_deltas_mean, last_7_1day_deltas_min, last_7_1day_deltas_max,
+    ]]
+
+
+def _recursive_forecast(predict_fn, working_df, test_dates,
+                         trend_int, trend_slope, fourier_coefs,
+                         n_harmonics, n_calib_days, feature_cols):
+    """
+    Generic 365-step recursive walk-forward forecast loop.
+    predict_fn: callable(feature_row_2d) -> float  (de_trend_seas prediction)
+    """
+    oodf = working_df.copy()
+    if "diff_yday" not in oodf.columns:
+        dts = oodf.sort_index()["de_trend_seas"]
+        oodf["diff_yday"] = dts - dts.shift(1)
+
+    n_steps = len(test_dates)
+    forecasts_actual = np.full(n_steps, np.nan)
+
+    for i in range(n_steps):
+        latest_day = oodf.index.max()
+        next_day = _next_date_skip_feb29(latest_day)
+        latest_row = oodf.loc[[latest_day]]
+        dts_pred = predict_fn(latest_row[feature_cols].values.reshape(1, -1))
+        try:
+            new_row_data = _create_feat(df=oodf, pdtn=dts_pred)
+        except (IndexError, KeyError) as e:
+            print(f"    WARNING: _create_feat failed at step {i}: {e}"); break
+        new_row = pd.DataFrame(data=new_row_data, index=[next_day], columns=feature_cols)
+        oodf = pd.concat([oodf, new_row], axis=0)
+        t_idx = float(n_calib_days + i)
+        doy = _doy_noleap(next_day)
+        trend_seas = _compute_trend_seasonal_single(
+            t_idx, doy, trend_int, trend_slope, fourier_coefs, n_harmonics)
+        forecasts_actual[i] = dts_pred + trend_seas
+
+    return forecasts_actual
+
+
+# ---- Paper XGBoost ----
+
+def load_paper_xgb(region, calib_year):
+    pkl_path = PAPER_XGB_DIR / f"paper_xgb_region_{region}_calib_{calib_year}.pkl"
+    with open(pkl_path, "rb") as f:
+        return pickle.load(f)
+
+def forecast_paper_xgb(payload, test_dates, calib_ctx):
+    """XGB forecast using PKL's own model+scaler, and calib_ctx for trend/working_df."""
+    model = payload["fitted_model"]
+    scaler = payload["scaler"]
+    # Use PKL's own trend/working_df if available, otherwise fall back to calib_ctx
+    trend_int = payload.get("trend_intercept", calib_ctx["trend_intercept"])
+    trend_slope = payload.get("trend_slope", calib_ctx["trend_slope"])
+    fourier_coefs = payload.get("fourier_coefs", calib_ctx["fourier_coefs"])
+    n_harmonics = payload.get("n_harmonics", calib_ctx["n_harmonics"])
+    n_calib_days = payload.get("n_calib_days", calib_ctx["n_calib_days"])
+    working_df = payload.get("working_df", calib_ctx["working_df"])
+    feature_cols = payload.get("feature_cols", FEATURE_COLS)
+
+    def predict_fn(X):
+        return float(model.predict(scaler.transform(X))[0])
+
+    return _recursive_forecast(predict_fn, working_df, test_dates,
+                                trend_int, trend_slope, fourier_coefs,
+                                n_harmonics, n_calib_days, feature_cols)
+
+
+# ---- Wavelet FNN ----
+
+def load_wavelet_fnn(region, calib_year):
+    prediction_year = calib_year + 1
+    pkl_path = WAVELET_FNN_DIR / f"wavelet_fnn_region_{region}_calib_{calib_year}_predict_{prediction_year}.pkl"
+    with open(pkl_path, "rb") as f:
+        return pickle.load(f)
+
+def forecast_wavelet_fnn(payload, test_dates, calib_ctx):
+    """WaveletFNN forecast using PKL's pipeline, and calib_ctx for trend/working_df."""
+    pipeline = payload["fitted_model"]   # key name in wavelet PKL
+    # Wavelet PKLs don't contain trend/working_df — always use calib_ctx
+    trend_int = calib_ctx["trend_intercept"]
+    trend_slope = calib_ctx["trend_slope"]
+    fourier_coefs = calib_ctx["fourier_coefs"]
+    n_harmonics = calib_ctx["n_harmonics"]
+    n_calib_days = calib_ctx["n_calib_days"]
+    working_df = calib_ctx["working_df"]
+
+    def predict_fn(X):
+        return float(pipeline.predict(X)[0])
+
+    return _recursive_forecast(predict_fn, working_df, test_dates,
+                                trend_int, trend_slope, fourier_coefs,
+                                n_harmonics, n_calib_days, FEATURE_COLS)
+
+
+# ===========================================================================
+# SECTION 5: METRICS (Equations 9–11)
+# ===========================================================================
+
+def cumulative_index(T_arr, metric):
+    if metric == "CAT": return float(np.sum(T_arr))
+    elif metric == "HDD": return float(np.sum(np.maximum(0.0, T_REF - T_arr)))
+    else: return float(np.sum(np.maximum(0.0, T_arr - T_REF)))
+
+def compute_ape(T_actual, T_forecast, metric):
+    d = {}
+    for h, (s, e) in HORIZONS.items():
+        ya = cumulative_index(T_actual[s:e], metric)
+        yf = cumulative_index(T_forecast[s:e], metric)
+        if abs(ya) < 1e-8: d[h] = np.nan
+        elif metric in ("HDD", "CDD") and ya < MIN_INDEX: d[h] = np.nan
+        else: d[h] = abs(ya - yf) / abs(ya)
+    return d
+
+def compute_mape(T_actual, T_forecast):
+    r = {}
+    for h, (s, e) in HORIZONS.items():
+        ya = T_actual[s:e]; yf = T_forecast[s:e]; m = np.abs(ya) > 1e-8
+        r[h] = float(np.mean(np.abs(ya[m] - yf[m]) / np.abs(ya[m]))) if m.any() else np.nan
+    return r
+
+def compute_rmse(T_actual, T_forecast):
+    return {h: float(np.sqrt(np.mean((T_actual[s:e] - T_forecast[s:e]) ** 2))) for h, (s, e) in HORIZONS.items()}
+
+def compute_mae(T_actual, T_forecast):
+    return {h: float(np.mean(np.abs(T_actual[s:e] - T_forecast[s:e]))) for h, (s, e) in HORIZONS.items()}
+
+def compute_wmape(T_actual, T_forecast):
+    r = {}
+    for h, (s, e) in HORIZONS.items():
+        ya = T_actual[s:e]; yf = T_forecast[s:e]; d = np.sum(np.abs(ya))
+        r[h] = float(np.sum(np.abs(ya - yf)) / d) if d > 1e-8 else np.nan
+    return r
+
+
+# ===========================================================================
+# SECTION 6: STATISTICAL TESTS (§4.4)
+# ===========================================================================
+
+def rank_models(ape_matrix, metadata):
+    n_obs = len(metadata); rd = {}
+    for h in HORIZON_NAMES:
+        rd[h] = {}
+        for oi in range(n_obs):
+            vals = {m: ape_matrix[m][oi][h] for m in MODEL_ORDER}
+            valid = {m: v for m, v in vals.items() if not np.isnan(v)}
+            if not valid: rd[h][oi] = {m: np.nan for m in MODEL_ORDER}; continue
+            sm = sorted(valid, key=lambda m: valid[m])
+            ranks = {m: np.nan for m in MODEL_ORDER}
+            for r, m in enumerate(sm, 1): ranks[m] = float(r)
+            rd[h][oi] = ranks
+    return rd
+
+def rank_count_table(rd):
+    rows = {m: {} for m in MODEL_ORDER}
+    for h in HORIZON_NAMES:
+        counts = {m: 0 for m in MODEL_ORDER}
+        for ri, rdict in rd[h].items():
+            best = min((rdict[m] for m in MODEL_ORDER if not np.isnan(rdict[m])), default=np.nan)
+            if np.isnan(best): continue
+            for m in MODEL_ORDER:
+                if rdict[m] == best: counts[m] += 1
+        for m in MODEL_ORDER: rows[m][h] = counts[m]
+    return pd.DataFrame(rows, index=HORIZON_NAMES).T
+
+def avg_rank_table(rd):
+    rows = {m: {} for m in MODEL_ORDER}
+    for h in HORIZON_NAMES:
+        for m in MODEL_ORDER:
+            vals = [rd[h][ri][m] for ri in rd[h] if not np.isnan(rd[h][ri][m])]
+            rows[m][h] = float(np.mean(vals)) if vals else np.nan
+    return pd.DataFrame(rows, index=HORIZON_NAMES).T
+
+def run_friedman_nemenyi(rd):
+    results = []
+    for h in HORIZON_NAMES:
+        rr = []
+        for ri in rd[h]:
+            row = [rd[h][ri][m] for m in MODEL_ORDER]
+            if not any(np.isnan(v) for v in row): rr.append(row)
+        if len(rr) < 3:
+            results.append({"horizon": h, "friedman_p": np.nan, **{m: np.nan for m in MODEL_ORDER}}); continue
+        mat = np.array(rr)
+        try: _, p = friedmanchisquare(*[mat[:, j] for j in range(mat.shape[1])])
+        except: p = np.nan
+        ar = {m: float(mat[:, j].mean()) for j, m in enumerate(MODEL_ORDER)}
+        results.append({"horizon": h, "friedman_p": round(p, 6), **ar})
+    return pd.DataFrame(results).set_index("horizon")
+
+def cluster_regions(rm, n_clusters=None):
+    M = np.array(rm); k = n_clusters or max(2, min(4, len(M) // 2))
+    return KMeans(n_clusters=k, random_state=42, n_init=10).fit_predict(M)
+
+def blocked_bootstrap_wilcoxon(ape_matrix, metadata, cluster_labels, n_bootstrap=N_BOOTSTRAP):
+    rng = np.random.default_rng(42); nm = len(MODEL_ORDER); no = len(metadata)
+    r2c = {r: int(cluster_labels[i]) for i, r in enumerate(REGIONS)}
+    oc = np.array([r2c[m["region"]] for m in metadata]); cl = np.unique(oc)
+    results = []
+    for h in HORIZON_NAMES:
+        aa = np.array([[ape_matrix[m][oi][h] for oi in range(no)] for m in MODEL_ORDER])
+        br = np.zeros((n_bootstrap, nm))
+        for b in range(n_bootstrap):
+            s = []
+            for c in cl:
+                ci = np.where(oc == c)[0]; s.extend(rng.choice(ci, size=len(ci), replace=True).tolist())
+            s = np.array(s); sub = aa[:, s]; por = np.full_like(sub, np.nan)
+            for col in range(sub.shape[1]):
+                cv = sub[:, col]; v = ~np.isnan(cv)
+                if v.sum() < 2: continue
+                rk = np.full(nm, np.nan); vi = np.where(v)[0]; sv = vi[np.argsort(cv[v])]
+                for r, vi2 in enumerate(sv, 1): rk[vi2] = r
+                por[:, col] = rk
+            br[b] = np.nanmean(por, axis=1)
+        abr = br.mean(axis=0); ci2 = int(np.argmin(abr))
+        row = {"horizon": h, "n_obs": no, "control_model": MODEL_ORDER[ci2]}
+        for j, m in enumerate(MODEL_ORDER): row[f"{m}_avg_rank"] = round(float(abr[j]), 3)
+        for j, m in enumerate(MODEL_ORDER):
+            if j == ci2: row[f"{m}_wilcoxon_p"] = np.nan; continue
+            diff = br[:, j] - br[:, ci2]
+            if np.all(diff == 0) or len(diff) < 10: row[f"{m}_wilcoxon_p"] = np.nan; continue
+            try: _, p = scipy_wilcoxon(diff, alternative="two-sided")
+            except: p = np.nan
+            row[f"{m}_wilcoxon_p"] = round(float(p), 6)
+        results.append(row)
+    return pd.DataFrame(results).set_index("horizon")
+
+def metric_table(md, meta):
+    rows = []
+    for oi, mr in enumerate(meta):
+        for m in MODEL_ORDER:
+            row = {"region": mr["region"], "year": mr["year"], "model": m}
+            row.update(md[m][oi]); rows.append(row)
+    return pd.DataFrame(rows).set_index(["region", "year", "model"])
+
+def region_temperature_moments(df):
+    T = df["T"].values
+    return (float(np.mean(T)), float(np.std(T)), float(sp_skew(T)), float(sp_kurt(T)))
+
+
+# ===========================================================================
+# SECTION 7: MAIN EVALUATION LOOP
+# ===========================================================================
+
+print("=" * 70)
+print("  Barnor et al. (2026) Replication — French NUTS-2 Regions")
+print(f"  Models: {', '.join(MODEL_ORDER)}")
+print(f"  OOS: {OOS_START}–{OOS_END} ({len(TEST_YEARS)} yrs × {len(REGIONS)} regions = {len(TEST_YEARS)*len(REGIONS)} obs)")
+print("=" * 70)
+
+ape_results = {"CAT": {m: [] for m in MODEL_ORDER}, "HDD": {m: [] for m in MODEL_ORDER}, "CDD": {m: [] for m in MODEL_ORDER}}
+mape_res = {m: [] for m in MODEL_ORDER}; rmse_res = {m: [] for m in MODEL_ORDER}
+mae_res = {m: [] for m in MODEL_ORDER}; wmape_res = {m: [] for m in MODEL_ORDER}
+obs_metadata = []; region_moments_list = []; all_forecasts = []
+
+region_data_cache = {}
+for region in REGIONS:
+    print(f"  Loading region {region} ...", end=" ", flush=True)
+    region_data_cache[region] = load_region(region)
+    df_pre = region_data_cache[region][region_data_cache[region]["date"].dt.year < OOS_START]
+    region_moments_list.append(region_temperature_moments(df_pre))
+    print("done")
+
+print()
 
 for region in REGIONS:
-    print(f"\n{'='*60}\n  Region {region}\n{'='*60}")
+    df = region_data_cache[region]; _loaded_calib = None
+    alaton_params = benth_params = xgb_payload = wavelet_payload = calib_ctx = wavelet_calib_ctx = None
+    print(f"\n{'─'*60}\n  Region {region}\n{'─'*60}")
 
-    # ── Load region-specific models ──────────────────────────────────────────
-    with open(f"alaton_models/alaton_model_{region}.pkl", "rb") as f:
-        alaton = pickle.load(f)
-    with open(f"benth_models/ou_levy_model_{region}.pkl", "rb") as f:
-        benth = pickle.load(f)
+    for test_year in TEST_YEARS:
+        calib_year = test_year - 1
+        df_train, df_test = get_train_test_for_year(df, test_year)
+        if len(df_train) < 365 or len(df_test) == 0:
+            print(f"  [{test_year}] Insufficient data — skipping"); continue
 
-    # NN-OU: load if available, skip gracefully if PKL not yet generated
-    _nn_pkl_path = f"{NN_PKL_DIR}/ou_nn_region_{region}_calib_end_2014-12-31.pkl"
-    _nn_available = False
-    try:
-        with open(_nn_pkl_path, "rb") as f:
-            nn_pkl = pickle.load(f)
-        # Reconstruct CalibNetFlexible from stored architecture + weights
-        arch = nn_pkl["nn_architecture"]
-        _in_dim = arch["hidden"]   # placeholder; will be computed from window + doy features
-        _doy_harm = nn_pkl["doy_harmonics"]
-        _win      = nn_pkl["window"]
-        _in_dim   = _win + 2 * _doy_harm    # window residuals + DOY sin/cos features
-        _model = CalibNetFlexible(
-            in_dim     = _in_dim,
-            hidden     = arch["hidden"],
-            activation = arch["activation"],
-            n_layers   = arch["n_layers"],
-            kappa_max  = arch["kappa_max"],
-        )
-        _model.load_state_dict(nn_pkl["nn_state_dict"])
-        _model.eval()
+        test_dates = df_test["date"].tolist()
+        T_actual = df_test["T"].values.astype(float)
+        if len(T_actual) < 365:
+            T_actual = np.pad(T_actual, (0, 365 - len(T_actual)), constant_values=np.nan)
+            test_dates += [test_dates[-1] + pd.Timedelta(days=i+1) for i in range(365 - len(test_dates))]
+        else:
+            T_actual = T_actual[:365]; test_dates = test_dates[:365]
 
-        _NN_MODEL        = _model
-        # beta not stored in PKL — recompute from calibration data using same
-        # OLS design matrix as the notebook (K harmonics, linear trend)
-        _k_harm  = int(nn_pkl.get("k_harmonics", 3))
-        _df_calib = alaton["df"].loc[:nn_pkl["calib_end"]].copy()
-        _dates_c  = pd.Series(_df_calib.index)
-        _n        = len(_df_calib)
-        _doy_c    = _dates_c.dt.dayofyear.values.astype(float)
-        _t_c      = np.arange(_n) / 365.0
-        _parts    = [np.ones(_n), _t_c]
-        for _k in range(1, _k_harm + 1):
-            _parts.append(np.sin(2 * np.pi * _k * _doy_c / 365.0))
-            _parts.append(np.cos(2 * np.pi * _k * _doy_c / 365.0))
-        _X_ols   = np.column_stack(_parts)
-        _beta, *_ = np.linalg.lstsq(_X_ols, _df_calib["T"].values, rcond=None)
-        _NN_BETA         = _beta
-        _NN_XMEAN        = float(nn_pkl["x_mean"])
-        _NN_XSTD         = float(nn_pkl["x_std"])
-        _NN_VOLMULT      = float(nn_pkl["vol_multiplier"])
-        _NN_TDFREE       = float(nn_pkl["student_t_df"])
-        _NN_WINDOW       = int(nn_pkl["window"])
-        _NN_DOYHARMONICS = int(nn_pkl["doy_harmonics"])
-        _NN_KHARMONICS   = _k_harm
-        # Data start: first date in the temperature series (used to compute t-offset)
-        _NN_DATASTART    = alaton["df"].index[0]
-        _nn_available    = True
-        print(f"  NN-OU loaded: hidden={arch['hidden']}  layers={arch['n_layers']}  "
-              f"activation={arch['activation']}  vol_mult={_NN_VOLMULT:.3f}  "
-              f"t_df={_NN_TDFREE:.1f}")
-    except FileNotFoundError:
-        print(f"  NN-OU PKL not found ({_nn_pkl_path}) — skipping NN for this region")
+        if calib_year != _loaded_calib:
+            print(f"  [{test_year}] calib={calib_year}", end="  ", flush=True)
+            try: alaton_params = load_alaton(region, calib_year)
+            except FileNotFoundError: alaton_params = None
+            try: benth_params = load_benth(region, calib_year)
+            except FileNotFoundError: benth_params = None
+            try: xgb_payload = load_paper_xgb(region, calib_year)
+            except FileNotFoundError: xgb_payload = None
+            try: wavelet_payload = load_wavelet_fnn(region, calib_year)
+            except FileNotFoundError: wavelet_payload = None
 
-    # Temperature data (use Alaton's full df as ground truth)
-    df       = alaton["df"][["T"]].copy().sort_index()
-    t_origin = df.index[0]
-    df["t"]  = (df.index - t_origin).days + 1   # absolute day count, Alaton only
+            # Compute detrending context for XGB (from region_avg.csv)
+            calib_ctx = compute_calib_context(df_train)
 
-    # ── Re-initialise Benth globals for this region ───────────────────────────
-    _NIG_A, _NIG_B, _NIG_LOC, _NIG_SCALE = benth["nig_params"]
-    _NIG_MEAN  = float(norminvgauss.mean(_NIG_A, _NIG_B, loc=_NIG_LOC, scale=_NIG_SCALE))
-    _NIG_STD   = float(norminvgauss.std (_NIG_A, _NIG_B, loc=_NIG_LOC, scale=_NIG_SCALE))
-    # Paper Section 3.3: use Alaton's a for Benth for a fair comparison
-    _B_ALPHA   = float(np.exp(-alaton["a"]))
-    _B_SIGDOY  = np.array(benth["sigma_doy"])
-    _B_A       = float(benth["a"])
-    _B_B       = float(benth["b"])
-    _B_B1      = float(benth["b1"])
-    _B_G1      = float(benth["g1"])
-    _B_DF      = benth["df"].copy()
+            # Compute wavelet context from region_temp_extended.csv (matches wavelet training data)
+            wavelet_calib_ctx = compute_wavelet_calib_context(region, calib_year, df_train)
 
-    print(f"N={len(df):,}  Benth: a={_B_A:.4f}  b={_B_B:.6f}  "
-          f"warming={_B_B*365*10:.3f}C/decade")
+            _loaded_calib = calib_year; print("PKLs loaded")
+        else:
+            print(f"  [{test_year}]", end="  ", flush=True)
 
-    # Sanity check: s(t) at summer and winter dates vs observed mean T
-    for label, date_str in [("2015-01-15", "2015-01-15"), ("2015-07-15", "2015-07-15"),
-                             ("2020-01-15", "2020-01-15"), ("2020-07-15", "2020-07-15")]:
-        test_date = pd.Timestamp(date_str)
-        if test_date in _B_DF.index:
-            t_abs  = int(_B_DF.loc[test_date, "t"])
-            s_val  = float(benth_s_vec(np.array([t_abs]))[0])
-            t_obs  = float(df.loc[test_date, "T"])
-            print(f"  s({label})={s_val:.2f}C  observed={t_obs:.2f}C  diff={s_val-t_obs:+.2f}C")
+        # HBA
+        doy_stats = {}
+        for doy in range(1, 366):
+            vals = df_train.loc[df_train["doy"] == doy, "T"].values
+            doy_stats[doy] = float(np.mean(vals)) if len(vals) else float(df_train["T"].mean())
+        f_hba = forecast_hba(df_train, doy_stats, test_dates)
 
-    for contract in CONTRACTS:
-        cname, itype, *_ = contract
-        n_ok = 0
-        print(f"  {cname} ({itype}) ...", end=" ", flush=True)
-        for year in sorted(y for y in df.index.year.unique() if y >= TEST_START):
-            s_act = get_temps(df, contract, year)
-            if not is_complete(s_act, contract, year, thr=0.95): continue
-            hist  = sum(1 for yr in range(year - N_HIST - 10, year)
-                        if is_complete(get_temps(df, contract, yr), contract, yr))
-            if hist < N_HIST_MIN: continue
-            Y = hdd_cdd(s_act, itype)
-            if Y < MIN_INDEX: continue
+        # Alaton
+        f_alaton = forecast_alaton(alaton_params, df_train, test_dates) if alaton_params else np.full(365, np.nan)
 
-            for timing in ["180", "mid"]:
-                model_fns = [("HBA",    hba_predict),
-                             ("Alaton", alaton_predict),
-                             ("Benth",  benth_predict)]
-                if _nn_available:
-                    model_fns.append(("NN-OU", nn_predict))
+        # Benth
+        f_benth = forecast_benth(benth_params, df_train, test_dates) if benth_params else np.full(365, np.nan)
 
-                for mk, fn in model_fns:
-                    pred = fn(contract, year, timing)
-                    if pred and pred > 0:
-                        d = (pred - Y) / Y
-                        records.append({"region": region, "year": year,
-                                        "contract": cname, "itype": itype,
-                                        "model": mk, "timing": timing,
-                                        "Y_actual": Y, "Y_pred": pred,
-                                        "delta": d, "delta_sq": d**2})
-            n_ok += 1
-        print(n_ok)
+        # Paper XGBoost — recursive walk-forward (§3.2.3)
+        f_xgb = forecast_paper_xgb(xgb_payload, test_dates, calib_ctx) if xgb_payload else np.full(365, np.nan)
 
-res = pd.DataFrame(records)
-print(f"\nTotal evaluations: {len(res):,}")
+        # Wavelet FNN — recursive walk-forward (§3.2.3)
+        if wavelet_payload and wavelet_calib_ctx:
+            f_wavelet = forecast_wavelet_fnn(wavelet_payload, test_dates, wavelet_calib_ctx)
+        else:
+            f_wavelet = np.full(365, np.nan)
 
-# ---------------------------------------------------------------------------
-# Table 4 -- MRE and MSRE
-# ---------------------------------------------------------------------------
+        forecasts = {"HBA": f_hba, "Alaton": f_alaton, "Benth": f_benth,
+                     "XGB": f_xgb, "WaveletFNN": f_wavelet}
 
-print(f"\n# Table 4 -- MRE and MSRE")
-print(f"  {'Model':<26} {'MRE 180':>10} {'MRE mid':>9} {'MSRE 180':>10} {'MSRE mid':>10} {'N':>5}")
-print("  " + "-" * 72)
-for itype in ["HDD", "CDD"]:
-    print(f"\n  {itype}")
-    for m in MODEL_ORDER:
-        rows = {t: res[(res.itype == itype) & (res.timing == t) & (res.model == m)]
-                for t in ["180", "mid"]}
-        n = len(rows["180"])
-        if n == 0: continue
-        print(f"  {LABELS[m]:<26}"
-              f" {rows['180']['delta'].mean():>9.2%}"
-              f" {rows['mid']['delta'].mean():>9.2%}"
-              f" {rows['180']['delta_sq'].mean():>9.2%}"
-              f" {rows['mid']['delta_sq'].mean():>9.2%}"
-              f" {n:>5}")
+        for m, f_arr in forecasts.items():
+            for d, T_hat, T_act in zip(test_dates, f_arr, T_actual):
+                all_forecasts.append({"region": region, "year": test_year, "date": d,
+                                      "actual": T_act, "model": m, "forecast": T_hat})
 
-# ---------------------------------------------------------------------------
-# Table 5 -- Mann-Whitney U test
-# ---------------------------------------------------------------------------
+        obs_metadata.append({"region": region, "year": test_year})
+        for m, f_arr in forecasts.items():
+            ape_results["CAT"][m].append(compute_ape(T_actual, f_arr, "CAT"))
+            ape_results["HDD"][m].append(compute_ape(T_actual, f_arr, "HDD"))
+            ape_results["CDD"][m].append(compute_ape(T_actual, f_arr, "CDD"))
+            mape_res[m].append(compute_mape(T_actual, f_arr))
+            rmse_res[m].append(compute_rmse(T_actual, f_arr))
+            mae_res[m].append(compute_mae(T_actual, f_arr))
+            wmape_res[m].append(compute_wmape(T_actual, f_arr))
 
-def mw_pval(x, y):
-    _, p = mannwhitneyu(x, y, alternative="less")
-    return p
+        xgb_cat = ape_results['CAT']['XGB'][-1].get('90', float('nan'))
+        wav_cat = ape_results['CAT']['WaveletFNN'][-1].get('90', float('nan'))
+        print(f"    XGB CAT-90={xgb_cat*100:.1f}%  WaveletFNN CAT-90={wav_cat*100:.1f}%")
 
-def stars(p):
-    return "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
+n_obs = len(obs_metadata)
+print(f"\n{'='*70}\n  Complete. {n_obs} obs ({len(REGIONS)} regions × {len(TEST_YEARS)} years)\n{'='*70}")
 
-print(f"\n# Table 5 -- Mann-Whitney U  (H1: row MSRE < col MSRE)")
-active_models = [m for m in MODEL_ORDER if m in res["model"].unique()]
-for timing in ["180", "mid"]:
-    print(f"\n  {'180 days ahead' if timing == '180' else 'Mid period'}")
-    sub = res[res.timing == timing]
-    for mx in active_models:
-        row = f"  {LABELS[mx]:<26}"
-        for my in active_models:
-            if mx == my: row += f"  {'—':>10}"; continue
-            p = mw_pval(sub[sub.model == mx]["delta_sq"].values,
-                        sub[sub.model == my]["delta_sq"].values)
-            row += f"  {p:>7.4f}{stars(p):<3}"
-        print(row)
 
-# ---------------------------------------------------------------------------
-# Figure 5 -- scatter delta_mid vs delta_180
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# SECTION 8: RESULTS OUTPUT
+# ===========================================================================
 
-print(f"\n# Figure 5 -- Regression: delta_mid = a*delta_180 + b")
-reg = {}
-for m in active_models:
-    d180 = res[(res.timing == "180") & (res.model == m)].set_index(["region","year","contract"])["delta"]
-    dmid = res[(res.timing == "mid")  & (res.model == m)].set_index(["region","year","contract"])["delta"]
-    mg   = pd.concat([d180.rename("d180"), dmid.rename("dmid")], axis=1).dropna()
-    sl, ic, r, pv, _ = stats.linregress(mg["d180"], mg["dmid"])
-    reg[m] = (mg["d180"].values, mg["dmid"].values, sl, ic, r)
-    print(f"  {LABELS[m]:<26}  a={sl:.4f}{stars(pv):<3}  b={ic:.4f}  R2={r**2:.4f}  n={len(mg)}")
+cluster_labels = cluster_regions(region_moments_list)
+print("\n# K-MEANS CLUSTERS (§4.5)")
+for ri, region in enumerate(REGIONS):
+    m = region_moments_list[ri]
+    print(f"  Region {region}: cluster {cluster_labels[ri]}  mean={m[0]:.1f}°C  std={m[1]:.1f}")
 
-# ---------------------------------------------------------------------------
-# Figures
-# ---------------------------------------------------------------------------
+print("\n# Building metric tables ...")
+df_ape_cat = metric_table(ape_results["CAT"], obs_metadata)
+df_ape_hdd = metric_table(ape_results["HDD"], obs_metadata)
+df_ape_cdd = metric_table(ape_results["CDD"], obs_metadata)
+df_mape = metric_table(mape_res, obs_metadata)
+df_rmse = metric_table(rmse_res, obs_metadata)
+df_mae = metric_table(mae_res, obs_metadata)
+df_wmape = metric_table(wmape_res, obs_metadata)
 
-n_models = len(active_models)
+rd_cat = rank_models(ape_results["CAT"], obs_metadata)
+rd_hdd = rank_models(ape_results["HDD"], obs_metadata)
+rd_cdd = rank_models(ape_results["CDD"], obs_metadata)
 
-# Figure 1: MRE/MSRE bar charts
-fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-fig.suptitle("Table 4 Replica — MRE & MSRE by Model | All Regions\n"
-             "Schiller, Seidler & Wimmer (2012)", fontweight="bold")
+for lbl, rd in [("CAT", rd_cat), ("HDD", rd_hdd), ("CDD", rd_cdd)]:
+    rc = rank_count_table(rd); ar = avg_rank_table(rd)
+    print(f"\n# RANK COUNT — {lbl} APE\n{rc.to_string()}")
+    print(f"\n# AVG RANK — {lbl} APE\n{ar.to_string()}")
+    rc.to_csv(f"bk_rank_counts_{lbl.lower()}.csv")
+    ar.to_csv(f"bk_rank_avg_{lbl.lower()}.csv")
 
-for (ri, ci, itype, metric, timing) in [
-    (0, 0, "HDD", "delta",    "180"),
-    (0, 1, "HDD", "delta",    "mid"),
-    (1, 0, "CDD", "delta_sq", "180"),
-    (1, 1, "CDD", "delta_sq", "mid"),
-]:
-    ax   = axes[ri, ci]
-    vals = [abs(res[(res.itype == itype) & (res.timing == timing) &
-                    (res.model == m)][metric].mean())
-            if m in res["model"].unique() else 0.0
-            for m in active_models]
-    x_pos = np.arange(n_models)
-    bars  = ax.bar(x_pos, [v*100 for v in vals],
-                   color=[COLORS[m] for m in active_models], alpha=0.85, width=0.6)
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels([LABELS[m].replace(" ", "\n", 1) for m in active_models], fontsize=7)
-    ax.set_ylabel("MRE (%)" if metric == "delta" else "MSRE (%)")
-    tlbl = "180 Days Ahead" if timing == "180" else "Mid Period"
-    ax.set_title(f"{itype} — {'MRE' if metric=='delta' else 'MSRE'} — {tlbl}", fontweight="bold")
-    for j, v in enumerate(vals):
-        ax.text(j, v*100 + 0.02, f"{v:.2%}", ha="center", fontsize=7)
+print("\n# FRIEDMAN + NEMENYI (§4.4.1)")
+friedman_dfs = {}
+for lbl, ad in [("CAT", ape_results["CAT"]), ("HDD", ape_results["HDD"]), ("CDD", ape_results["CDD"])]:
+    rd = rank_models(ad, obs_metadata); dff = run_friedman_nemenyi(rd); friedman_dfs[lbl] = dff
+    print(f"\n  {lbl} APE\n{dff.to_string()}")
+pd.concat(friedman_dfs, axis=1).to_csv("bk_friedman_nemenyi.csv")
 
-fig.tight_layout()
-fig.savefig("backtest_table4.png", bbox_inches="tight", dpi=150)
-print("\nSaved -> backtest_table4.png")
+print("\n# BLOCKED BOOTSTRAP WILCOXON (§4.4.2)")
+boot_dfs = {}
+for lbl, ad in [("CAT", ape_results["CAT"]), ("HDD", ape_results["HDD"]), ("CDD", ape_results["CDD"])]:
+    print(f"  {lbl} APE ...", end=" ", flush=True)
+    dfb = blocked_bootstrap_wilcoxon(ad, obs_metadata, cluster_labels); boot_dfs[lbl] = dfb
+    print(f"done\n{dfb.to_string()}")
+pd.concat(boot_dfs, axis=1).to_csv("bk_bootstrap_wilcoxon.csv")
 
-# Figure 2: scatter delta_mid vs delta_180
-fig2, axes2 = plt.subplots(1, n_models, figsize=(5 * n_models, 5))
-if n_models == 1: axes2 = [axes2]
-fig2.suptitle("Figure 5 Replica — Mid-period vs 180-days-ahead relative errors | All Regions",
-              fontweight="bold")
-for ax, m in zip(axes2, active_models):
-    x, y, sl, ic, r = reg[m]
-    ax.scatter(x, y, s=5, alpha=0.4, color=COLORS[m])
-    xl = np.array([np.percentile(x,1), np.percentile(x,99)])
-    ax.plot(xl, sl*xl+ic, color="black", lw=1.5,
-            label=f"a={sl:.3f}  b={ic:.3f}\nR2={r**2:.3f}")
-    ax.axhline(0, color=GRAY, lw=0.5, ls="--"); ax.axvline(0, color=GRAY, lw=0.5, ls="--")
-    ax.set_xlim(xl); ax.set_ylim(np.percentile(y,1), np.percentile(y,99))
-    ax.set_xlabel("delta_180"); ax.set_ylabel("delta_mid")
-    ax.set_title(f"({chr(97+active_models.index(m))}) {LABELS[m]}", fontweight="bold")
-    ax.legend(frameon=False, fontsize=8)
-fig2.tight_layout()
-fig2.savefig("backtest_figure5.png", bbox_inches="tight", dpi=150)
-print("Saved -> backtest_figure5.png")
+df_ape_cat.to_csv("bk_ape_cat.csv"); df_ape_hdd.to_csv("bk_ape_hdd.csv"); df_ape_cdd.to_csv("bk_ape_cdd.csv")
+df_mape.to_csv("bk_mape_cat.csv"); df_rmse.to_csv("bk_rmse_hdd.csv")
+df_mae.to_csv("bk_mae_hdd.csv"); df_wmape.to_csv("bk_wmape_cat.csv")
+pd.DataFrame(all_forecasts).to_csv("bk_forecasts.csv", index=False)
+pd.DataFrame(obs_metadata).to_csv("bk_obs_metadata.csv", index=False)
 
-# Figure 3: MSRE by contract
-fig3, axes3 = plt.subplots(1, 2, figsize=(14, 6))
-fig3.suptitle("Figure 6 Replica — MSRE by Contract | All Regions", fontweight="bold")
-bar_w = 0.8 / n_models
-for ax, (timing, tlbl) in zip(axes3, [("180","180 Days Ahead"),("mid","Mid Period")]):
-    x = np.arange(len(CONTRACTS))
-    for j, m in enumerate(active_models):
-        offset = (j - n_models/2 + 0.5) * bar_w
-        vals = [res[(res.timing==timing)&(res.model==m)&(res.contract==c[0])]["delta_sq"].mean()
-                if len(res[(res.timing==timing)&(res.model==m)&(res.contract==c[0])]) else np.nan
-                for c in CONTRACTS]
-        ax.bar(x + offset, vals, width=bar_w, label=LABELS[m], color=COLORS[m], alpha=0.85)
-    ax.set_xticks(x)
-    ax.set_xticklabels([c[0] for c in CONTRACTS], rotation=40, ha="right", fontsize=8)
-    ax.set_ylabel("MSRE"); ax.set_title(tlbl, fontweight="bold")
-    ax.legend(frameon=False, fontsize=7)
-fig3.tight_layout()
-fig3.savefig("backtest_figure6.png", bbox_inches="tight", dpi=150)
-print("Saved -> backtest_figure6.png")
-
-# ---------------------------------------------------------------------------
-# Save
-# ---------------------------------------------------------------------------
-
-res.to_csv("backtest_results.csv", index=False)
-with open("model_comparison.pkl", "wb") as f:
-    pickle.dump({"results": res}, f)
-
-print("Saved -> backtest_results.csv  model_comparison.pkl")
-print(f"\nDone.  {len(res):,} evaluations  |  years: {sorted(res['year'].unique())}")
+print("\n# SAVED OUTPUTS")
+for f in ["bk_ape_cat.csv", "bk_ape_hdd.csv", "bk_ape_cdd.csv", "bk_mape_cat.csv", "bk_rmse_hdd.csv",
+          "bk_mae_hdd.csv", "bk_wmape_cat.csv", "bk_rank_counts_cat.csv", "bk_rank_counts_hdd.csv",
+          "bk_rank_counts_cdd.csv", "bk_rank_avg_cat.csv", "bk_rank_avg_hdd.csv", "bk_rank_avg_cdd.csv",
+          "bk_friedman_nemenyi.csv", "bk_bootstrap_wilcoxon.csv", "bk_forecasts.csv", "bk_obs_metadata.csv"]:
+    print(f"  Saved -> {f}")
+print(f"\nDone. {n_obs} observations, {len(all_forecasts)} forecast rows.")

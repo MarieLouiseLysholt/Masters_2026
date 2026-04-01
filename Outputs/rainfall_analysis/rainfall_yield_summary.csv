@@ -1,0 +1,9 @@
+region,region_name,n_calib,trend,temp_index,temp_months,temp_rho,temp_rho2,temp_p,rain_index,rain_months,rain_rho,rain_rho2,rain_p,p_ref_mm,r2_temp_only,r2_rain_only,r2_both,delta_r2_rain_given_temp,F_rain_given_temp,p_rain_given_temp,delta_r2_temp_given_rain,F_temp_given_rain,p_temp_given_rain,rain_sig_beyond_temp
+11,Île-de-France,15,linear (OLS),CAT,M03-M04-M05-M06-M07,-0.6893,0.4751,0.0045,RAI,M11-M12,-0.3214,0.1033,0.2427,1.732,0.5545,0.1291,0.6408,0.0863,2.882,0.1154,0.5117,17.093,0.0014,False
+24,Centre-Val de Loire,15,linear (OLS),CAT,M04-M05-M06-M07,-0.7536,0.5679,0.0012,RAI,M04,0.4464,0.1993,0.0953,2.007,0.5548,0.1111,0.5807,0.0259,0.741,0.4062,0.4696,13.441,0.0032,False
+27,Bourgogne-F-C,15,linear (OLS),HDD,M10-M11,0.6607,0.4365,0.0073,RAI,M03-M04-M05-M06,-0.4357,0.1898,0.1045,2.058,0.4101,0.0532,0.4734,0.0634,1.444,0.2527,0.4202,9.576,0.0093,False
+28,Normandie,15,linear (OLS),HDD,M10-M11-M12-M01,0.6607,0.4365,0.0073,RAI,M05-M06,-0.5179,0.2682,0.048,2.195,0.3728,0.2932,0.4608,0.088,1.958,0.1871,0.1676,3.73,0.0774,False
+32,Hauts-de-France,15,linear (OLS),CAT,M06,-0.7036,0.495,0.0034,RAI,M05-M06-M07,-0.4393,0.193,0.1014,2.096,0.3843,0.2708,0.4937,0.1095,2.595,0.1332,0.223,5.285,0.0403,False
+44,Grand Est,15,linear (OLS),HDD,M03,0.7857,0.6173,0.0005,RAI,M11-M12,-0.625,0.3906,0.0127,1.982,0.4173,0.3113,0.5456,0.1282,3.386,0.0906,0.2343,6.186,0.0286,False
+52,Pays de la Loire,15,linear (OLS),CAT,M04-M05-M06-M07,-0.525,0.2756,0.0445,RAI,M10-M11,-0.75,0.5625,0.0013,2.266,0.2131,0.4655,0.5225,0.3093,7.773,0.0164,0.057,1.432,0.2546,True
+53,Bretagne,15,linear (OLS),HDD,M10-M11-M12,0.5286,0.2794,0.0428,RAI,M12,-0.5143,0.2645,0.0498,2.339,0.2643,0.2313,0.2963,0.032,0.545,0.4744,0.065,1.108,0.3133,False

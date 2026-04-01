@@ -1,0 +1,9 @@
+strike_K,beta_qr,tick_size,tau,n_obs,ci_beta_lo,ci_beta_hi,region,best_window,index_type,doy_start,doy_end,option_type
+115.4051,0.0087,173.6706,0.3,25,-0.0037,0.021,11,HDD_May,HDD,121,151,put
+832.0053,-0.0032,64.6467,0.3,25,-0.009,0.0025,24,CAT_AprMay,CAT,91,151,call
+177.7149,0.0106,212.2556,0.3,12,,,27,CDD_AprMayJunJul,CDD,91,212,put
+380.4587,0.0033,66.1641,0.3,25,-0.0087,0.0153,28,HDD_Jan,HDD,1,31,put
+57.0066,0.0097,193.0683,0.3,12,,,32,CDD_MarAprMayJunJul,CDD,60,212,put
+338.1534,0.0056,111.9981,0.3,25,-0.0052,0.0164,44,HDD_Mar,HDD,60,90,put
+773.8092,-0.0048,96.1384,0.3,25,-0.0135,0.0038,52,CAT_AprMay,CAT,91,151,call
+408.477,-0.0074,148.5239,0.3,25,-0.0205,0.0056,53,CAT_May,CAT,121,151,call

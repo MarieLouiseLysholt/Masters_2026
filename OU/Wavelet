@@ -1,0 +1,463 @@
+"""
+Wavelet-Enhanced FNN — Rolling Calibration Training Script
+============================================================
+Uses the same preprocessing pipeline as paper_xgboost_rolling_train.py:
+  - region_avg.csv → remove Feb 29 → impute → OLS detrend → Fourier deseasonalize
+  - Build Table 2 features
+  - Nested CV (5 outer × 3 inner) once per region
+  - Rolling yearly calibration
+
+Model: Pipeline(SimpleImputer, StandardScaler, WaveletFeatureTransformer,
+                StandardScaler, MLPRegressor)
+
+Output PKLs saved to: EXPORT_DIR / wavelet_fnn_region_{R}_calib_{Y}.pkl
+Each PKL contains:
+  - fitted_pipeline:  full sklearn Pipeline (handles all transforms + prediction)
+  - trend_intercept:  OLS intercept for de_trend_seas → T conversion
+  - trend_slope:      OLS slope
+  - fourier_coefs:    Fourier regression coefficients
+  - n_harmonics:      number of harmonics
+  - best_params:      best pipeline hyperparameters from nested CV
+  - working_df:       last 5 years of processed training data (for create_feat)
+  - feature_cols:     feature column names
+  - n_calib_days:     number of calibration days (for t_idx in forecasting)
+"""
+
+import os
+import datetime
+import pickle
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.experimental import enable_halving_search_cv  # noqa: F401
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import TimeSeriesSplit, HalvingGridSearchCV
+from sklearn.neural_network import MLPRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_absolute_percentage_error,
+    mean_squared_error,
+    r2_score,
+)
+
+warnings.filterwarnings("ignore")
+np.random.seed(23)
+
+# ===========================================================================
+# CONFIG
+# ===========================================================================
+
+RAW_CSV    = "EDA/region_avg.csv"
+EXPORT_DIR = Path("Outputs/WaveletFNN_rolling_exports")
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+REGIONS = [11, 24, 27, 28, 32, 44, 52, 53]
+
+START_CALIB_YEAR = 2014
+END_CALIB_YEAR   = 2023
+
+RANDOM_STATE = 23
+N_HARMONICS  = 3
+
+# Wavelet FNN hyperparameter grid — matches wavelet.ipynb
+WAVELET_FNN_GRID = {
+    "wavelet__n_wavelets": [1, 2, 3, 5],
+    "wavelet__wavelet": ["mexican_hat", "morlet"],
+    "wavelet__include_original": [True],
+    "mlp__hidden_layer_sizes": [(50,), (25,), (12,), (25, 10), (25, 10, 5)],
+    "mlp__activation": ["relu", "tanh"],
+    "mlp__learning_rate": ["constant", "invscaling", "adaptive"],
+    "mlp__learning_rate_init": [0.001, 0.005],
+    "mlp__max_iter": [2000],
+    "mlp__tol": [0.0001, 0.0005],
+    "mlp__early_stopping": [True],
+    "mlp__validation_fraction": [0.1, 0.2],
+}
+
+FEATURE_COLS = [
+    "dayofyear", "pdtn_doy", "de_trend_seas",
+    "dts_doyavge", "dts_doyvar",
+    "yday", "IIdays_ago", "IIIdays_ago", "IVdays_ago",
+    "Vdays_ago", "VIdays_ago", "VIIdays_ago",
+    "last_year", "last_2year", "last_3year", "last_4year", "last_5year",
+    "h1_last_year", "h1_last_2years", "h1_last_3years",
+    "h1_last_4years", "h1_last_5years",
+    "h1_ly_2days", "h1_ly_3day", "h1_ly_4day",
+    "h1_ly_5day", "h1_ly_6day", "h1_ly_7day",
+    "h1_ly_next_1day", "h1_ly_next_2days", "h1_ly_next_3days",
+    "h1_ly_next_4days", "h1_ly_next_5days",
+    "h1_ly_next_6days", "h1_ly_next_7days",
+    "diff_1year", "diff_2year", "diff_3year", "diff_4year", "diff_5year",
+    "diff_yday", "diff_2days", "diff_3days", "diff_4days",
+    "diff_5days", "diff_6days", "diff_7days",
+    "last_7_1day_deltas_mean", "last_7_1day_deltas_min",
+    "last_7_1day_deltas_max",
+]
+
+TARGET_COL = "next_day"
+
+
+# ===========================================================================
+# WAVELET FEATURE TRANSFORMER (must match wavelet.ipynb exactly)
+# ===========================================================================
+
+class WaveletFeatureTransformer(BaseEstimator, TransformerMixin):
+    """
+    Analytical wavelet-basis feature expansion.
+    Applies Mexican Hat or Morlet basis functions across the sample axis
+    for each input feature and returns the expanded feature matrix.
+    """
+
+    def __init__(self, n_wavelets=3, wavelet="mexican_hat", include_original=True):
+        self.n_wavelets = n_wavelets
+        self.wavelet = wavelet
+        self.include_original = include_original
+
+    def fit(self, X, y=None):
+        X = self._to_numpy(X)
+        self.n_features_in_ = X.shape[1]
+        return self
+
+    def transform(self, X):
+        X = self._to_numpy(X)
+        n_samples, n_features = X.shape
+        t = np.linspace(-1.0, 1.0, n_samples)
+
+        features = []
+        if self.include_original:
+            features.append(X)
+
+        for j in range(n_features):
+            x = X[:, j]
+            for i in range(self.n_wavelets):
+                if self.n_wavelets == 1:
+                    shift = 0.0
+                else:
+                    shift = -0.75 + i * (1.5 / (self.n_wavelets - 1))
+
+                scale = 0.25 + 0.20 * i
+                tau = (t - shift) / scale
+
+                if self.wavelet == "mexican_hat":
+                    psi = (1.0 - tau**2) * np.exp(-0.5 * tau**2)
+                elif self.wavelet == "morlet":
+                    psi = np.cos(5.0 * tau) * np.exp(-0.5 * tau**2)
+                else:
+                    raise ValueError(f"Unknown wavelet type: {self.wavelet}")
+
+                features.append((x * psi).reshape(-1, 1))
+
+        X_out = np.hstack(features).astype(float)
+        if not np.isfinite(X_out).all():
+            raise ValueError("WaveletFeatureTransformer produced NaN/inf.")
+        return X_out
+
+    @staticmethod
+    def _to_numpy(X):
+        if isinstance(X, pd.DataFrame):
+            X = X.to_numpy()
+        return np.asarray(X, dtype=float)
+
+
+# ===========================================================================
+# DATA LOADING & PREPROCESSING (identical to XGB training script)
+# ===========================================================================
+
+def load_region_raw(region: int) -> pd.DataFrame:
+    raw = pd.read_csv(RAW_CSV, parse_dates=["date"])
+    raw = raw.rename(columns={"daily_avg_temperature": "T"})
+    df = (raw[raw["region_code"] == region][["date", "T"]]
+          .dropna(subset=["date"]).sort_values("date").reset_index(drop=True))
+    df = df[~((df["date"].dt.month == 2) & (df["date"].dt.day == 29))].copy()
+    df = df.reset_index(drop=True)
+
+    def _doy_noleap(d):
+        doy = d.timetuple().tm_yday
+        if (d.year % 4 == 0 and (d.year % 100 != 0 or d.year % 400 == 0)):
+            if d.month > 2:
+                doy -= 1
+        return max(1, min(365, doy))
+
+    df["dayofyear"] = df["date"].apply(_doy_noleap)
+    df["t_idx"] = np.arange(len(df), dtype=float)
+
+    if df["T"].isna().any():
+        doy_means = df.dropna(subset=["T"]).groupby("dayofyear")["T"].mean().to_dict()
+        for pos in df[df["T"].isna()].index.tolist():
+            doy_val = int(df.at[pos, "dayofyear"])
+            T_avy = doy_means.get(doy_val, float(df["T"].mean()))
+            nbrs = []
+            for off in list(range(-7, 0)) + list(range(1, 8)):
+                p = pos + off
+                if 0 <= p < len(df) and not pd.isna(df.at[p, "T"]):
+                    nbrs.append(df.at[p, "T"])
+            T_avd = float(np.mean(nbrs)) if nbrs else T_avy
+            df.at[pos, "T"] = (T_avy + T_avd) / 2.0
+    return df
+
+
+def detrend_linear(df):
+    t = df["t_idx"].values; T = df["T"].values; mask = ~np.isnan(T)
+    A = np.column_stack([np.ones(mask.sum()), t[mask]])
+    coefs, _, _, _ = np.linalg.lstsq(A, T[mask], rcond=None)
+    return coefs[0], coefs[1], T - (coefs[0] + coefs[1] * t)
+
+
+def deseasonalize_fourier(doy, detrended, n_harmonics=N_HARMONICS):
+    mask = ~np.isnan(detrended)
+    cols = [np.ones(mask.sum())]
+    for k in range(1, n_harmonics + 1):
+        cols.append(np.sin(2 * np.pi * k * doy[mask] / 365.0))
+        cols.append(np.cos(2 * np.pi * k * doy[mask] / 365.0))
+    X = np.column_stack(cols)
+    coefs, _, _, _ = np.linalg.lstsq(X, detrended[mask], rcond=None)
+    cols_all = [np.ones(len(doy))]
+    for k in range(1, n_harmonics + 1):
+        cols_all.append(np.sin(2 * np.pi * k * doy / 365.0))
+        cols_all.append(np.cos(2 * np.pi * k * doy / 365.0))
+    seasonal = np.column_stack(cols_all) @ coefs
+    return coefs, detrended - seasonal
+
+
+def build_feature_df(df):
+    df = df.copy().sort_values("date").set_index("date")
+    dts = df["de_trend_seas"]
+    df["pdtn_doy"] = df["dayofyear"].shift(-1)
+    last_doy = df["dayofyear"].iloc[-1]
+    df.iloc[-1, df.columns.get_loc("pdtn_doy")] = 1 if last_doy == 365 else last_doy + 1
+    df["pdtn_doy"] = df["pdtn_doy"].astype(int)
+    doy_stats = df.groupby("dayofyear")["de_trend_seas"].agg(["mean", "var"])
+    df["dts_doyavge"] = df["dayofyear"].map(doy_stats["mean"])
+    df["dts_doyvar"] = df["dayofyear"].map(doy_stats["var"])
+    df["yday"] = dts.shift(1)
+    df["IIdays_ago"] = dts.shift(2); df["IIIdays_ago"] = dts.shift(3)
+    df["IVdays_ago"] = dts.shift(4); df["Vdays_ago"] = dts.shift(5)
+    df["VIdays_ago"] = dts.shift(6); df["VIIdays_ago"] = dts.shift(7)
+    df["last_year"] = dts.shift(365); df["last_2year"] = dts.shift(730)
+    df["last_3year"] = dts.shift(1095); df["last_4year"] = dts.shift(1460)
+    df["last_5year"] = dts.shift(1825)
+    df["h1_last_year"] = dts.shift(364); df["h1_last_2years"] = dts.shift(729)
+    df["h1_last_3years"] = dts.shift(1094); df["h1_last_4years"] = dts.shift(1459)
+    df["h1_last_5years"] = dts.shift(1824)
+    df["h1_ly_2days"] = dts.shift(366); df["h1_ly_3day"] = dts.shift(367)
+    df["h1_ly_4day"] = dts.shift(368); df["h1_ly_5day"] = dts.shift(369)
+    df["h1_ly_6day"] = dts.shift(370); df["h1_ly_7day"] = dts.shift(371)
+    df["h1_ly_next_1day"] = dts.shift(363); df["h1_ly_next_2days"] = dts.shift(362)
+    df["h1_ly_next_3days"] = dts.shift(361); df["h1_ly_next_4days"] = dts.shift(360)
+    df["h1_ly_next_5days"] = dts.shift(359); df["h1_ly_next_6days"] = dts.shift(358)
+    df["h1_ly_next_7days"] = dts.shift(357)
+    df["diff_1year"] = dts - dts.shift(365); df["diff_2year"] = dts - dts.shift(730)
+    df["diff_3year"] = dts - dts.shift(1095); df["diff_4year"] = dts - dts.shift(1460)
+    df["diff_5year"] = dts - dts.shift(1825)
+    df["diff_yday"] = dts - dts.shift(1); df["diff_2days"] = dts - dts.shift(2)
+    df["diff_3days"] = dts - dts.shift(3); df["diff_4days"] = dts - dts.shift(4)
+    df["diff_5days"] = dts - dts.shift(5); df["diff_6days"] = dts - dts.shift(6)
+    df["diff_7days"] = dts - dts.shift(7)
+    diff_1d = dts - dts.shift(1)
+    df["last_7_1day_deltas_mean"] = diff_1d.rolling(7).mean()
+    df["last_7_1day_deltas_min"] = diff_1d.rolling(7).min()
+    df["last_7_1day_deltas_max"] = diff_1d.rolling(7).max()
+    df[TARGET_COL] = dts.shift(-1)
+    return df
+
+
+# ===========================================================================
+# PIPELINE BUILDER
+# ===========================================================================
+
+def build_pipeline() -> Pipeline:
+    return Pipeline(steps=[
+        ("imputer", SimpleImputer()),
+        ("scaler_pre", StandardScaler()),
+        ("wavelet", WaveletFeatureTransformer()),
+        ("scaler_post", StandardScaler()),
+        ("mlp", MLPRegressor(random_state=RANDOM_STATE)),
+    ])
+
+
+# ===========================================================================
+# MAIN TRAINING LOOP
+# ===========================================================================
+
+def main():
+    start = datetime.datetime.now()
+    print("=" * 70)
+    print("  Wavelet FNN — Rolling Calibration Training")
+    print(f"  Regions: {REGIONS}")
+    print(f"  Calibration years: {START_CALIB_YEAR}–{END_CALIB_YEAR}")
+    print("=" * 70)
+
+    outer_cv = TimeSeriesSplit(n_splits=5, test_size=365)
+    inner_cv = TimeSeriesSplit(n_splits=3)
+
+    export_rows = []
+
+    for region in REGIONS:
+        print(f"\n{'─'*60}")
+        print(f"  Region {region}")
+        print(f"{'─'*60}")
+
+        raw_df = load_region_raw(region)
+        print(f"  Loaded {len(raw_df)} days")
+
+        # Full-series detrending and deseasonalizing (for nested CV)
+        trend_int, trend_slope, detrended = detrend_linear(raw_df)
+        fourier_coefs, dts_residual = deseasonalize_fourier(
+            raw_df["dayofyear"].values, detrended, N_HARMONICS
+        )
+        raw_df["de_trend_seas"] = dts_residual
+
+        feat_df = build_feature_df(raw_df)
+        train_cols = FEATURE_COLS + [TARGET_COL]
+        feat_clean = feat_df.dropna(subset=train_cols, how="any").copy()
+        print(f"  Feature rows (after dropna): {len(feat_clean)}")
+
+        # ---- Nested CV: tune once per region ----
+        calib_end_date = pd.Timestamp(f"{END_CALIB_YEAR}-12-31")
+        cv_data = feat_clean[feat_clean.index <= calib_end_date].copy()
+
+        X_cv = cv_data[FEATURE_COLS]
+        y_cv = cv_data[TARGET_COL]
+
+        print(f"  Running nested CV on {len(cv_data)} rows ...")
+        best_params_dict = {}
+        fold_results = []
+
+        fold_idx = 0
+        for train_idx, test_idx in outer_cv.split(X_cv):
+            fold_idx += 1
+            print(f"    Outer Fold {fold_idx}")
+
+            X_out_train = X_cv.iloc[train_idx]
+            X_out_test = X_cv.iloc[test_idx]
+            y_out_train = y_cv.iloc[train_idx]
+            y_out_test = y_cv.iloc[test_idx]
+
+            pipe = build_pipeline()
+
+            grid_search = HalvingGridSearchCV(
+                estimator=pipe,
+                param_grid=WAVELET_FNN_GRID,
+                cv=inner_cv,
+                scoring="neg_mean_absolute_percentage_error",
+                refit=True,
+                n_jobs=1,
+                factor=2,
+            )
+            grid_search.fit(X_out_train, y_out_train)
+
+            best_model = grid_search.best_estimator_
+            y_pred = best_model.predict(X_out_test)
+            mape = mean_absolute_percentage_error(y_out_test, y_pred)
+
+            fold_results.append({
+                "fold": fold_idx,
+                "mape": mape,
+                "params": grid_search.best_params_,
+            })
+            best_params_dict[fold_idx] = grid_search.best_params_
+
+        best_fold = min(fold_results, key=lambda x: x["mape"])
+        best_params = best_fold["params"]
+        print(f"  Best fold: {best_fold['fold']} (MAPE={best_fold['mape']:.6f})")
+        print(f"  Best params: {best_params}")
+
+        # ---- Rolling calibration: refit per year with best params ----
+        for calib_year in range(START_CALIB_YEAR, END_CALIB_YEAR + 1):
+            prediction_year = calib_year + 1
+            calib_end = pd.Timestamp(f"{calib_year}-12-31")
+
+            # Recalibrate detrending on calib-only data
+            calib_raw = raw_df[raw_df["date"] <= calib_end].copy()
+            c_int, c_slope, c_detrended = detrend_linear(calib_raw)
+            c_fourier, c_dts = deseasonalize_fourier(
+                calib_raw["dayofyear"].values, c_detrended, N_HARMONICS
+            )
+            calib_raw["de_trend_seas"] = c_dts
+
+            calib_feat = build_feature_df(calib_raw)
+            calib_clean = calib_feat.dropna(
+                subset=FEATURE_COLS + [TARGET_COL], how="any"
+            ).copy()
+
+            if len(calib_clean) < 365 * 6:
+                print(f"    Skipping calib {calib_year}: "
+                      f"too few rows ({len(calib_clean)})")
+                continue
+
+            X_train = calib_clean[FEATURE_COLS]
+            y_train = calib_clean[TARGET_COL]
+
+            # Build and fit pipeline with best params
+            pipeline = build_pipeline()
+            pipeline.set_params(**best_params)
+            pipeline.fit(X_train, y_train)
+
+            # In-sample metrics
+            y_fit = pipeline.predict(X_train)
+            fit_mae = mean_absolute_error(y_train, y_fit)
+            fit_rmse = np.sqrt(mean_squared_error(y_train, y_fit))
+            fit_r2 = r2_score(y_train, y_fit)
+
+            # Working DataFrame for recursive forecasting (last 5 years)
+            working_df = calib_feat.sort_index(ascending=False).head(365 * 5)
+            working_df = working_df.drop(columns=[TARGET_COL], errors="ignore")
+
+            # Save PKL
+            payload = {
+                "fitted_pipeline":  pipeline,
+                "trend_intercept":  float(c_int),
+                "trend_slope":      float(c_slope),
+                "fourier_coefs":    c_fourier,
+                "n_harmonics":      N_HARMONICS,
+                "best_params":      best_params,
+                "region":           int(region),
+                "calib_year":       int(calib_year),
+                "prediction_year":  int(prediction_year),
+                "n_calib_days":     int(len(calib_raw)),
+                "feature_cols":     FEATURE_COLS,
+                "working_df":       working_df,
+                "fit_metrics": {
+                    "MAE": float(fit_mae),
+                    "RMSE": float(fit_rmse),
+                    "R2": float(fit_r2),
+                },
+                "created_at": datetime.datetime.now().isoformat(),
+            }
+
+            pkl_name = f"wavelet_fnn_region_{region}_calib_{calib_year}.pkl"
+            pkl_path = EXPORT_DIR / pkl_name
+            with open(pkl_path, "wb") as f:
+                pickle.dump(payload, f)
+
+            export_rows.append({
+                "region": region,
+                "calib_year": calib_year,
+                "prediction_year": prediction_year,
+                "n_train_rows": len(calib_clean),
+                "fit_MAE": fit_mae,
+                "fit_RMSE": fit_rmse,
+                "fit_R2": fit_r2,
+                "best_params": str(best_params),
+                "pkl_path": str(pkl_path),
+            })
+
+            print(f"    calib {calib_year} → predict {prediction_year}  "
+                  f"({len(calib_clean)} rows, R²={fit_r2:.4f}, MAE={fit_mae:.4f})")
+
+    if export_rows:
+        summary = pd.DataFrame(export_rows)
+        summary.to_csv(EXPORT_DIR / "wavelet_fnn_training_summary.csv", index=False)
+
+    elapsed = datetime.datetime.now() - start
+    print(f"\nDone. Elapsed: {elapsed}")
+    print(f"PKLs saved to: {EXPORT_DIR}")
+
+
+if __name__ == "__main__":
+    main()

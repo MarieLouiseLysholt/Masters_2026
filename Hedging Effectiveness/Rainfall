@@ -1,0 +1,121 @@
+"""
+fetch_precipitation.py
+----------------------
+Fetches daily precipitation from all Meteostat stations mapped to each
+French agricultural region, averages across stations per day, and saves:
+
+    date, region_code, daily_precipitation_mm
+
+One row per (date, region) — same format as region_avg.csv for temperature.
+
+Usage:
+    pip install meteostat
+    python fetch_precipitation.py
+"""
+
+import pandas as pd
+from datetime import datetime
+from meteostat import Daily
+
+# =============================================================================
+# STATION → REGION MAPPING
+# Each station ID maps to one region code.
+# Where multiple stations cover a region, daily values are averaged.
+# =============================================================================
+
+STATION_REGION = {
+    "LFSM0": 27, "07157": 11, "07179": 44, "LFFS0": 44, "07201": 53,
+    "07265": 27, "07235": 52, "07031": 28, "07203": 53, "07106": 53,
+    "07055": 32, "07306": 52, "07299": 44, "07090": 44, "07029": 28,
+    "07217": 52, "07149": 11, "07093": 44, "07027": 28, "07010": 32,
+    "07300": 52, "07156": 11, "07143": 24, "07110": 53, "07173": 44,
+    "LFLH0": 27, "07046": 28, "07109": 53, "07200": 53, "07205": 53,
+    "07354": 24, "07257": 24, "07180": 44, "07033": 28, "07197": 44,
+    "07249": 24, "07260": 27, "07053": 11, "07024": 28, "LFRU0": 53,
+    "07005": 32, "07288": 27, "LFSG0": 44, "07145": 11, "LFPT0": 11,
+    "07038": 28, "07166": 44, "07385": 27, "07280": 27, "07150": 11,
+    "LFOZ0": 24, "07247": 24, "LFGA0": 44, "LFRV0": 53, "07207": 53,
+    "07386": 27, "07296": 27, "07121": 53, "07139": 28, "07020": 28,
+    "07295": 27, "07070": 44, "07379": 27, "07072": 44, "07022": 28,
+    "07153": 11, "07283": 44, "07118": 53, "KQIH0": 32, "07276": 27,
+    "07125": 53, "LFAC0": 32, "LFOV0": 52, "LFYD0": 44, "07037": 28,
+    "07017": 32, "07148": 11, "07015": 32, "07255": 24, "LFAQ0": 32,
+    "07186": 44, "07230": 52, "07146": 28, "07168": 44, "07190": 44,
+    "LFJR0": 52, "07169": 44, "07002": 32, "07057": 32, "07147": 11,
+    "07222": 52, "07003": 32, "07075": 44, "99854": 44, "LFQA0": 44,
+    "07130": 53, "LFYL0": 27, "07059": 32, "07040": 28, "07061": 32,
+    "LFOQ0": 24, "07292": 27, "07120": 53, "07140": 24, "07240": 24,
+    "07181": 44,
+}
+
+START = datetime(1970, 1, 1)
+END   = datetime(2024, 12, 31)
+
+OUT_PATH = r"C:\Users\victo\Downloads\Python\Projects\Masters_2026\EDA\region_avg_precip.csv"
+
+# =============================================================================
+# FETCH ALL STATIONS
+# =============================================================================
+
+all_station_data = []
+station_ids = list(STATION_REGION.keys())
+
+print(f"Fetching {len(station_ids)} stations...\n")
+
+for i, sid in enumerate(station_ids):
+    region = STATION_REGION[sid]
+    try:
+        data = Daily(sid, START, END).fetch()
+        if data.empty or "prcp" not in data.columns:
+            print(f"  [{i+1:3d}/{len(station_ids)}] {sid} (region {region}) — no data, skipping")
+            continue
+        prcp = data[["prcp"]].copy()
+        prcp.index.name = "date"
+        prcp = prcp.reset_index()
+        prcp["station"]     = sid
+        prcp["region_code"] = region
+        n_valid = prcp["prcp"].notna().sum()
+        all_station_data.append(prcp)
+        print(f"  [{i+1:3d}/{len(station_ids)}] {sid} (region {region}) — {n_valid} valid days")
+    except Exception as e:
+        print(f"  [{i+1:3d}/{len(station_ids)}] {sid} (region {region}) — ERROR: {e}")
+
+# =============================================================================
+# AVERAGE ACROSS STATIONS PER REGION PER DAY
+# =============================================================================
+
+if not all_station_data:
+    raise RuntimeError("No data fetched from any station.")
+
+df = pd.concat(all_station_data, ignore_index=True)
+
+# Average across all stations in the region for each day
+# Only average over stations that have a non-NaN value that day
+region_avg = (
+    df.groupby(["date", "region_code"])["prcp"]
+    .mean()                         # NaN stations are excluded by pandas default
+    .reset_index()
+    .rename(columns={"prcp": "daily_precipitation_mm"})
+)
+
+region_avg = region_avg.sort_values(["date", "region_code"]).reset_index(drop=True)
+
+# =============================================================================
+# SAVE
+# =============================================================================
+
+region_avg.to_csv(OUT_PATH, index=False)
+
+print(f"\n{'='*60}")
+print(f"Saved {len(region_avg)} rows to:")
+print(f"  {OUT_PATH}")
+print(f"{'='*60}")
+print(f"\nRegions covered: {sorted(region_avg['region_code'].unique())}")
+print(f"Date range:      {region_avg['date'].min()} to {region_avg['date'].max()}")
+print(f"\nStations per region:")
+for reg, grp in df.groupby("region_code"):
+    n_stations = grp["station"].nunique()
+    coverage   = grp["prcp"].notna().mean() * 100
+    print(f"  Region {reg}: {n_stations} stations, {coverage:.0f}% non-NaN coverage")
+print(f"\nSample output:")
+print(region_avg.head(16).to_string(index=False))

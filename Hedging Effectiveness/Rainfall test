@@ -1,0 +1,655 @@
+"""
+rainfall_yield_analysis.py
+==========================
+Tests whether rainfall has meaningful incremental impact on French winter
+wheat yields beyond temperature, and compares the two drivers head-to-head.
+
+Two-part output:
+
+  Part 1 — Spearman ρ² comparison (same methodology as hedging_effectiveness_xgb.py)
+    For each region, find the best rainfall index window (max |ρ| with yield)
+    and the best temperature index window. Compare ρ² directly — this tells
+    you how much yield variance each driver explains at its best.
+
+  Part 2 — OLS incremental R² (does rainfall add power beyond temperature?)
+    Stage 1: regress detrended yield on best temperature index → R²_temp
+    Stage 2: add best rainfall index → R²_temp+rain
+    Incremental R²: ΔR² = R²_temp+rain − R²_temp
+    F-test for significance of ΔR² (H0: rainfall adds nothing).
+
+Rainfall indices (analogous to temperature indices):
+  RAI  = Σ precipitation              (cumulative, analogous to CAT)
+  DRY  = Σ max(P_REF − P_d, 0)       (rainfall deficit, analogous to HDD)
+  WET  = Σ max(P_d − P_REF, 0)       (excess rainfall, analogous to CDD)
+
+  P_REF is set to the regional long-run daily mean, so DRY and WET are
+  symmetric around the climatological baseline.
+
+Methodology:
+  Yield detrending:  MM-estimator + Wald test (Pelka §2, Finger 2010)
+  Index selection:   max |Spearman ρ| (Möllmann et al. 2019 §2a)
+  Incremental R²:    OLS F-test (Greene 2012, §5.4)
+  Calibration only:  2000–2014 (prevents OOS data leakage into selection)
+"""
+
+import numpy as np
+import pandas as pd
+import warnings
+import os
+from scipy import stats
+from scipy.optimize import minimize
+
+warnings.filterwarnings("ignore")
+np.random.seed(42)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+REGIONS     = [11, 24, 27, 28, 32, 44, 52, 53]
+
+YIELD_CSV   = "EDA/ble_tendre_hiver_yield_2000_2024_regions_mainland.csv"
+TEMP_CSV    = "EDA/region_avg.csv"
+RAIN_CSV    = r"C:\Users\victo\Downloads\Python\Projects\Masters_2026\EDA\region_avg_precip.csv"
+
+CALIB_START = 2000
+CALIB_END   = 2014      # index selection on calibration window only
+
+# Temperature index candidate months (same as hedging script)
+# Full growing season: Oct (prior year) through Jul (harvest)
+# Cross-year windows handled the same way as rainfall (Oct–Dec prior, Jan–Jul current)
+FULL_SEASON = list(range(10, 13)) + list(range(1, 8))   # Oct–Jul
+
+HDD_MONTHS  = FULL_SEASON    # cold stress across full season
+CDD_MONTHS  = FULL_SEASON    # heat stress across full season
+CAT_MONTHS  = FULL_SEASON    # cumulative temp across full season
+
+# Rainfall index candidate months — winter wheat full cycle
+# Oct–Jul covers sowing through grain filling
+RAIN_MONTHS = list(range(10, 13)) + list(range(1, 8))   # Oct–Jul (cross-year)
+MAX_WINDOW  = 5
+
+T_REF       = 18.0      # °C (same as hedging script)
+# P_REF computed per region from calibration data (long-run daily mean)
+
+OUTPUT_DIR  = "Outputs/rainfall_analysis"
+
+REGION_NAMES = {
+    11: "Île-de-France",       24: "Centre-Val de Loire",
+    27: "Bourgogne-F-C",       28: "Normandie",
+    32: "Hauts-de-France",     44: "Grand Est",
+    52: "Pays de la Loire",    53: "Bretagne",
+}
+
+# Toggle: True = plain OLS (exploratory), False = MM-estimator (Pelka §2, default)
+USE_OLS_DETREND = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 1: DATA LOADING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def load_yield_data():
+    df = pd.read_csv(YIELD_CSV)
+    df["weighted_yield"] = df["yield"] * df["surf"]
+    agg = (df.groupby(["year", "reg"])
+             .agg(total_wt=("weighted_yield", "sum"),
+                  total_surf=("surf", "sum"))
+             .reset_index())
+    agg["yield_wt"] = agg["total_wt"] / agg["total_surf"]
+    agg["year"] = agg["year"].astype(int)
+    return agg[["year", "reg", "yield_wt"]]
+
+
+def load_daily_data(csv_path, value_col_hint=None):
+    """
+    Generic loader for daily regional CSVs (temperature or rainfall).
+    Expects: date, region_code, <value column>.
+    Returns dict: {region_code: DataFrame indexed by date with column 'V'}.
+    """
+    df = pd.read_csv(csv_path, parse_dates=["date"])
+
+    # Identify value column (not date, not region_code)
+    if value_col_hint and value_col_hint in df.columns:
+        val_col = value_col_hint
+    else:
+        candidates = [c for c in df.columns
+                      if c not in ("date", "region_code")]
+        if not candidates:
+            raise ValueError(f"Cannot find value column in {csv_path}")
+        val_col = candidates[0]
+
+    out = {}
+    for reg in REGIONS:
+        sub = df[df["region_code"] == reg][["date", val_col]].copy()
+        sub = sub.dropna(subset=["date"]).sort_values("date")
+        sub = sub.set_index("date").rename(columns={val_col: "V"})
+        out[reg] = sub
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 2: YIELD DETRENDING (Pelka §2, Finger 2010)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def detrend_yield(years, yields, final_year=None):
+    if final_year is None:
+        final_year = int(years.max())
+    n   = len(years)
+    t   = years - years.min()
+    t_f = final_year - years.min()
+
+    if USE_OLS_DETREND:
+        # Plain OLS — exploratory comparison with MM-estimator
+        A_lin  = np.column_stack([np.ones(n), t])
+        A_quad = np.column_stack([np.ones(n), t, t**2])
+        b_lin,  *_ = np.linalg.lstsq(A_lin,  yields, rcond=None)
+        b_quad, *_ = np.linalg.lstsq(A_quad, yields, rcond=None)
+
+        # Wald test on quadratic term via OLS residual variance
+        y_hat_quad = A_quad @ b_quad
+        resid_quad = yields - y_hat_quad
+        n_eff  = n - 3
+        se_c   = np.sqrt(np.sum(resid_quad**2) / n_eff *
+                         np.linalg.inv(A_quad.T @ A_quad)[2, 2]) if n_eff > 0 else 1e12
+        wald_stat = (b_quad[2] / se_c)**2 if se_c > 1e-12 else 0.0
+        wald_p    = 1.0 - stats.chi2.cdf(wald_stat, df=1)
+
+        if wald_p < 0.05:
+            tv = b_quad[0] + b_quad[1]*t + b_quad[2]*t**2
+            tf = b_quad[0] + b_quad[1]*t_f + b_quad[2]*t_f**2
+            return yields - tv + tf, "quadratic (OLS)", wald_p
+        else:
+            tv = b_lin[0] + b_lin[1]*t
+            tf = b_lin[0] + b_lin[1]*t_f
+            return yields - tv + tf, "linear (OLS)", wald_p
+
+    else:
+        # MM-estimator + Wald test (Pelka §2, Finger 2010) — methodological default
+        try:
+            import statsmodels.api as sm
+            from statsmodels.robust.robust_linear_model import RLM
+
+            X_lin  = sm.add_constant(t)
+            res_lin = RLM(yields, X_lin,
+                          M=sm.robust.norms.TukeyBiweight()).fit()
+
+            X_quad = np.column_stack([np.ones(n), t, t**2])
+            res_quad = RLM(yields, X_quad,
+                           M=sm.robust.norms.TukeyBiweight()).fit()
+
+            c_se = res_quad.bse[2]
+            wald_stat = (res_quad.params[2] / c_se)**2 if c_se > 1e-12 else 0.0
+            wald_p = 1.0 - stats.chi2.cdf(wald_stat, df=1)
+
+            if wald_p < 0.05:
+                p = res_quad.params
+                tv = p[0] + p[1]*t + p[2]*t**2
+                tf = p[0] + p[1]*t_f + p[2]*t_f**2
+                return yields - tv + tf, "quadratic (MM)", wald_p
+            else:
+                p = res_lin.params
+                tv = p[0] + p[1]*t
+                tf = p[0] + p[1]*t_f
+                return yields - tv + tf, "linear (MM)", wald_p
+
+        except ImportError:
+            A = np.column_stack([np.ones(n), t])
+            b, *_ = np.linalg.lstsq(A, yields, rcond=None)
+            tv = b[0] + b[1]*t
+            tf = b[0] + b[1]*t_f
+            return yields - tv + tf, "linear (OLS fallback)", np.nan
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 3: INDEX COMPUTATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_temp_index(temp_df, year, months, index_type, t_ref=T_REF):
+    """
+    Compute temperature index over a potentially cross-year window.
+    Months >= 10 are taken from year-1 (Oct–Dec sowing period),
+    months < 10 from the current year (Jan–Jul growing/harvest).
+    """
+    prior_months   = [m for m in months if m >= 10]
+    current_months = [m for m in months if m < 10]
+
+    frames = []
+    if prior_months:
+        mask = ((temp_df.index.year == year - 1) &
+                temp_df.index.month.isin(prior_months))
+        frames.append(temp_df.loc[mask, "V"].values)
+    if current_months:
+        mask = ((temp_df.index.year == year) &
+                temp_df.index.month.isin(current_months))
+        frames.append(temp_df.loc[mask, "V"].values)
+
+    if not frames:
+        return np.nan
+    T = np.concatenate(frames)
+    if len(T) == 0:
+        return np.nan
+
+    if index_type == "HDD":
+        return float(np.nansum(np.maximum(t_ref - T, 0)))
+    elif index_type == "CDD":
+        return float(np.nansum(np.maximum(T - t_ref, 0)))
+    else:   # CAT
+        return float(np.nansum(T))
+
+
+def compute_rain_index(rain_df, year, months, index_type, p_ref=None):
+    """
+    RAI: cumulative precipitation over window (analogous to CAT).
+    DRY: cumulative rainfall deficit below p_ref (analogous to HDD).
+    WET: cumulative excess above p_ref (analogous to CDD).
+
+    Cross-year windows (e.g. Oct–Jul) handled by splitting into
+    prior-year Oct–Dec and current-year Jan–Jul.
+    """
+    # Split months into prior-year (Oct–Dec) and current-year (Jan–Sep)
+    prior_months   = [m for m in months if m >= 10]
+    current_months = [m for m in months if m < 10]
+
+    frames = []
+    if prior_months:
+        mask = ((rain_df.index.year == year - 1) &
+                rain_df.index.month.isin(prior_months))
+        frames.append(rain_df.loc[mask, "V"].values)
+    if current_months:
+        mask = ((rain_df.index.year == year) &
+                rain_df.index.month.isin(current_months))
+        frames.append(rain_df.loc[mask, "V"].values)
+
+    if not frames:
+        return np.nan
+    P = np.concatenate(frames)
+    if len(P) == 0:
+        return np.nan
+
+    if index_type == "RAI":
+        return float(np.nansum(P))
+    elif index_type == "DRY":
+        ref = p_ref if p_ref is not None else float(np.mean(P))
+        return float(np.sum(np.maximum(ref - P, 0)))
+    else:   # WET
+        ref = p_ref if p_ref is not None else float(np.mean(P))
+        return float(np.sum(np.maximum(P - ref, 0)))
+
+
+def build_temp_vector(temp_df, years, months, index_type):
+    return np.array([compute_temp_index(temp_df, yr, months, index_type)
+                     for yr in years], dtype=float)
+
+
+def build_rain_vector(rain_df, years, months, index_type, p_ref=None):
+    return np.array([compute_rain_index(rain_df, yr, months, index_type, p_ref)
+                     for yr in years], dtype=float)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 4: CANDIDATE WINDOWS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def temp_candidate_windows():
+    specs = []
+    for idx_type, pool in [("HDD", HDD_MONTHS), ("CDD", CDD_MONTHS),
+                           ("CAT", CAT_MONTHS)]:
+        for m in pool:
+            specs.append((idx_type, [m]))
+        for start in range(len(pool)):
+            for length in range(2, MAX_WINDOW + 1):
+                if start + length > len(pool):
+                    break
+                specs.append((idx_type, pool[start:start + length]))
+    return specs
+
+
+def rain_candidate_windows():
+    """
+    Candidate windows over Oct–Jul (cross-year growing cycle).
+    RAI (cumulative precipitation) is the standard OTC rainfall derivative
+    index — the direct precipitation analogue of CAT for temperature.
+    DRY/WET (deficit/excess around a threshold) are non-standard and excluded.
+    """
+    pool = RAIN_MONTHS
+    specs = []
+    for m in pool:
+        specs.append(("RAI", [m]))
+    for start in range(len(pool)):
+        for length in range(2, MAX_WINDOW + 1):
+            if start + length > len(pool):
+                break
+            specs.append(("RAI", pool[start:start + length]))
+    return specs
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 5: BEST INDEX SELECTION (Möllmann §2a)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def select_best_temp_index(dt_yields, years, temp_df):
+    best = None
+    for idx_type, months in temp_candidate_windows():
+        idx = build_temp_vector(temp_df, years, months, idx_type)
+        valid = ~(np.isnan(idx) | np.isnan(dt_yields))
+        if valid.sum() < 8:
+            continue
+        r, p = stats.spearmanr(dt_yields[valid], idx[valid])
+        if best is None or abs(r) > abs(best["corr"]):
+            best = {"index_type": idx_type, "months": months,
+                    "corr": r, "r_squared": r**2, "p_value": p,
+                    "vector": idx}
+    return best
+
+
+def select_best_rain_index(dt_yields, years, rain_df, p_ref):
+    best = None
+    for idx_type, months in rain_candidate_windows():
+        idx = build_rain_vector(rain_df, years, months, idx_type, p_ref)
+        valid = ~(np.isnan(idx) | np.isnan(dt_yields))
+        if valid.sum() < 8:
+            continue
+        r, p = stats.spearmanr(dt_yields[valid], idx[valid])
+        if best is None or abs(r) > abs(best["corr"]):
+            best = {"index_type": idx_type, "months": months,
+                    "corr": r, "r_squared": r**2, "p_value": p,
+                    "vector": idx}
+    return best
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 6: OLS INCREMENTAL R² AND F-TEST (Greene 2012 §5.4)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def ols_r2(y, X):
+    """OLS R² for y ~ X (X should include constant column)."""
+    valid = ~np.isnan(y)
+    for col in range(X.shape[1]):
+        valid = valid & ~np.isnan(X[:, col])
+    yv, Xv = y[valid], X[valid]
+    if len(yv) < X.shape[1] + 2:
+        return np.nan, np.nan, len(yv)
+    b, res, rank, _ = np.linalg.lstsq(Xv, yv, rcond=None)
+    y_hat = Xv @ b
+    ss_res = float(np.sum((yv - y_hat)**2))
+    ss_tot = float(np.sum((yv - yv.mean())**2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-10 else 0.0
+    return float(r2), float(ss_res), int(len(yv))
+
+
+def incremental_f_test(y, X_base, X_full):
+    """
+    F-test: does adding columns in X_full (vs X_base) significantly improve fit?
+    X_base and X_full must both include a constant column.
+    Returns: delta_R2, F-statistic, p-value.
+    """
+    r2_base, ssr_base, n_base = ols_r2(y, X_base)
+    r2_full, ssr_full, n_full = ols_r2(y, X_full)
+
+    if np.isnan(r2_base) or np.isnan(r2_full):
+        return np.nan, np.nan, np.nan
+
+    n  = n_full
+    k_base = X_base.shape[1]   # includes constant
+    k_full = X_full.shape[1]
+    q  = k_full - k_base        # number of added regressors
+
+    if ssr_full <= 1e-12 or q < 1:
+        return r2_full - r2_base, np.nan, np.nan
+
+    # F = [(SSR_base - SSR_full) / q] / [SSR_full / (n - k_full)]
+    F = ((ssr_base - ssr_full) / q) / (ssr_full / (n - k_full))
+    p_val = 1.0 - stats.f.cdf(F, dfn=q, dfd=n - k_full)
+
+    return float(r2_full - r2_base), float(F), float(p_val)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 7: MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run():
+    print("=" * 85)
+    print("  RAINFALL vs TEMPERATURE — Yield Impact Analysis")
+    print("  French Winter Wheat | 8 NUTS-2 Regions")
+    print(f"  Calibration window: {CALIB_START}–{CALIB_END}")
+    print(f"  Part 1: Spearman ρ² comparison (Möllmann §2a)")
+    print(f"  Part 2: OLS incremental R² + F-test (Greene 2012 §5.4)")
+    print("=" * 85)
+
+    yield_raw = load_yield_data()
+    temp_data = load_daily_data(TEMP_CSV, value_col_hint="daily_avg_temperature")
+    rain_data = load_daily_data(RAIN_CSV, value_col_hint="daily_precipitation_mm")
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    calib_years = list(range(CALIB_START, CALIB_END + 1))
+    results = []
+
+    for region in REGIONS:
+        print(f"\n{'─'*75}")
+        print(f"  Region {region} — {REGION_NAMES.get(region, '?')}")
+        print(f"{'─'*75}")
+
+        # ── Yield ─────────────────────────────────────────────────────────────
+        ry = (yield_raw[yield_raw["reg"] == region]
+              .set_index("year").sort_index()["yield_wt"])
+        ry.index = ry.index.astype(int)
+        calib = ry[(ry.index >= CALIB_START) & (ry.index <= CALIB_END)]
+        if len(calib) < 10:
+            print("  Insufficient yield data. Skipping."); continue
+
+        yrs   = calib.index.values.astype(float)
+        vals  = calib.values.astype(float)
+        dt_y, trend, wald_p = detrend_yield(yrs, vals, final_year=CALIB_END)
+        yrs_i = yrs.astype(int)
+        print(f"  Yield: N={len(calib)}  trend={trend}  Wald p={wald_p:.4f}")
+
+        if region not in temp_data or region not in rain_data:
+            print("  Missing temp or rain data. Skipping."); continue
+
+        tdf = temp_data[region]
+        rdf = rain_data[region]
+
+        # Regional long-run daily mean rainfall → P_REF for DRY/WET indices
+        rain_calib_mask = (rdf.index.year >= CALIB_START) & (rdf.index.year <= CALIB_END)
+        p_ref = float(rdf.loc[rain_calib_mask, "V"].mean())
+        print(f"  P_REF (daily mean, calib): {p_ref:.2f} mm/day")
+
+        # ── Part 1: Best index selection ──────────────────────────────────────
+        best_temp = select_best_temp_index(dt_y, yrs_i, tdf)
+        best_rain = select_best_rain_index(dt_y, yrs_i, rdf, p_ref)
+
+        if best_temp is None or best_rain is None:
+            print("  Could not find valid index. Skipping."); continue
+
+        mo_t = "-".join(f"M{m:02d}" for m in best_temp["months"])
+        mo_r = "-".join(f"M{m:02d}" for m in best_rain["months"])
+
+        sig_t = ("***" if best_temp["p_value"] < 0.001 else
+                 "**" if best_temp["p_value"] < 0.01 else
+                 "*" if best_temp["p_value"] < 0.05 else
+                 "." if best_temp["p_value"] < 0.10 else "ns")
+        sig_r = ("***" if best_rain["p_value"] < 0.001 else
+                 "**" if best_rain["p_value"] < 0.01 else
+                 "*" if best_rain["p_value"] < 0.05 else
+                 "." if best_rain["p_value"] < 0.10 else "ns")
+
+        print(f"\n  Part 1 — Spearman ρ² comparison:")
+        print(f"    Temperature  {best_temp['index_type']:<4} {mo_t:<15}  "
+              f"ρ={best_temp['corr']:>+.3f}  ρ²={best_temp['r_squared']:.3f}  "
+              f"p={best_temp['p_value']:.4f} {sig_t}")
+        print(f"    Rainfall     {best_rain['index_type']:<4} {mo_r:<15}  "
+              f"ρ={best_rain['corr']:>+.3f}  ρ²={best_rain['r_squared']:.3f}  "
+              f"p={best_rain['p_value']:.4f} {sig_r}")
+
+        winner = ("Temperature" if best_temp["r_squared"] >= best_rain["r_squared"]
+                  else "Rainfall")
+        gap = abs(best_temp["r_squared"] - best_rain["r_squared"])
+        print(f"    → {winner} explains more yield variance  "
+              f"(Δρ²={gap:.3f})")
+
+        # ── Part 2: Incremental R² ────────────────────────────────────────────
+        # Align all three vectors on valid observations
+        t_vec = best_temp["vector"]
+        r_vec = best_rain["vector"]
+
+        valid = (~np.isnan(dt_y) & ~np.isnan(t_vec) & ~np.isnan(r_vec))
+        y_v  = dt_y[valid]
+        t_v  = t_vec[valid]
+        r_v  = r_vec[valid]
+        n_v  = int(valid.sum())
+
+        ones = np.ones(n_v)
+        X_null  = np.column_stack([ones])                  # intercept only
+        X_temp  = np.column_stack([ones, t_v])             # + temperature
+        X_rain  = np.column_stack([ones, r_v])             # + rainfall
+        X_both  = np.column_stack([ones, t_v, r_v])        # + both
+
+        r2_null, _, _  = ols_r2(y_v, X_null)
+        r2_temp, _, _  = ols_r2(y_v, X_temp)
+        r2_rain, _, _  = ols_r2(y_v, X_rain)
+        r2_both, _, _  = ols_r2(y_v, X_both)
+
+        # Incremental: does rain add anything beyond temperature?
+        dr2_rain_given_temp, F_rain, p_rain = incremental_f_test(
+            y_v, X_temp, X_both)
+
+        # Incremental: does temperature add anything beyond rainfall?
+        dr2_temp_given_rain, F_temp, p_temp = incremental_f_test(
+            y_v, X_rain, X_both)
+
+        print(f"\n  Part 2 — Incremental R² (OLS, n={n_v}):")
+        print(f"    R²(intercept only):       {r2_null:.3f}")
+        print(f"    R²(temperature only):     {r2_temp:.3f}")
+        print(f"    R²(rainfall only):        {r2_rain:.3f}")
+        print(f"    R²(temperature+rainfall): {r2_both:.3f}")
+        print(f"    ΔR²(rain | temp):         {dr2_rain_given_temp:+.3f}  "
+              f"F={F_rain:.2f}  p={p_rain:.4f}"
+              + ("  *" if p_rain < 0.05 else "  ." if p_rain < 0.10 else ""))
+        print(f"    ΔR²(temp | rain):         {dr2_temp_given_rain:+.3f}  "
+              f"F={F_temp:.2f}  p={p_temp:.4f}"
+              + ("  *" if p_temp < 0.05 else "  ." if p_temp < 0.10 else ""))
+
+        # Interpretation
+        if p_rain < 0.05:
+            interp = "Rainfall adds significant explanatory power beyond temperature."
+        elif p_rain < 0.10:
+            interp = "Rainfall adds marginal explanatory power (p<0.10)."
+        else:
+            interp = "Rainfall does not significantly improve on temperature alone."
+        print(f"    → {interp}")
+
+        results.append({
+            "region":               region,
+            "region_name":          REGION_NAMES.get(region, "?"),
+            "n_calib":              n_v,
+            "trend":                trend,
+            # Temperature
+            "temp_index":           best_temp["index_type"],
+            "temp_months":          mo_t,
+            "temp_rho":             round(best_temp["corr"], 4),
+            "temp_rho2":            round(best_temp["r_squared"], 4),
+            "temp_p":               round(best_temp["p_value"], 4),
+            # Rainfall
+            "rain_index":           best_rain["index_type"],
+            "rain_months":          mo_r,
+            "rain_rho":             round(best_rain["corr"], 4),
+            "rain_rho2":            round(best_rain["r_squared"], 4),
+            "rain_p":               round(best_rain["p_value"], 4),
+            "p_ref_mm":             round(p_ref, 3),
+            # OLS R²
+            "r2_temp_only":         round(r2_temp, 4),
+            "r2_rain_only":         round(r2_rain, 4),
+            "r2_both":              round(r2_both, 4),
+            # Incremental
+            "delta_r2_rain_given_temp": round(dr2_rain_given_temp, 4),
+            "F_rain_given_temp":    round(F_rain, 3) if not np.isnan(F_rain) else np.nan,
+            "p_rain_given_temp":    round(p_rain, 4) if not np.isnan(p_rain) else np.nan,
+            "delta_r2_temp_given_rain": round(dr2_temp_given_rain, 4),
+            "F_temp_given_rain":    round(F_temp, 3) if not np.isnan(F_temp) else np.nan,
+            "p_temp_given_rain":    round(p_temp, 4) if not np.isnan(p_temp) else np.nan,
+            "rain_sig_beyond_temp": p_rain < 0.05 if not np.isnan(p_rain) else False,
+        })
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SUMMARY OUTPUT
+    # ══════════════════════════════════════════════════════════════════════════
+    if not results:
+        print("\nNo results."); return
+
+    df = pd.DataFrame(results)
+    SEP = "=" * 100
+
+    print(f"\n\n{SEP}")
+    print("  SUMMARY — RAINFALL vs TEMPERATURE YIELD IMPACT")
+    print(f"  Calibration {CALIB_START}–{CALIB_END} | "
+          f"Index selection: max |Spearman ρ| (Möllmann §2a)")
+    print(SEP)
+
+    # Part 1 table
+    print(f"\n  PART 1 — Spearman ρ² Comparison")
+    hdr = (f"  {'Reg':<5}{'Name':<22}{'Temp index':<22}{'ρ²(T)':>7}"
+           f"{'Rain index':<22}{'ρ²(R)':>7}{'Winner':>12}{'Δρ²':>7}")
+    print(hdr)
+    print(f"  {'─'*95}")
+    for _, r in df.iterrows():
+        winner = "Temp" if r.temp_rho2 >= r.rain_rho2 else "Rain"
+        gap = abs(r.temp_rho2 - r.rain_rho2)
+        t_str = f"{r.temp_index} {r.temp_months}"
+        rain_str = f"{r.rain_index} {r.rain_months}"
+        print(f"  {int(r.region):<5}{r.region_name:<22}{t_str:<22}{r.temp_rho2:>7.3f}"
+              f"{rain_str:<22}{r.rain_rho2:>7.3f}{winner:>12}{gap:>7.3f}")
+
+    print(f"\n  Means:  ρ²(temp)={df['temp_rho2'].mean():.3f}  "
+          f"ρ²(rain)={df['rain_rho2'].mean():.3f}")
+
+    # Part 2 table
+    print(f"\n\n  PART 2 — Incremental R² (does rainfall add beyond temperature?)")
+    hdr2 = (f"  {'Reg':<5}{'Name':<22}{'R²(T)':>7}{'R²(R)':>7}{'R²(T+R)':>9}"
+            f"{'ΔR²(R|T)':>10}{'F':>7}{'p':>8}{'Sig':>5}")
+    print(hdr2)
+    print(f"  {'─'*80}")
+    for _, r in df.iterrows():
+        sig = ("*" if r.p_rain_given_temp < 0.05 else
+               "." if r.p_rain_given_temp < 0.10 else "")
+        p_str = f"{r.p_rain_given_temp:.4f}" if not pd.isna(r.p_rain_given_temp) else "  nan"
+        F_str = f"{r.F_rain_given_temp:.2f}" if not pd.isna(r.F_rain_given_temp) else " nan"
+        print(f"  {int(r.region):<5}{r.region_name:<22}"
+              f"{r.r2_temp_only:>7.3f}{r.r2_rain_only:>7.3f}{r.r2_both:>9.3f}"
+              f"{r.delta_r2_rain_given_temp:>+10.3f}{F_str:>7}{p_str:>8}{sig:>5}")
+
+    n_sig = int(df["rain_sig_beyond_temp"].sum())
+    print(f"\n  → Rainfall significant beyond temperature (p<0.05): "
+          f"{n_sig}/{len(df)} regions")
+
+    # Pooled Spearman comparison (all regions)
+    print(f"\n  Pooled across regions:")
+    print(f"    Mean ρ²(temperature): {df['temp_rho2'].mean():.3f}  "
+          f"(range {df['temp_rho2'].min():.3f}–{df['temp_rho2'].max():.3f})")
+    print(f"    Mean ρ²(rainfall):    {df['rain_rho2'].mean():.3f}  "
+          f"(range {df['rain_rho2'].min():.3f}–{df['rain_rho2'].max():.3f})")
+    print(f"    Mean R²(both):        {df['r2_both'].mean():.3f}  "
+          f"(mean gain from adding rain: "
+          f"{df['delta_r2_rain_given_temp'].mean():+.3f})")
+
+    # Methodology
+    print(f"\n{SEP}")
+    print("METHODOLOGY")
+    print(f"  Detrending:    MM-estimator + Wald test (Pelka §2, Finger 2010)")
+    print(f"  Index selection: max |Spearman ρ| (Möllmann et al. 2019 §2a)")
+    print(f"  Temp indices:  HDD=Σmax(T_REF−T,0)  CDD=Σmax(T−T_REF,0)  CAT=ΣT")
+    print(f"  Rain indices:  RAI=ΣP  (cumulative precipitation, standard OTC index)")
+    print(f"                 DRY/WET excluded — non-standard, no CME precedent")
+    print(f"  Incremental R²: OLS F-test H0: β_rain=0 given temperature (Greene 2012 §5.4)")
+    print(f"  All selection on calibration window {CALIB_START}–{CALIB_END} only")
+
+    df.to_csv(f"{OUTPUT_DIR}/rainfall_yield_summary.csv", index=False)
+    print(f"\n  Saved → {OUTPUT_DIR}/rainfall_yield_summary.csv")
+
+    return df
+
+
+if __name__ == "__main__":
+    run()
