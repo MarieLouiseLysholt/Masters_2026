@@ -1,0 +1,620 @@
+"""
+Paper XGBoost — Rolling Calibration Training Script
+=====================================================
+Replicates the Barnor, Kampouridis & Kanellopoulos (2026) XGBoost methodology
+for French NUTS-2 regions with rolling yearly calibration.
+
+Pipeline (per region, per calibration year):
+  1. Load DAT from region_avg.csv, remove Feb 29, impute missing (Eqs 6-8)
+  2. OLS linear detrending (§3.1.1)
+  3. Fourier deseasonalization (Berhane et al. 2021)
+  4. Feature engineering (Table 2)
+  5. Nested CV: 5 outer × 3 inner, HalvingGridSearchCV (§3.2.2)
+  6. Refit best model on full calibration data
+  7. Save PKL with everything needed for recursive walk-forward forecasting
+
+Rolling calibration:
+  calib through 2014-12-31 → predicts 2015
+  calib through 2015-12-31 → predicts 2016
+  ...
+  calib through 2023-12-31 → predicts 2024
+
+Output PKLs saved to: EXPORT_DIR / paper_xgb_region_{R}_calib_{Y}.pkl
+Each PKL contains:
+  - fitted_model:    XGBRegressor with best hyperparameters
+  - scaler:          fitted StandardScaler
+  - trend_intercept: OLS intercept
+  - trend_slope:     OLS slope
+  - fourier_coefs:   fitted Fourier regression coefficients
+  - n_harmonics:     number of Fourier harmonics used
+  - best_params:     best hyperparameters from nested CV
+  - region:          region code
+  - calib_year:      calibration year
+  - calib_end_tidx:  last t_idx in calibration (for extending trend to test)
+  - n_train_days:    number of training days (for t_idx computation)
+  - training_df:     last 5 years of processed training data (for create_feat)
+
+Usage:
+  python paper_xgboost_rolling_train.py
+"""
+
+import os
+import datetime
+import pickle
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from sklearn.experimental import enable_halving_search_cv  # noqa: F401
+from sklearn.model_selection import TimeSeriesSplit, HalvingGridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_absolute_percentage_error,
+    mean_squared_error,
+    r2_score,
+)
+import xgboost as xgb
+
+warnings.filterwarnings("ignore")
+np.random.seed(23)
+
+# ===========================================================================
+# CONFIG
+# ===========================================================================
+
+RAW_CSV    = "EDA/region_avg.csv"
+EXPORT_DIR = Path("Outputs/xgBoost_rolling_exports")
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+REGIONS = [11, 24, 27, 28, 32, 44, 52, 53]
+
+START_CALIB_YEAR = 2014
+END_CALIB_YEAR   = 2023   # calib 2023 → predict 2024
+
+RANDOM_STATE = 23
+N_HARMONICS  = 3   # Fourier harmonics for deseasonalization
+
+# XGB hyperparameter grid — matches paper Table 3 exactly
+XGB_GRID = {
+    "n_estimators":  [5, 50, 80, 100, 150, 200],
+    "max_depth":     [2, 3, 4, 5, 6],
+    "learning_rate": [0.09, 0.10, 0.14, 0.18, 0.20, 0.21],
+}
+
+# Feature column order — matches paper Table 2
+FEATURE_COLS = [
+    "dayofyear", "pdtn_doy", "de_trend_seas",
+    "dts_doyavge", "dts_doyvar",
+    "yday",
+    "IIdays_ago", "IIIdays_ago", "IVdays_ago",
+    "Vdays_ago", "VIdays_ago", "VIIdays_ago",
+    "last_year", "last_2year", "last_3year", "last_4year", "last_5year",
+    "h1_last_year", "h1_last_2years", "h1_last_3years",
+    "h1_last_4years", "h1_last_5years",
+    "h1_ly_2days", "h1_ly_3day", "h1_ly_4day",
+    "h1_ly_5day", "h1_ly_6day", "h1_ly_7day",
+    "h1_ly_next_1day", "h1_ly_next_2days", "h1_ly_next_3days",
+    "h1_ly_next_4days", "h1_ly_next_5days",
+    "h1_ly_next_6days", "h1_ly_next_7days",
+    "diff_1year", "diff_2year", "diff_3year", "diff_4year", "diff_5year",
+    "diff_yday", "diff_2days", "diff_3days", "diff_4days",
+    "diff_5days", "diff_6days", "diff_7days",
+    "last_7_1day_deltas_mean", "last_7_1day_deltas_min",
+    "last_7_1day_deltas_max",
+]
+
+TARGET_COL = "next_day"
+
+
+# ===========================================================================
+# SECTION 1: DATA LOADING & PREPROCESSING
+# ===========================================================================
+
+def load_region_raw(region: int) -> pd.DataFrame:
+    """Load DAT for one region, remove Feb 29, impute missing."""
+    raw = pd.read_csv(RAW_CSV, parse_dates=["date"])
+    raw = raw.rename(columns={"daily_avg_temperature": "T"})
+    df = (raw[raw["region_code"] == region][["date", "T"]]
+          .dropna(subset=["date"])
+          .sort_values("date")
+          .reset_index(drop=True))
+
+    # Remove Feb 29 — §3.1.1
+    df = df[~((df["date"].dt.month == 2) & (df["date"].dt.day == 29))].copy()
+    df = df.reset_index(drop=True)
+
+    # DOY (1-365, no leap)
+    def _doy_noleap(d):
+        doy = d.timetuple().tm_yday
+        if (d.year % 4 == 0 and (d.year % 100 != 0 or d.year % 400 == 0)):
+            if d.month > 2:
+                doy -= 1
+        return max(1, min(365, doy))
+
+    df["dayofyear"] = df["date"].apply(_doy_noleap)
+    df["t_idx"] = np.arange(len(df), dtype=float)
+
+    # Missing data imputation — Eqs 6-8
+    if df["T"].isna().any():
+        doy_means = (df.dropna(subset=["T"])
+                     .groupby("dayofyear")["T"].mean().to_dict())
+        for pos in df[df["T"].isna()].index.tolist():
+            doy_val = int(df.at[pos, "dayofyear"])
+            T_avy = doy_means.get(doy_val, float(df["T"].mean()))
+            nbrs = []
+            for off in list(range(-7, 0)) + list(range(1, 8)):
+                p = pos + off
+                if 0 <= p < len(df) and not pd.isna(df.at[p, "T"]):
+                    nbrs.append(df.at[p, "T"])
+            T_avd = float(np.mean(nbrs)) if nbrs else T_avy
+            df.at[pos, "T"] = (T_avy + T_avd) / 2.0
+
+    return df
+
+
+# ===========================================================================
+# SECTION 2: DETRENDING & DESEASONALIZING (§3.1.1)
+# ===========================================================================
+
+def detrend_linear(df: pd.DataFrame) -> tuple:
+    """
+    Remove linear trend via OLS: T = intercept + slope * t_idx + residual.
+    Returns (intercept, slope, detrended_series).
+    """
+    t = df["t_idx"].values
+    T = df["T"].values
+    mask = ~np.isnan(T)
+    # OLS: T = a + b*t
+    A = np.column_stack([np.ones(mask.sum()), t[mask]])
+    coefs, _, _, _ = np.linalg.lstsq(A, T[mask], rcond=None)
+    intercept, slope = coefs[0], coefs[1]
+    detrended = T - (intercept + slope * t)
+    return intercept, slope, detrended
+
+
+def deseasonalize_fourier(doy: np.ndarray, detrended: np.ndarray,
+                           n_harmonics: int = N_HARMONICS) -> tuple:
+    """
+    Remove seasonal component via Fourier regression on DOY.
+    T_detrended = sum_k [a_k * sin(2πk*doy/365) + b_k * cos(2πk*doy/365)] + residual
+    Returns (fourier_coefs, de_trend_seas_residual).
+    """
+    mask = ~np.isnan(detrended)
+    cols = [np.ones(mask.sum())]   # intercept
+    for k in range(1, n_harmonics + 1):
+        cols.append(np.sin(2 * np.pi * k * doy[mask] / 365.0))
+        cols.append(np.cos(2 * np.pi * k * doy[mask] / 365.0))
+    X = np.column_stack(cols)
+    coefs, _, _, _ = np.linalg.lstsq(X, detrended[mask], rcond=None)
+
+    # Compute seasonal for ALL rows
+    cols_all = [np.ones(len(doy))]
+    for k in range(1, n_harmonics + 1):
+        cols_all.append(np.sin(2 * np.pi * k * doy / 365.0))
+        cols_all.append(np.cos(2 * np.pi * k * doy / 365.0))
+    X_all = np.column_stack(cols_all)
+    seasonal = X_all @ coefs
+    residual = detrended - seasonal
+    return coefs, residual
+
+
+def compute_trend_seasonal(t_idx: np.ndarray, doy: np.ndarray,
+                            trend_intercept: float, trend_slope: float,
+                            fourier_coefs: np.ndarray,
+                            n_harmonics: int = N_HARMONICS) -> np.ndarray:
+    """Reconstruct trend + seasonal component for given t_idx and doy."""
+    trend = trend_intercept + trend_slope * t_idx
+    cols = [np.ones(len(doy))]
+    for k in range(1, n_harmonics + 1):
+        cols.append(np.sin(2 * np.pi * k * doy / 365.0))
+        cols.append(np.cos(2 * np.pi * k * doy / 365.0))
+    X = np.column_stack(cols)
+    seasonal = X @ fourier_coefs
+    return trend + seasonal
+
+
+# ===========================================================================
+# SECTION 3: FEATURE ENGINEERING (Table 2)
+# ===========================================================================
+
+def build_feature_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build the full feature DataFrame from preprocessed data.
+    df must have columns: date, T, dayofyear, t_idx, de_trend_seas
+    Sorted by date ascending. Indexed by date.
+    """
+    df = df.copy().sort_values("date").set_index("date")
+
+    dts = df["de_trend_seas"]
+
+    # pdtn_doy: DOY of the next day (prediction target day)
+    df["pdtn_doy"] = df["dayofyear"].shift(-1)
+    # Fill last row
+    last_doy = df["dayofyear"].iloc[-1]
+    df.iloc[-1, df.columns.get_loc("pdtn_doy")] = (
+        1 if last_doy == 365 else last_doy + 1
+    )
+    df["pdtn_doy"] = df["pdtn_doy"].astype(int)
+
+    # DOY averages and variances of de_trend_seas
+    doy_stats = df.groupby("dayofyear")["de_trend_seas"].agg(["mean", "var"])
+    df["dts_doyavge"] = df["dayofyear"].map(doy_stats["mean"])
+    df["dts_doyvar"]  = df["dayofyear"].map(doy_stats["var"])
+
+    # Lag features (yesterday, 2-7 days ago)
+    df["yday"]       = dts.shift(1)
+    df["IIdays_ago"] = dts.shift(2)
+    df["IIIdays_ago"] = dts.shift(3)
+    df["IVdays_ago"]  = dts.shift(4)
+    df["Vdays_ago"]   = dts.shift(5)
+    df["VIdays_ago"]  = dts.shift(6)
+    df["VIIdays_ago"] = dts.shift(7)
+
+    # Year-ago features
+    df["last_year"]  = dts.shift(365)
+    df["last_2year"] = dts.shift(365 * 2)
+    df["last_3year"] = dts.shift(365 * 3)
+    df["last_4year"] = dts.shift(365 * 4)
+    df["last_5year"] = dts.shift(365 * 5)
+
+    # h1_last_*years: prediction-day DOY temperature from 1-5 years ago
+    df["h1_last_year"]   = dts.shift(364)
+    df["h1_last_2years"] = dts.shift(364 + 365)
+    df["h1_last_3years"] = dts.shift(364 + 365 * 2)
+    df["h1_last_4years"] = dts.shift(364 + 365 * 3)
+    df["h1_last_5years"] = dts.shift(364 + 365 * 4)
+
+    # h1_ly_*days: fortnight around current day one year ago
+    df["h1_ly_2days"] = dts.shift(366)
+    df["h1_ly_3day"]  = dts.shift(367)
+    df["h1_ly_4day"]  = dts.shift(368)
+    df["h1_ly_5day"]  = dts.shift(369)
+    df["h1_ly_6day"]  = dts.shift(370)
+    df["h1_ly_7day"]  = dts.shift(371)
+
+    # h1_ly_next_*days: days after current day one year ago
+    df["h1_ly_next_1day"]  = dts.shift(363)
+    df["h1_ly_next_2days"] = dts.shift(362)
+    df["h1_ly_next_3days"] = dts.shift(361)
+    df["h1_ly_next_4days"] = dts.shift(360)
+    df["h1_ly_next_5days"] = dts.shift(359)
+    df["h1_ly_next_6days"] = dts.shift(358)
+    df["h1_ly_next_7days"] = dts.shift(357)
+
+    # Difference features: diff_Xyr = de_trend_seas - X_years_ago
+    df["diff_1year"] = dts - dts.shift(365)
+    df["diff_2year"] = dts - dts.shift(365 * 2)
+    df["diff_3year"] = dts - dts.shift(365 * 3)
+    df["diff_4year"] = dts - dts.shift(365 * 4)
+    df["diff_5year"] = dts - dts.shift(365 * 5)
+
+    # Difference features: diff_Xdays = de_trend_seas - X_days_ago
+    df["diff_yday"]  = dts - dts.shift(1)
+    df["diff_2days"] = dts - dts.shift(2)
+    df["diff_3days"] = dts - dts.shift(3)
+    df["diff_4days"] = dts - dts.shift(4)
+    df["diff_5days"] = dts - dts.shift(5)
+    df["diff_6days"] = dts - dts.shift(6)
+    df["diff_7days"] = dts - dts.shift(7)
+
+    # Rolling 7-day delta statistics
+    diff_1d = dts - dts.shift(1)
+    df["last_7_1day_deltas_mean"] = diff_1d.rolling(7).mean()
+    df["last_7_1day_deltas_min"]  = diff_1d.rolling(7).min()
+    df["last_7_1day_deltas_max"]  = diff_1d.rolling(7).max()
+
+    # Target: next day's de_trend_seas
+    df[TARGET_COL] = dts.shift(-1)
+
+    return df
+
+
+# ===========================================================================
+# SECTION 4: CREATE_FEAT — RECURSIVE FEATURE CONSTRUCTION
+# (Exact replication of the paper author's create_feat function)
+# ===========================================================================
+
+def create_feat(df: pd.DataFrame, pdtn: float) -> list:
+    """
+    Replicate paper author's create_feat for recursive walk-forward.
+    df: working DataFrame sorted descending by date (latest first),
+        must contain at least 5*365 + 7 rows.
+    pdtn: the model's prediction (de_trend_seas value for the next day).
+    Returns: list of lists [[feat1, feat2, ...]] for one row.
+    """
+    df = df.sort_index(ascending=False)
+    today = df.index.max()
+    today_row = df.loc[[today]]
+
+    dayofyear = today_row["pdtn_doy"].iloc[0]
+    pdtn_doy = 1 if dayofyear == 365 else dayofyear + 1
+    de_trend_seas = pdtn
+
+    dts_doyavge = df[df["dayofyear"] == dayofyear]["dts_doyavge"].iloc[0]
+    dts_doyvar  = df[df["dayofyear"] == dayofyear]["dts_doyvar"].iloc[0]
+
+    yday       = today_row["de_trend_seas"].iloc[0]
+    IIdays_ago = df["de_trend_seas"].iloc[1]
+    IIIdays_ago = df["de_trend_seas"].iloc[2]
+    IVdays_ago  = df["de_trend_seas"].iloc[3]
+    Vdays_ago   = df["de_trend_seas"].iloc[4]
+    VIdays_ago  = df["de_trend_seas"].iloc[5]
+    VIIdays_ago = df["de_trend_seas"].iloc[6]
+
+    last_year  = df["de_trend_seas"].iloc[364]
+    last_2year = df["de_trend_seas"].iloc[364 + 365]
+    last_3year = df["de_trend_seas"].iloc[364 + 365 * 2]
+    last_4year = df["de_trend_seas"].iloc[364 + 365 * 3]
+    last_5year = df["de_trend_seas"].iloc[364 + 365 * 4]
+
+    h1_last_year   = df["de_trend_seas"].iloc[363]
+    h1_last_2years = df["de_trend_seas"].iloc[363 + 365]
+    h1_last_3years = df["de_trend_seas"].iloc[363 + 365 * 2]
+    h1_last_4years = df["de_trend_seas"].iloc[363 + 365 * 3]
+    h1_last_5years = df["de_trend_seas"].iloc[363 + 365 * 4]
+
+    h1_ly_2days = df["de_trend_seas"].iloc[365]
+    h1_ly_3day  = df["de_trend_seas"].iloc[366]
+    h1_ly_4day  = df["de_trend_seas"].iloc[367]
+    h1_ly_5day  = df["de_trend_seas"].iloc[368]
+    h1_ly_6day  = df["de_trend_seas"].iloc[369]
+    h1_ly_7day  = df["de_trend_seas"].iloc[370]
+
+    h1_ly_next_1day  = df["de_trend_seas"].iloc[362]
+    h1_ly_next_2days = df["de_trend_seas"].iloc[361]
+    h1_ly_next_3days = df["de_trend_seas"].iloc[360]
+    h1_ly_next_4days = df["de_trend_seas"].iloc[359]
+    h1_ly_next_5days = df["de_trend_seas"].iloc[358]
+    h1_ly_next_6days = df["de_trend_seas"].iloc[357]
+    h1_ly_next_7days = df["de_trend_seas"].iloc[356]
+
+    diff_1year = pdtn - last_year
+    diff_2year = pdtn - last_2year
+    diff_3year = pdtn - last_3year
+    diff_4year = pdtn - last_4year
+    diff_5year = pdtn - last_5year
+    diff_yday  = pdtn - yday
+    diff_2days = pdtn - IIdays_ago
+    diff_3days = pdtn - IIIdays_ago
+    diff_4days = pdtn - IVdays_ago
+    diff_5days = pdtn - Vdays_ago
+    diff_6days = pdtn - VIdays_ago
+    diff_7days = pdtn - VIIdays_ago
+
+    last_7_1day_deltas_mean = df["diff_yday"].iloc[0:7].mean()
+    last_7_1day_deltas_min  = df["diff_yday"].iloc[0:7].min()
+    last_7_1day_deltas_max  = df["diff_yday"].iloc[0:7].max()
+
+    return [[
+        dayofyear, pdtn_doy, de_trend_seas, dts_doyavge, dts_doyvar,
+        yday, IIdays_ago, IIIdays_ago, IVdays_ago, Vdays_ago,
+        VIdays_ago, VIIdays_ago,
+        last_year, last_2year, last_3year, last_4year, last_5year,
+        h1_last_year, h1_last_2years, h1_last_3years,
+        h1_last_4years, h1_last_5years,
+        h1_ly_2days, h1_ly_3day, h1_ly_4day,
+        h1_ly_5day, h1_ly_6day, h1_ly_7day,
+        h1_ly_next_1day, h1_ly_next_2days, h1_ly_next_3days,
+        h1_ly_next_4days, h1_ly_next_5days,
+        h1_ly_next_6days, h1_ly_next_7days,
+        diff_1year, diff_2year, diff_3year, diff_4year, diff_5year,
+        diff_yday, diff_2days, diff_3days, diff_4days,
+        diff_5days, diff_6days, diff_7days,
+        last_7_1day_deltas_mean, last_7_1day_deltas_min,
+        last_7_1day_deltas_max,
+    ]]
+
+
+# ===========================================================================
+# SECTION 5: MAIN TRAINING LOOP
+# ===========================================================================
+
+def main():
+    start = datetime.datetime.now()
+    print("=" * 70)
+    print("  Paper XGBoost — Rolling Calibration Training")
+    print(f"  Regions: {REGIONS}")
+    print(f"  Calibration years: {START_CALIB_YEAR}–{END_CALIB_YEAR}")
+    print("=" * 70)
+
+    outer_cv = TimeSeriesSplit(n_splits=5, test_size=365)
+    inner_cv = TimeSeriesSplit(n_splits=3)
+
+    export_rows = []
+
+    for region in REGIONS:
+        print(f"\n{'─'*60}")
+        print(f"  Region {region}")
+        print(f"{'─'*60}")
+
+        # Load and preprocess full series
+        raw_df = load_region_raw(region)
+        print(f"  Loaded {len(raw_df)} days")
+
+        # Full-series detrending and deseasonalizing
+        trend_int, trend_slope, detrended = detrend_linear(raw_df)
+        fourier_coefs, dts_residual = deseasonalize_fourier(
+            raw_df["dayofyear"].values, detrended, N_HARMONICS
+        )
+        raw_df["de_trend_seas"] = dts_residual
+
+        # Build features on full series
+        feat_df = build_feature_df(raw_df)
+
+        # Drop rows with NaN features (first ~5 years have insufficient lags)
+        train_cols = FEATURE_COLS + [TARGET_COL]
+        feat_clean = feat_df.dropna(subset=train_cols, how="any").copy()
+        print(f"  Feature rows (after dropna): {len(feat_clean)}")
+
+        # ---- Nested CV: tune once per region on ALL pre-OOS data ----
+        # Use all data up to END_CALIB_YEAR for hyperparameter selection
+        calib_end_date = pd.Timestamp(f"{END_CALIB_YEAR}-12-31")
+        cv_data = feat_clean[feat_clean.index <= calib_end_date].copy()
+
+        X_cv = cv_data[FEATURE_COLS].values
+        y_cv = cv_data[TARGET_COL].values
+
+        scaler_cv = StandardScaler()
+        X_cv_scaled = scaler_cv.fit_transform(X_cv)
+
+        print(f"  Running nested CV on {len(cv_data)} rows ...")
+        best_params_dict = {}
+        fold_results = []
+
+        fold_idx = 0
+        for train_idx, test_idx in outer_cv.split(X_cv_scaled):
+            fold_idx += 1
+            print(f"    Outer Fold {fold_idx}")
+
+            X_out_train = X_cv_scaled[train_idx]
+            X_out_test  = X_cv_scaled[test_idx]
+            y_out_train = y_cv[train_idx]
+            y_out_test  = y_cv[test_idx]
+
+            grid_search = HalvingGridSearchCV(
+                estimator=xgb.XGBRegressor(
+                    objective="reg:squarederror",
+                    random_state=RANDOM_STATE,
+                    n_jobs=1,
+                ),
+                param_grid=XGB_GRID,
+                cv=inner_cv,
+                scoring="neg_mean_absolute_percentage_error",
+                refit=True,
+                n_jobs=-1,
+                random_state=RANDOM_STATE,
+            )
+            grid_search.fit(X_out_train, y_out_train)
+
+            best_model = grid_search.best_estimator_
+            y_pred = best_model.predict(X_out_test)
+            mape = mean_absolute_percentage_error(y_out_test, y_pred)
+
+            fold_results.append({
+                "fold": fold_idx,
+                "mape": mape,
+                "params": grid_search.best_params_,
+            })
+            best_params_dict[fold_idx] = grid_search.best_params_
+
+        # Select best fold
+        best_fold = min(fold_results, key=lambda x: x["mape"])
+        best_params = best_fold["params"]
+        print(f"  Best fold: {best_fold['fold']} "
+              f"(MAPE={best_fold['mape']:.6f})")
+        print(f"  Best params: {best_params}")
+
+        # ---- Rolling calibration: refit per year with best params ----
+        for calib_year in range(START_CALIB_YEAR, END_CALIB_YEAR + 1):
+            prediction_year = calib_year + 1
+            calib_end = pd.Timestamp(f"{calib_year}-12-31")
+
+            # Recalibrate detrending on calib-only data
+            calib_raw = raw_df[raw_df["date"] <= calib_end].copy()
+            c_int, c_slope, c_detrended = detrend_linear(calib_raw)
+            c_fourier, c_dts = deseasonalize_fourier(
+                calib_raw["dayofyear"].values, c_detrended, N_HARMONICS
+            )
+            calib_raw["de_trend_seas"] = c_dts
+
+            # Build features on calib data
+            calib_feat = build_feature_df(calib_raw)
+            calib_clean = calib_feat.dropna(
+                subset=FEATURE_COLS + [TARGET_COL], how="any"
+            ).copy()
+
+            if len(calib_clean) < 365 * 6:
+                print(f"    Skipping calib {calib_year}: "
+                      f"too few rows ({len(calib_clean)})")
+                continue
+
+            # Scale and fit
+            X_train = calib_clean[FEATURE_COLS].values
+            y_train = calib_clean[TARGET_COL].values
+
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X_train)
+
+            model = xgb.XGBRegressor(
+                objective="reg:squarederror",
+                random_state=RANDOM_STATE,
+                n_jobs=1,
+                **best_params,
+            )
+            model.fit(X_scaled, y_train)
+
+            # In-sample metrics
+            y_fit = model.predict(X_scaled)
+            fit_mae  = mean_absolute_error(y_train, y_fit)
+            fit_rmse = np.sqrt(mean_squared_error(y_train, y_fit))
+            fit_r2   = r2_score(y_train, y_fit)
+
+            # Prepare working DataFrame for recursive forecasting
+            # (last 5 years of processed data, as paper author does)
+            working_df = calib_feat.sort_index(ascending=False).head(365 * 5)
+            working_df = working_df.drop(
+                columns=[TARGET_COL], errors="ignore"
+            )
+
+            # Save PKL
+            payload = {
+                "fitted_model":     model,
+                "scaler":           scaler,
+                "trend_intercept":  float(c_int),
+                "trend_slope":      float(c_slope),
+                "fourier_coefs":    c_fourier,
+                "n_harmonics":      N_HARMONICS,
+                "best_params":      best_params,
+                "region":           int(region),
+                "calib_year":       int(calib_year),
+                "prediction_year":  int(prediction_year),
+                "n_calib_days":     int(len(calib_raw)),
+                "feature_cols":     FEATURE_COLS,
+                "working_df":       working_df,
+                "fit_metrics": {
+                    "MAE":  float(fit_mae),
+                    "RMSE": float(fit_rmse),
+                    "R2":   float(fit_r2),
+                },
+                "created_at": datetime.datetime.now().isoformat(),
+            }
+
+            pkl_name = (f"paper_xgb_region_{region}"
+                        f"_calib_{calib_year}.pkl")
+            pkl_path = EXPORT_DIR / pkl_name
+            with open(pkl_path, "wb") as f:
+                pickle.dump(payload, f)
+
+            export_rows.append({
+                "region": region,
+                "calib_year": calib_year,
+                "prediction_year": prediction_year,
+                "n_train_rows": len(calib_clean),
+                "fit_MAE": fit_mae,
+                "fit_RMSE": fit_rmse,
+                "fit_R2": fit_r2,
+                "best_params": str(best_params),
+                "pkl_path": str(pkl_path),
+            })
+
+            print(f"    calib {calib_year} → predict {prediction_year}  "
+                  f"({len(calib_clean)} rows, "
+                  f"R²={fit_r2:.4f}, MAE={fit_mae:.4f})")
+
+    # Save summary
+    if export_rows:
+        summary = pd.DataFrame(export_rows)
+        summary.to_csv(
+            EXPORT_DIR / f"paper_xgb_training_summary.csv",
+            index=False,
+        )
+
+    elapsed = datetime.datetime.now() - start
+    print(f"\nDone. Elapsed: {elapsed}")
+    print(f"PKLs saved to: {EXPORT_DIR}")
+
+
+if __name__ == "__main__":
+    main()

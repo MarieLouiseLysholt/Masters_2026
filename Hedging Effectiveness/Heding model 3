@@ -1,0 +1,1309 @@
+"""
+phase2_hedging_framework.py
+================================================================================
+Stage 2: Operationalizing XGBoost Temperature Forecasts for Weather Derivative
+         Hedging of French Winter Wheat
+
+Methodology citations are embedded at each step.  Every design choice that
+affects results is traceable to a published source; no ad-hoc assumptions
+are introduced beyond data-specific choices clearly flagged with [ADAPT].
+
+Project root: C:/Users/victo/Downloads/Python/Projects/Masters_2026
+
+================================================================================
+DATA SOURCES
+--------------------------------------------------------------------------------
+  region_avg.csv       : Daily actual temperatures 1970-present.
+                         Columns: date, region_code, daily_avg_temperature.
+                         Used for: full-sample (2000-2024) index computation
+                         -> Spearman selection (n=25) and QR contract design.
+
+  bk_forecasts.csv     : Stage 1 OOS forecasts + actuals, 2015-2024.
+                         Columns: region, year, date, actual, model, forecast.
+                         Filtered to model="XGB".
+                         Used for: MC pricing and EVOI.
+
+  EDA/ble_tendre_...   : Annual yield 2000-2024, quintaux/ha.
+                         Columns: year, reg, prod, surf, yield, source.
+
+================================================================================
+KEY METHODOLOGICAL DECISIONS
+--------------------------------------------------------------------------------
+  INDEX SELECTION & CONTRACT DESIGN  [CF15; MOM19]
+    Full panel 2000-2024 (n=25) from actual temperatures. Maximises
+    statistical power. Single-month and contiguous multi-month windows
+    are evaluated from the seasonal month sets below.
+
+  PRICING  [CD05; BKK26; JB05]
+    MC: XGBoost OOS forecasts (2015-2024) + block-bootstrapped residuals.
+    HBA: full historical actual index, loading = 0.22.
+
+  HEDGING EFFECTIVENESS  [MOM19; VB04; RU00]
+    Simulated joint (revenue, payoff) distribution [VB04]:
+      1. OLS: yield = alpha + beta * index + eps  (full panel, n=25).
+      2. For each MC temperature path -> index_sim.
+      3. yield_sim = alpha + beta * index_sim + eps*  (bootstrapped OLS eps).
+      4. loss_sim = mean(rev_u) - rev_u  (shortfall below mean revenue).
+      5. HE_ES = 1 - ES(loss_hedged) / ES(loss_unhedged).
+    ES defined as shortfall below mean so it is always positive for
+    always-positive revenues, and so that better hedging reduces ES [RU00].
+    alpha=0.95 valid with N_SIMS=10,000 (500 tail observations).
+
+  EVOI  [MU77; RI00]
+    Model-vs-model: XGBoost MC probabilities vs HBA historical frequencies.
+
+================================================================================
+CITATION MAP
+--------------------------------------------------------------------------------
+  JB05   Jewson & Brix (2005). Weather Derivative Valuation. CUP.
+  VB04   Vedenov & Barnett (2004). JARE 29(3), 387-403.
+  CD05   Campbell & Diebold (2005). JASA 100(469), 6-16.
+  CF15   Conradt, Finger & Bokusheva (2015). Agric. Econ. 46(4), 537-547.
+  MOM19  Mollmann, Buchholz & Musshoff (2019). WCS 11(1), 90-105.
+  RU00   Rockafellar & Uryasev (2000). J. Risk 2(3), 21-41.
+  MU77   Murphy (1977). Mon. Weather Rev. 105, 803-816.
+  RI00   Richardson (2000). QJRMS 126, 649-668.
+  STU16  Stulec, Petljak & Bakovic (2016). Agric. Econ. Czech 62(8), 356-362.
+  PRE24  Prentzas, Soulis & Papathanasiou (2024). Sustainability 16(17), 7372.
+  BAB93  Babcock, Choi & Feinerman (1993). JARE 18(1), 17-24.
+  PR94   Politis & Romano (1994). JASA 89(428), 1303-1313.
+  OS05   Oetomo & Stevenson (2005). GFJ 16(2), 192-209.
+  BKK26  Barnor, Kampouridis & Kanellopoulos (2026). Artif. Intell. Rev.
+         https://doi.org/10.1007/s10462-026-11539-0
+  SH13   Spicka & Hnilica (2013). Adv. Meteorol. 2013, 146036.
+================================================================================
+"""
+
+# -- Standard library ----------------------------------------------------------
+import warnings
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# -- Third-party ---------------------------------------------------------------
+import numpy as np
+import pandas as pd
+import scipy.stats as stats
+from statsmodels.regression.quantile_regression import QuantReg
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+
+# ==============================================================================
+# 0.  CONFIGURATION
+# ==============================================================================
+
+ROOT    = Path(r"C:/Users/victo/Downloads/Python/Projects/Masters_2026")
+OUT_DIR = ROOT / "results" / "phase2"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+REGIONS   = ["11", "24", "27", "28", "32", "44", "52", "53"]
+ALL_YEARS = list(range(2000, 2025))   # full panel for selection + design
+OOS_YEARS = list(range(2015, 2025))   # OOS for pricing + EVOI
+
+T_REF   = 18.0    # CME Europe standard [OS05]
+MIN_RHO = 0.15    # minimum |rho| to accept a window [MOM19]
+
+# -- Candidate windows ---------------------------------------------------------
+# (index_type, start_doy, end_doy) using non-leap-year DOY reference.
+# All contiguous month combinations are evaluated within each seasonal set, so
+# the selection step can compare single months and grouped months such as
+# HDD_AprMayJun or CDD_AprMayJun on the same footing.
+MONTH_DAY_RANGES: Dict[str, Tuple[int, int]] = {
+    "Jan": (1, 31),
+    "Feb": (32, 59),
+    "Mar": (60, 90),
+    "Apr": (91, 120),
+    "May": (121, 151),
+    "Jun": (152, 181),
+    "Jul": (182, 212),
+}
+
+INDEX_MONTHS: Dict[str, List[str]] = {
+    "HDD": ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul"],
+    "CDD": ["Mar", "Apr", "May", "Jun", "Jul"],
+    "CAT": ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul"],
+}
+
+
+def build_candidate_windows() -> Dict[str, Tuple[str, int, int]]:
+    """Generate single-month and contiguous multi-month windows."""
+    windows: Dict[str, Tuple[str, int, int]] = {}
+    for idx_type, months in INDEX_MONTHS.items():
+        for start in range(len(months)):
+            for end in range(start, len(months)):
+                month_slice = months[start:end + 1]
+                label = "".join(month_slice)
+                doy_start = MONTH_DAY_RANGES[month_slice[0]][0]
+                doy_end = MONTH_DAY_RANGES[month_slice[-1]][1]
+                windows[f"{idx_type}_{label}"] = (idx_type, doy_start, doy_end)
+    return windows
+
+
+CANDIDATE_WINDOWS: Dict[str, Tuple[str, int, int]] = build_candidate_windows()
+
+QUANTILE_TAU     = 0.30   # lower tail contract design [CF15]
+CROP_PRICE_EUR_T = 200.0  # [ADAPT]
+FARM_AREA_HA     = 100.0  # [ADAPT]
+
+LAMBDA_GRID = [0.0001, 0.001, 0.005, 0.01]   # [BAB93]
+LAMBDA_BASE = 0.001                            # central estimate [VB04]
+
+N_SIMS       = 10_000
+BLOCK_LENGTH = 10       # days [PR94]
+RISK_FREE    = 0.03     # [ADAPT]
+ALPHA        = 0.95     # valid with N_SIMS=10,000 [RU00]
+
+CL_GRID          = np.linspace(0.02, 0.50, 49)
+HBA_LOADING      = 0.22      # [JB05]
+MIN_WINDOW_DAYS  = 20
+MIN_INDEX_VAR    = 1.0
+
+
+# ==============================================================================
+# 1.  DATA LOADING
+# ==============================================================================
+
+def load_temperature(path: Path) -> pd.DataFrame:
+    """
+    Load daily actual temperatures from region_avg.csv.
+    Columns: date, region_code, daily_avg_temperature
+    Used for full-panel index computation (Spearman + QR, n=25).
+    """
+    df = pd.read_csv(path, parse_dates=["date"])
+    df = df.rename(columns={"region_code": "region",
+                             "daily_avg_temperature": "T_mean"})
+    df["region"] = df["region"].astype(str)
+    df["year"]   = df["date"].dt.year
+    df["doy"]    = df["date"].dt.dayofyear
+    print(f"      Temperature: {len(df):,} rows | "
+          f"years {df['year'].min()}-{df['year'].max()}")
+    return df
+
+
+def load_yield(path: Path) -> pd.DataFrame:
+    """
+    Load AGRESTE annual yield. Columns: year, reg, prod, surf, yield, source.
+    yield in quintaux/ha -> divided by 10 -> t/ha.
+    Linear OLS detrend per region [VB04 sec. 3.1].
+    """
+    df = pd.read_csv(path)
+    df = df.rename(columns={"reg": "region"})
+    df["region"]   = df["region"].astype(str)
+    df["yield_t_ha"] = df["yield"] / 10.0
+
+    parts = []
+    for region, grp in df.groupby("region"):
+        grp = grp.sort_values("year").copy()
+        if len(grp) < 3:
+            parts.append(grp)
+            continue
+        x = grp["year"].values.astype(float)
+        y = grp["yield_t_ha"].values
+        trend = np.polyval(np.polyfit(x, y, 1), x)
+        grp["yield_t_ha"] = y - trend + y.mean()
+        parts.append(grp)
+
+    out = pd.concat(parts, ignore_index=True)[["year", "region", "yield_t_ha"]]
+    print(f"      Yield: {len(out)} rows | "
+          f"years {out['year'].min()}-{out['year'].max()} | "
+          f"mean {out['yield_t_ha'].mean():.2f} t/ha")
+    return out
+
+
+def load_xgb_forecasts(path: Path, model_name: str = "XGB") -> pd.DataFrame:
+    """
+    Load XGB OOS forecasts from bk_forecasts.csv.
+    Columns: region, year, date, actual, model, forecast.
+    Filters to model_name. Computes residual = actual - forecast.
+    """
+    df = pd.read_csv(path, parse_dates=["date"])
+    avail = df["model"].unique().tolist()
+    if model_name not in avail:
+        raise ValueError(f"'{model_name}' not in {avail}")
+    df = df[df["model"] == model_name].copy()
+    df = df.rename(columns={"actual": "T_actual", "forecast": "T_forecast"})
+    df["year"]     = df["date"].dt.year
+    df["doy"]      = df["date"].dt.dayofyear
+    df["region"]   = df["region"].astype(str)
+    df["residual"] = df["T_actual"] - df["T_forecast"]
+    print(f"      XGB forecasts: {len(df):,} rows | "
+          f"years {df['year'].min()}-{df['year'].max()}")
+    return df
+
+
+# ==============================================================================
+# 2.  INDEX COMPUTATION
+# ==============================================================================
+# HDD = sum max(T_REF - T, 0)  [OS05]
+# CDD = sum max(T - T_REF, 0)  [OS05]
+# CAT = sum T over window       [JB05]
+
+def _accumulate(series: np.ndarray, idx_type: str) -> float:
+    if idx_type == "HDD":
+        return float(np.maximum(T_REF - series, 0).sum())
+    elif idx_type == "CDD":
+        return float(np.maximum(series - T_REF, 0).sum())
+    return float(series.sum())
+
+
+def compute_indices_from_actual(
+    temp_df: pd.DataFrame,
+    regions: List[str],
+    years: List[int],
+    windows: Dict[str, Tuple[str, int, int]] = CANDIDATE_WINDOWS,
+) -> pd.DataFrame:
+    """
+    Compute all candidate indices from actual observed temperatures.
+    Column naming: <win>_act, <win>_n_days.
+    Used for: Spearman selection (n=25), QR design, HBA pricing.
+    """
+    records = []
+    for region in regions:
+        r = temp_df[temp_df["region"] == region].sort_values("date")
+        for year in years:
+            yr = r[r["year"] == year]
+            if yr.empty:
+                continue
+            row = {"region": region, "year": year}
+            for wn, (it, d1, d2) in windows.items():
+                seg = yr[(yr["doy"] >= d1) & (yr["doy"] <= d2)]
+                row[f"{wn}_act"]    = _accumulate(seg["T_mean"].values, it) if not seg.empty else np.nan
+                row[f"{wn}_n_days"] = len(seg)
+            records.append(row)
+    return pd.DataFrame(records)
+
+
+def compute_indices_from_forecasts(
+    xgb_df: pd.DataFrame,
+    regions: List[str],
+    years: List[int],
+    windows: Dict[str, Tuple[str, int, int]] = CANDIDATE_WINDOWS,
+) -> pd.DataFrame:
+    """
+    Compute candidate indices from XGBoost OOS forecasts.
+    Columns: <win>_fc (from T_forecast), <win>_act (from T_actual).
+    Used for: MC pricing (via _fc) and EVOI event flags (via _act).
+    """
+    records = []
+    for region in regions:
+        r = xgb_df[xgb_df["region"] == region].sort_values("date")
+        for year in years:
+            yr = r[r["year"] == year]
+            if yr.empty:
+                continue
+            row = {"region": region, "year": year}
+            for wn, (it, d1, d2) in windows.items():
+                seg = yr[(yr["doy"] >= d1) & (yr["doy"] <= d2)]
+                if seg.empty:
+                    row[f"{wn}_fc"]     = np.nan
+                    row[f"{wn}_act"]    = np.nan
+                    row[f"{wn}_n_days"] = 0
+                else:
+                    row[f"{wn}_fc"]     = _accumulate(seg["T_forecast"].values, it)
+                    row[f"{wn}_act"]    = _accumulate(seg["T_actual"].values,   it)
+                    row[f"{wn}_n_days"] = len(seg)
+            records.append(row)
+    return pd.DataFrame(records)
+
+
+# ==============================================================================
+# 3.  WINDOW SELECTION VIA SPEARMAN (FULL PANEL)
+# ==============================================================================
+
+def select_best_window(
+    idx_all: pd.DataFrame,
+    yield_df: pd.DataFrame,
+    region: str,
+    windows: Dict[str, Tuple[str, int, int]] = CANDIDATE_WINDOWS,
+    min_rho: float = MIN_RHO,
+    min_days: int = MIN_WINDOW_DAYS,
+    min_variance: float = MIN_INDEX_VAR,
+    exclude_windows: Optional[List[str]] = None,
+) -> Dict:
+    """
+    Select best (window, index_type) per region via Spearman rho with
+    detrended yield over the full historical panel (n=25) [CF15; MOM19].
+    Uses _act columns (actual observed temperatures from region_avg.csv).
+    exclude_windows: list of window names to skip (used for straddle leg 2).
+    """
+    exclude_windows = exclude_windows or []
+    merged = (
+        idx_all[idx_all["region"] == region]
+        .merge(yield_df[yield_df["region"] == region], on=["region", "year"])
+        .dropna(subset=["yield_t_ha"])
+    )
+
+    rho_results = {}
+    for wn, (it, d1, d2) in windows.items():
+        if wn in exclude_windows:
+            continue
+        ac, nd = f"{wn}_act", f"{wn}_n_days"
+        if ac not in merged.columns:
+            continue
+        sub = merged[[ac, nd, "yield_t_ha"]].dropna()
+        if len(sub) < 5 or sub[nd].mean() < min_days or sub[ac].var() < min_variance:
+            continue
+        rho, pval = stats.spearmanr(sub[ac], sub["yield_t_ha"])
+        rho_results[wn] = {
+            "rho": float(rho), "abs_rho": float(abs(rho)),
+            "p_value": float(pval), "index_type": it,
+            "doy_start": d1, "doy_end": d2, "n_obs": len(sub),
+        }
+
+    if not rho_results:
+        return {"best_window": None, "index_type": None, "doy_start": None,
+                "doy_end": None, "rho": np.nan, "abs_rho": np.nan,
+                "p_value": np.nan, "direction": 0, "n_obs": 0, "all_rhos": {}}
+
+    best = max(rho_results, key=lambda k: rho_results[k]["abs_rho"])
+    b    = rho_results[best]
+
+    if b["abs_rho"] < min_rho:
+        print(f"    [WARN] R{region}: |rho|={b['abs_rho']:.3f} ({best}) "
+              f"< {min_rho}")
+
+    all_rhos = {k: round(v["rho"], 3)
+                for k, v in sorted(rho_results.items(),
+                                   key=lambda x: -x[1]["abs_rho"])}
+    return {
+        "best_window": best, "index_type": b["index_type"],
+        "doy_start": b["doy_start"], "doy_end": b["doy_end"],
+        "rho": b["rho"], "abs_rho": b["abs_rho"],
+        "p_value": b["p_value"], "direction": int(np.sign(b["rho"])),
+        "n_obs": b["n_obs"], "all_rhos": all_rhos,
+    }
+
+
+def select_spring_cdd_window(
+    idx_all: pd.DataFrame,
+    yield_df: pd.DataFrame,
+    region: str,
+    windows: Dict[str, Tuple[str, int, int]] = CANDIDATE_WINDOWS,
+    min_days: int = MIN_WINDOW_DAYS,
+    min_variance: float = MIN_INDEX_VAR,
+    exclude_windows: Optional[List[str]] = None,
+) -> Dict:
+    """
+    Select best CDD spring/summer window (doy_start >= 91) for straddle leg 2.
+    Excludes the primary window to prevent identical legs.
+    Lower min_rho=0.05 since spring CDD signal may be weaker.
+    """
+    cdd_spring = {k: v for k, v in windows.items()
+                  if v[0] == "CDD" and v[1] >= 91}
+    return select_best_window(
+        idx_all, yield_df, region,
+        windows=cdd_spring, min_rho=0.05,
+        min_days=min_days, min_variance=min_variance,
+        exclude_windows=exclude_windows,
+    )
+
+
+# ==============================================================================
+# 4.  CONTRACT DESIGN: QR STRIKE AND TICK (FULL PANEL)
+# ==============================================================================
+
+def estimate_contract_parameters(
+    idx_all: pd.DataFrame,
+    yield_df: pd.DataFrame,
+    region: str,
+    best_window: str,
+    tau: float = QUANTILE_TAU,
+) -> Dict:
+    """
+    Strike K and tick via tau-QR on full-panel actual index [CF15].
+    K = (Q_tau(yield) - alpha_hat) / beta_hat  [CF15 eq. 4]
+    tick = |beta_hat| * price * area            [SH13]
+    """
+    ac_col = f"{best_window}_act"
+    merged = (
+        idx_all[idx_all["region"] == region]
+        .merge(yield_df[yield_df["region"] == region], on=["region", "year"])
+        .dropna(subset=[ac_col, "yield_t_ha"])
+    )
+    if len(merged) < 5:
+        return {"strike_K": np.nan, "beta_qr": np.nan,
+                "tick_size": np.nan, "tau": tau, "n_obs": len(merged)}
+
+    X = merged[ac_col].values
+    y = merged["yield_t_ha"].values
+    res = QuantReg(y, np.column_stack([np.ones(len(X)), X])).fit(
+        q=tau, max_iter=2000, vcov="iid")
+    a_hat, b_hat = res.params
+
+    K = float(np.clip(
+        (np.quantile(y, tau) - a_hat) / b_hat if abs(b_hat) > 1e-9 else np.mean(X),
+        X.min(), X.max()
+    ))
+    return {
+        "strike_K":   K,
+        "beta_qr":    float(b_hat),
+        "tick_size":  float(abs(b_hat) * CROP_PRICE_EUR_T * FARM_AREA_HA),
+        "tau":        tau,
+        "n_obs":      len(merged),
+        "ci_beta_lo": float(res.conf_int()[1, 0]),
+        "ci_beta_hi": float(res.conf_int()[1, 1]),
+    }
+
+
+# ==============================================================================
+# 5.  OLS FIT FOR SIMULATED JOINT DISTRIBUTION
+# ==============================================================================
+
+def fit_ols_yield_index(
+    idx_all: pd.DataFrame,
+    yield_df: pd.DataFrame,
+    region: str,
+    best_window: str,
+) -> Dict:
+    """
+    OLS: yield = alpha + beta * index_act + eps  (full panel, n=25).
+    Residuals eps are bootstrapped in simulate_joint_distribution() to
+    represent yield variance unexplained by temperature [VB04 sec. 4].
+    """
+    ac_col = f"{best_window}_act"
+    merged = (
+        idx_all[idx_all["region"] == region]
+        .merge(yield_df[yield_df["region"] == region], on=["region", "year"])
+        .dropna(subset=[ac_col, "yield_t_ha"])
+    )
+    X      = merged[ac_col].values
+    y      = merged["yield_t_ha"].values
+    X2     = np.column_stack([np.ones(len(X)), X])
+    betas  = np.linalg.lstsq(X2, y, rcond=None)[0]
+    resids = y - X2 @ betas
+    return {
+        "alpha":     float(betas[0]),
+        "beta":      float(betas[1]),
+        "residuals": resids,
+        "n_obs":     len(merged),
+        "r2":        float(1 - resids.var() / y.var()),
+    }
+
+
+# ==============================================================================
+# 6.  HBA PRICING
+# ==============================================================================
+
+def hba_price(
+    hist_idx: np.ndarray,
+    strike: float,
+    tick: float,
+    option_type: str,
+    loading: float = HBA_LOADING,
+) -> Dict:
+    """Historical Burn Analysis fair premium [JB05 ch.3; SH13]."""
+    payoffs = (tick * np.maximum(hist_idx - strike, 0) if option_type == "call"
+               else tick * np.maximum(strike - hist_idx, 0))
+    return {
+        "premium_hba": float(payoffs.mean() * (1 + loading)),
+        "mean_payoff": float(payoffs.mean()),
+        "std_payoff":  float(payoffs.std(ddof=1)),
+        "n_years":     len(hist_idx),
+    }
+
+
+# ==============================================================================
+# 7.  MONTE CARLO PRICING
+# ==============================================================================
+
+def block_bootstrap(
+    residuals: np.ndarray, n_days: int, n_sims: int,
+    b: int = BLOCK_LENGTH,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """Stationary block bootstrap [PR94]. Returns (n_sims, n_days)."""
+    if rng is None:
+        rng = np.random.default_rng(42)
+    n_res = len(residuals)
+    out   = np.empty((n_sims, n_days))
+    for i in range(n_sims):
+        path = []
+        while len(path) < n_days:
+            start = rng.integers(0, max(1, n_res - b + 1))
+            path.extend(residuals[start: start + b].tolist())
+        out[i] = path[:n_days]
+    return out
+
+
+def mc_price(
+    forecast: np.ndarray,
+    residuals: np.ndarray,
+    strike: float,
+    tick: float,
+    option_type: str,
+    index_type: str,
+    n_sims: int = N_SIMS,
+    b: int      = BLOCK_LENGTH,
+    rf: float   = RISK_FREE,
+    rng: Optional[np.random.Generator] = None,
+) -> Dict:
+    """
+    MC option price: T_sim = T_forecast + eps*  [CD05; BKK26].
+    Returns payoffs and idx_sims for downstream HE and EVOI.
+    """
+    n_days = len(forecast)
+    eps    = block_bootstrap(residuals, n_days, n_sims, b, rng)
+    T_sim  = forecast[np.newaxis, :] + eps
+
+    if index_type == "HDD":
+        idx = np.maximum(T_REF - T_sim, 0).sum(axis=1)
+    elif index_type == "CDD":
+        idx = np.maximum(T_sim - T_REF, 0).sum(axis=1)
+    else:
+        idx = T_sim.sum(axis=1)
+
+    payoffs = (tick * np.maximum(idx - strike, 0) if option_type == "call"
+               else tick * np.maximum(strike - idx, 0))
+
+    return {
+        "premium_mc":  float((1.0 / (1.0 + rf)) * payoffs.mean()),
+        "mean_payoff": float(payoffs.mean()),
+        "std_payoff":  float(payoffs.std(ddof=1)),
+        "payoffs":     payoffs,
+        "idx_sims":    idx,
+        "n_sims":      n_sims,
+    }
+
+
+# ==============================================================================
+# 8.  SIMULATED JOINT DISTRIBUTION
+# ==============================================================================
+
+def simulate_joint_distribution(
+    idx_sims: np.ndarray,
+    ols_alpha: float,
+    ols_beta: float,
+    ols_residuals: np.ndarray,
+    strike: float,
+    tick: float,
+    option_type: str,
+    premium: float,
+    n_sims: int = N_SIMS,
+    b: int      = BLOCK_LENGTH,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Simulate joint (rev_unhedged, rev_hedged) over 10,000 MC paths [VB04].
+
+    yield_sim = ols_alpha + ols_beta * index_sim + eps*
+    eps* drawn by scalar block-bootstrap from OLS yield residuals.
+    rev = yield_sim * price * area.
+    """
+    if rng is None:
+        rng = np.random.default_rng(99)
+    n_res = len(ols_residuals)
+    eps   = np.empty(n_sims)
+    for i in range(n_sims):
+        start  = rng.integers(0, max(1, n_res - b + 1))
+        eps[i] = ols_residuals[start]
+
+    yield_sim = ols_alpha + ols_beta * idx_sims + eps
+    rev_u     = yield_sim * CROP_PRICE_EUR_T * FARM_AREA_HA
+
+    payoffs = (tick * np.maximum(idx_sims - strike, 0) if option_type == "call"
+               else tick * np.maximum(strike - idx_sims, 0))
+    rev_h = rev_u + payoffs - premium
+
+    return rev_u, rev_h
+
+
+# ==============================================================================
+# 9.  HEDGING EFFECTIVENESS: ES (PRIMARY), VaR, SD
+# ==============================================================================
+# ES SIGN CONVENTION:
+#   Revenues are always positive (yield > 0, price > 0, area > 0).
+#   Standard ES (negative tail mean) would be negative for positive revenues,
+#   making the HE formula incoherent.
+#
+#   Solution: define ES as the EXPECTED SHORTFALL BELOW MEAN REVENUE.
+#     loss = mean(rev) - rev  (positive when revenue is below average)
+#     ES   = E[loss | loss >= VaR_alpha(loss)]  > 0 always  [RU00]
+#
+#   With this definition:
+#     - Hedging raises the lower tail -> shortfalls shrink -> ES_h < ES_u
+#     - HE_ES = 1 - ES_h / ES_u > 0 (correct direction)  [MOM19]
+#
+# VaR is defined identically as the alpha-quantile of the shortfall.
+
+def _es(r: np.ndarray, alpha: float = ALPHA) -> float:
+    """
+    Expected Shortfall of revenue shortfall below mean.
+    ES = E[mean(r) - r | mean(r) - r >= VaR_alpha(mean(r) - r)]
+    Always positive. Better hedging -> lower ES. [RU00; MOM19]
+    """
+    loss   = r.mean() - r
+    thresh = np.quantile(loss, alpha)
+    tail   = loss[loss >= thresh]
+    return float(tail.mean()) if len(tail) > 0 else np.nan
+
+
+def _var(r: np.ndarray, alpha: float = ALPHA) -> float:
+    """VaR of revenue shortfall below mean [alpha-quantile of loss]."""
+    return float(np.quantile(r.mean() - r, alpha))
+
+
+def hedging_effectiveness(
+    rev_u: np.ndarray,
+    rev_h: np.ndarray,
+    alpha: float = ALPHA,
+) -> Dict:
+    """
+    Three-metric hedging effectiveness framework [MOM19; VB04; RU00].
+
+    HE_ES  = 1 - ES(hedged)  / ES(unhedged)   PRIMARY  [MOM19; RU00]
+    HE_VaR = 1 - VaR(hedged) / VaR(unhedged)  secondary [VB04]
+    HE_SD  = 1 - Var(hedged) / Var(unhedged)  secondary [Ederington 1979]
+
+    All defined on shortfall (loss = mean - revenue) so that positive HE
+    means risk reduction. Valid for always-positive revenue distributions.
+    """
+    es_u  = _es(rev_u, alpha);    es_h  = _es(rev_h, alpha)
+    var_u = _var(rev_u, alpha);   var_h = _var(rev_h, alpha)
+    sd_u  = float(rev_u.std(ddof=1));  sd_h = float(rev_h.std(ddof=1))
+
+    return {
+        "HE_ES":         1 - es_h  / es_u  if es_u  > 0 else np.nan,
+        "HE_VaR":        1 - var_h / var_u  if var_u > 0 else np.nan,
+        "HE_SD":         1 - (sd_h / sd_u)**2 if sd_u > 0 else np.nan,
+        "ES_unhedged":   es_u,   "ES_hedged":  es_h,
+        "VaR_unhedged":  var_u,  "VaR_hedged": var_h,
+        "SD_unhedged":   sd_u,   "SD_hedged":  sd_h,
+        "mean_unhedged": float(rev_u.mean()),
+        "mean_hedged":   float(rev_h.mean()),
+    }
+
+
+# ==============================================================================
+# 10. CARA
+# ==============================================================================
+
+def cara_ce(
+    revenue: np.ndarray,
+    payoffs: np.ndarray,
+    lam: float,
+) -> Dict:
+    """CARA h* and CE revenue [VB04 eq. 8; BAB93]."""
+    var_p  = np.var(payoffs, ddof=1)
+    cov_rp = np.cov(revenue, payoffs)[0, 1]
+    h_star = float(cov_rp / var_p) if var_p > 1e-10 else 0.0
+    rev_h  = revenue + h_star * payoffs
+    CE_u   = revenue.mean() - (lam / 2) * np.var(revenue, ddof=1)
+    CE_h   = rev_h.mean()   - (lam / 2) * np.var(rev_h,   ddof=1)
+    return {"h_star": h_star, "CE_unhedged": float(CE_u),
+            "CE_hedged": float(CE_h), "CE_gain": float(CE_h - CE_u),
+            "lambda": lam}
+
+
+# ==============================================================================
+# 11. EVOI
+# ==============================================================================
+
+def compute_evoi(
+    actual_events: np.ndarray,
+    p_hba: float, p_xgb: float,
+    L: float, C: float,
+    cl_grid: np.ndarray = CL_GRID,
+) -> pd.DataFrame:
+    """REV across C/L grid: XGBoost vs HBA hedge decisions [MU77; RI00]."""
+    base = float(actual_events.mean())
+    rows = []
+    for cl in cl_grid:
+        h_hba = int(p_hba >= cl)
+        h_xgb = int(p_xgb >= cl)
+        e_hba = -C if h_hba else -L * base
+        e_xgb = -C if h_xgb else -L * base
+        e_pft = -C * base
+        denom = e_hba - e_pft
+        rev   = (e_hba - e_xgb) / denom if abs(denom) > 1e-9 else np.nan
+        rows.append({"cl_ratio": cl, "REV": rev, "E_hba": e_hba,
+                     "E_xgb": e_xgb, "E_perfect": e_pft,
+                     "p_hba": p_hba, "p_xgb": p_xgb,
+                     "hedge_hba": h_hba, "hedge_xgb": h_xgb})
+    return pd.DataFrame(rows)
+
+
+# ==============================================================================
+# 12. STRADDLE
+# ==============================================================================
+
+def price_straddle(mc_leg1: Dict, mc_leg2: Dict) -> Dict:
+    """Cross-index cross-period straddle [STU16; PRE24]."""
+    total = mc_leg1["payoffs"] + mc_leg2["payoffs"]
+    return {
+        "premium_straddle":  float(mc_leg1["premium_mc"] + mc_leg2["premium_mc"]),
+        "premium_leg1":      float(mc_leg1["premium_mc"]),
+        "premium_leg2":      float(mc_leg2["premium_mc"]),
+        "total_payoffs":     total,
+        "mean_total_payoff": float(total.mean()),
+        "std_total_payoff":  float(total.std(ddof=1)),
+        "idx_sims_leg1":     mc_leg1["idx_sims"],
+        "idx_sims_leg2":     mc_leg2["idx_sims"],
+    }
+
+
+# ==============================================================================
+# 13. TERMINAL SUMMARY
+# ==============================================================================
+
+def print_results_summary(
+    sel_df, ctr_df, hba_df, mc_store, he_df, cara_df, evoi_df, straddle_df
+):
+    """Compact aligned terminal summary. Paste for review."""
+    SEP  = "=" * 72
+    SEP2 = "-" * 72
+
+    print(f"\n{SEP}")
+    print("  PHASE 2 RESULTS SUMMARY")
+    print(SEP)
+
+    # [1] Window selection
+    print("\n[1] DATA-DRIVEN WINDOW SELECTION  [Conradt et al. 2015]")
+    print(f"  {'Region':<8} {'Best Window':<16} {'Idx':<5} "
+          f"{'rho':>7} {'p-val':>8} {'n':>4}")
+    print(f"  {SEP2[:52]}")
+    for _, r in sel_df.iterrows():
+        print(f"  {r['region']:<8} {str(r['best_window']):<16} "
+              f"{str(r['index_type']):<5} {r['rho']:>+7.3f} "
+              f"{r['p_value']:>8.3f} {int(r['n_obs']):>4}")
+
+    # [2] Contract design
+    print("\n[2] CONTRACT DESIGN  [Conradt et al. 2015; Spicka & Hnilica 2013]")
+    print(f"  {'Region':<8} {'Window':<16} {'Opt':<5} "
+          f"{'K':>10} {'Tick EUR':>12}")
+    print(f"  {SEP2[:55]}")
+    for _, r in ctr_df.iterrows():
+        print(f"  {r['region']:<8} {str(r['best_window']):<16} "
+              f"{str(r['option_type']):<5} {r['strike_K']:>10.1f} "
+              f"{r['tick_size']:>12,.0f}")
+
+    # [3] Pricing
+    print("\n[3] PRICING: MC (XGBoost bootstrap) vs HBA benchmark  [CD05; JB05]")
+    print(f"  {'Region':<8} {'MC EUR':>12} {'HBA EUR':>12} "
+          f"{'Diff':>10} {'Diff%':>7}")
+    print(f"  {SEP2[:53]}")
+    for region, mc in mc_store.items():
+        hba_r = hba_df[hba_df["region"] == region]
+        if hba_r.empty:
+            continue
+        hba_p = hba_r["premium_hba"].values[0]
+        mc_p  = mc["premium_mc"]
+        diff  = mc_p - hba_p
+        pct   = diff / hba_p * 100 if hba_p > 0 else float("nan")
+        pct_s = f"{pct:>+6.1f}%" if pd.notna(pct) else "    nan"
+        print(f"  {region:<8} {mc_p:>12,.0f} {hba_p:>12,.0f} "
+              f"{diff:>+10,.0f} {pct_s}")
+
+    # [4] HE
+    print(f"\n[4] HEDGING EFFECTIVENESS  alpha={ALPHA} | PRIMARY=HE_ES "
+          f"[MOM19; RU00]")
+    print("    ES/VaR on shortfall below mean | simulated joint dist. [VB04]")
+    print(f"  {'Region':<8} {'Instr':<11} {'HE_ES':>7} "
+          f"{'HE_VaR':>7} {'HE_SD':>7} {'OLS R2':>7}")
+    print(f"  {SEP2[:51]}")
+    for _, r in he_df.iterrows():
+        he_es  = f"{r['HE_ES']:>+7.3f}"  if pd.notna(r.get("HE_ES"))  else "    nan"
+        he_var = f"{r['HE_VaR']:>+7.3f}" if pd.notna(r.get("HE_VaR")) else "    nan"
+        he_sd  = f"{r['HE_SD']:>+7.3f}"  if pd.notna(r.get("HE_SD"))  else "    nan"
+        r2_s   = (f"{r['ols_r2']:>7.3f}" if "ols_r2" in r.index
+                  and pd.notna(r.get("ols_r2")) else "       ")
+        print(f"  {r['region']:<8} {str(r['instrument']):<11} "
+              f"{he_es} {he_var} {he_sd} {r2_s}")
+
+    # [5] CARA
+    print("\n[5] CARA CE GAIN EUR  [Vedenov & Barnett 2004; Babcock et al. 1993]")
+    print(f"  {'Region':<8} {'lam=0.0001':>12} {'lam=0.001':>12} "
+          f"{'lam=0.005':>12} {'lam=0.01':>12}")
+    print(f"  {SEP2[:60]}")
+    for region in REGIONS:
+        sub = cara_df[cara_df["region"] == region].sort_values("lambda")
+        if sub.empty:
+            continue
+        vals = "".join(f"{g:>12,.0f}" for g in sub["CE_gain"].tolist())
+        print(f"  {region:<8} {vals}")
+
+    # [6] EVOI
+    print("\n[6] EVOI MAX REV  [Murphy 1977; Richardson 2000]")
+    print("    REV > 0: XGBoost adds value over HBA | REV = 1: perfect")
+    print(f"  {'Region':<8} {'p_HBA':>7} {'p_XGB':>7} "
+          f"{'maxREV':>9} {'opt C/L':>8}")
+    print(f"  {SEP2[:43]}")
+    for region in REGIONS:
+        sub = evoi_df[evoi_df["region"] == region]
+        if sub.empty:
+            continue
+        p_hba   = sub["p_hba"].iloc[0]
+        p_xgb   = sub["p_xgb"].iloc[0]
+        max_rev = sub["REV"].max()
+        opt_cl  = sub.loc[sub["REV"].idxmax(), "cl_ratio"]
+        rev_s   = f"{max_rev:>+9.3f}" if pd.notna(max_rev) else "      nan"
+        print(f"  {region:<8} {p_hba:>7.3f} {p_xgb:>7.3f} "
+              f"{rev_s} {opt_cl:>8.2f}")
+
+    # [7] Straddle
+    if not straddle_df.empty:
+        print("\n[7] STRADDLE  [Stulec et al. 2016; Prentzas et al. 2024]")
+        print(f"  {'Region':<8} {'Leg 1':<16} {'Leg 2':<16} "
+              f"{'L1 EUR':>9} {'L2 EUR':>9} {'Total':>9}")
+        print(f"  {SEP2[:71]}")
+        for _, r in straddle_df.iterrows():
+            print(f"  {r['region']:<8} {str(r['window_l1']):<16} "
+                  f"{str(r['window_l2']):<16} "
+                  f"{r['premium_leg1']:>9,.0f} "
+                  f"{r['premium_leg2']:>9,.0f} "
+                  f"{r['premium_straddle']:>9,.0f}")
+
+        st_he = he_df[he_df["instrument"] == "straddle"]
+        if not st_he.empty:
+            print("\n  Straddle HE:")
+            print(f"  {'Region':<8} {'HE_ES':>7} {'HE_VaR':>7} "
+                  f"{'HE_SD':>7} {'OLS R2':>7}")
+            for _, r in st_he.iterrows():
+                he_es  = f"{r['HE_ES']:>+7.3f}"  if pd.notna(r.get("HE_ES"))  else "    nan"
+                he_var = f"{r['HE_VaR']:>+7.3f}" if pd.notna(r.get("HE_VaR")) else "    nan"
+                he_sd  = f"{r['HE_SD']:>+7.3f}"  if pd.notna(r.get("HE_SD"))  else "    nan"
+                r2_s   = (f"{r['ols_r2']:>7.3f}" if "ols_r2" in r.index
+                          and pd.notna(r.get("ols_r2")) else "       ")
+                print(f"  {r['region']:<8} {he_es} {he_var} {he_sd} {r2_s}")
+
+    print(f"\n{SEP}\n")
+
+
+# ==============================================================================
+# 14. PLOTTING
+# ==============================================================================
+
+def plot_rev_curves(evoi_df, out_path):
+    fig, ax = plt.subplots(figsize=(10, 5))
+    colors  = plt.cm.tab10.colors
+    for i, region in enumerate(REGIONS):
+        sub = evoi_df[evoi_df["region"] == region]
+        if sub.empty:
+            continue
+        ax.plot(sub["cl_ratio"], sub["REV"].clip(-0.5, 1.2),
+                label=f"R{region}", color=colors[i % 10], lw=1.8)
+    ax.axhline(0, color="black",   lw=0.9, ls="--")
+    ax.axhline(1, color="dimgrey", lw=0.8, ls=":")
+    ax.set_xlabel("C/L ratio"); ax.set_ylabel("REV")
+    ax.set_title("EVOI: XGBoost vs HBA  [MU77; RI00]")
+    ax.legend(fontsize=8, ncol=3); ax.set_xlim(CL_GRID.min(), CL_GRID.max())
+    fig.tight_layout(); fig.savefig(out_path, dpi=200); plt.close(fig)
+    print(f"    Saved: {out_path.name}")
+
+
+def plot_window_selection(sel_records, out_path):
+    valid  = [r for r in sel_records if r.get("best_window")]
+    labels = [f"R{r['region']}\n{r['best_window']}" for r in valid]
+    values = [r["abs_rho"] for r in valid]
+    colors = ["#2196F3" if "HDD" in r["best_window"]
+              else "#F44336" if "CDD" in r["best_window"]
+              else "#4CAF50" for r in valid]
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.bar(labels, values, color=colors, edgecolor="white")
+    ax.axhline(MIN_RHO, color="black", ls="--", lw=0.8,
+               label=f"Min |rho|={MIN_RHO}")
+    ax.set_ylabel("Spearman |rho|")
+    ax.set_title("Data-Driven Window Selection  [CF15; MOM19]")
+    ax.legend(fontsize=8)
+    fig.tight_layout(); fig.savefig(out_path, dpi=200); plt.close(fig)
+    print(f"    Saved: {out_path.name}")
+
+
+def plot_he_comparison(he_df, out_path):
+    single   = he_df[he_df["instrument"] == "single"].set_index("region")["HE_ES"]
+    straddle = he_df[he_df["instrument"] == "straddle"].set_index("region")["HE_ES"]
+    x = np.arange(len(REGIONS)); w = 0.35
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(x - w/2, [single.get(r, np.nan) for r in REGIONS],
+           w, label="Single option", color="#2196F3")
+    ax.bar(x + w/2, [straddle.get(r, np.nan) for r in REGIONS],
+           w, label="Straddle", color="#FF9800")
+    ax.axhline(0, color="black", lw=0.8, ls="--")
+    ax.set_xticks(x); ax.set_xticklabels([f"R{r}" for r in REGIONS])
+    ax.set_ylabel("HE_ES  [MOM19; RU00]")
+    ax.set_title("Hedging Effectiveness: Single vs Straddle")
+    ax.legend(fontsize=9)
+    fig.tight_layout(); fig.savefig(out_path, dpi=200); plt.close(fig)
+    print(f"    Saved: {out_path.name}")
+
+
+def plot_cara_sensitivity(cara_df, out_path):
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for region in REGIONS:
+        sub = cara_df[cara_df["region"] == region].sort_values("lambda")
+        if sub.empty:
+            continue
+        ax.plot(sub["lambda"], sub["CE_gain"], marker="o",
+                label=f"R{region}", lw=1.6)
+    ax.axhline(0, color="black", lw=0.8, ls="--")
+    ax.set_xlabel("CARA lambda  [BAB93]"); ax.set_ylabel("CE gain (EUR)")
+    ax.set_title("CARA Sensitivity  [VB04]")
+    ax.legend(fontsize=8, ncol=2)
+    fig.tight_layout(); fig.savefig(out_path, dpi=200); plt.close(fig)
+    print(f"    Saved: {out_path.name}")
+
+
+# ==============================================================================
+# 15. MAIN PIPELINE
+# ==============================================================================
+
+def run_phase2():
+    print("=" * 72)
+    print("  PHASE 2 -- Weather Derivative Hedging: French Winter Wheat")
+    print(f"  8 NUTS-2 Regions | OOS 2015-2024 | "
+          f"{len(CANDIDATE_WINDOWS)} candidate windows")
+    print("=" * 72)
+
+    rng  = np.random.default_rng(42)
+    rng2 = np.random.default_rng(99)
+    rng3 = np.random.default_rng(77)
+
+    # -- 15.1  Load ------------------------------------------------------------
+    print("\n[1/9] Loading data...")
+    temp_df  = load_temperature(ROOT / "EDA" / "region_avg.csv")
+    yield_df = load_yield(
+        ROOT / "EDA" / "ble_tendre_hiver_yield_2000_2024_regions_mainland.csv")
+    xgb_df   = load_xgb_forecasts(ROOT / "bk_forecasts.csv", model_name="XGB")
+
+    # -- 15.2  Compute indices -------------------------------------------------
+    print(f"[2/9] Computing candidate indices...")
+    print(f"      Full panel (actual, n={len(ALL_YEARS)} years)...")
+    idx_all = compute_indices_from_actual(temp_df, REGIONS, ALL_YEARS)
+    print(f"      {idx_all.shape[0]} region-year rows")
+    print(f"      OOS panel (XGB forecasts, n={len(OOS_YEARS)} years)...")
+    idx_oos = compute_indices_from_forecasts(xgb_df, REGIONS, OOS_YEARS)
+    print(f"      {idx_oos.shape[0]} region-year rows")
+
+    # -- 15.3  Spearman window selection (full panel) --------------------------
+    print("[3/9] Spearman window selection (full panel n=25) [CF15; MOM19]...")
+    sel_records = []
+    for region in REGIONS:
+        s = select_best_window(idx_all, yield_df, region)
+        s["region"] = region
+        sel_records.append(s)
+        top5 = list(s["all_rhos"].items())[:5]
+        print(f"      R{region}: {s['best_window']}  "
+              f"rho={s['rho']:+.3f}  p={s['p_value']:.3f}  "
+              f"n={s['n_obs']}  top5={top5}")
+
+    sel_df = pd.DataFrame([{k: v for k, v in r.items() if k != "all_rhos"}
+                            for r in sel_records])
+
+    # -- 15.4  QR contract parameters (full panel) -----------------------------
+    print(f"[4/9] tau={QUANTILE_TAU} QR strike & tick (full panel) [CF15]...")
+    ctr_records = []
+    for region in REGIONS:
+        s    = next(r for r in sel_records if r["region"] == region)
+        bwin = s["best_window"]
+        if bwin is None:
+            continue
+        opt_type = "call" if s["direction"] < 0 else "put"
+        c = estimate_contract_parameters(idx_all, yield_df, region, bwin)
+        c.update({"region": region, "best_window": bwin,
+                  "index_type": s["index_type"],
+                  "doy_start": s["doy_start"], "doy_end": s["doy_end"],
+                  "option_type": opt_type})
+        ctr_records.append(c)
+        print(f"      R{region} | {bwin} ({opt_type}): "
+              f"K={c['strike_K']:.1f}  tick={c['tick_size']:,.0f} EUR  "
+              f"n={c['n_obs']}")
+    ctr_df = pd.DataFrame(ctr_records)
+
+    # -- 15.5  OLS fit for HE simulation ---------------------------------------
+    print("[5/9 prep] OLS yield ~ index (full panel) for HE simulation...")
+    ols_store: Dict[str, Dict] = {}
+    for _, row in ctr_df.iterrows():
+        region = row["region"]
+        ols    = fit_ols_yield_index(idx_all, yield_df, region,
+                                     row["best_window"])
+        ols_store[region] = ols
+        print(f"      R{region}: alpha={ols['alpha']:.3f}  "
+              f"beta={ols['beta']:.4f}  R2={ols['r2']:.3f}  n={ols['n_obs']}")
+
+    # -- 15.6  HBA pricing (full historical index) -----------------------------
+    print("[5/9] HBA pricing (full historical index) [JB05]...")
+    hba_records = []
+    for _, row in ctr_df.iterrows():
+        region  = row["region"]
+        ac_col  = f"{row['best_window']}_act"
+        hist    = idx_all[idx_all["region"] == region][ac_col].dropna().values
+        h       = hba_price(hist, row["strike_K"], row["tick_size"],
+                            row["option_type"])
+        h["region"] = region
+        hba_records.append(h)
+        print(f"      R{region}: HBA = {h['premium_hba']:>10,.0f} EUR "
+              f"(n={h['n_years']} years)")
+    hba_df = pd.DataFrame(hba_records)
+
+    # -- 15.7  MC pricing (XGBoost residuals) ----------------------------------
+    print("[6/9] MC pricing (XGBoost residuals) [BKK26; CD05; PR94]...")
+    mc_store: Dict[str, Dict] = {}
+    for _, row in ctr_df.iterrows():
+        region   = row["region"]
+        d1, d2   = int(row["doy_start"]), int(row["doy_end"])
+        r_xgb    = xgb_df[xgb_df["region"] == region]
+        residuals = r_xgb["residual"].dropna().values
+        price_yr  = max(OOS_YEARS)
+        mask = ((r_xgb["year"] == price_yr) &
+                (r_xgb["doy"]  >= d1) & (r_xgb["doy"] <= d2))
+        fc   = r_xgb[mask]["T_forecast"].values
+        if len(fc) < 10:
+            print(f"      [WARN] R{region}: < 10 forecast days -- skipping.")
+            continue
+        mc = mc_price(fc, residuals, row["strike_K"], row["tick_size"],
+                      row["option_type"], row["index_type"],
+                      N_SIMS, BLOCK_LENGTH, RISK_FREE, rng)
+        mc["region"] = region
+        mc_store[region] = mc
+        hba_p = hba_df[hba_df["region"] == region]["premium_hba"].values[0]
+        diff  = mc["premium_mc"] - hba_p
+        print(f"      R{region}: MC={mc['premium_mc']:>10,.0f}  "
+              f"HBA={hba_p:>10,.0f}  diff={diff:>+10,.0f} EUR")
+
+    # -- 15.8  Hedging effectiveness (simulated joint) -------------------------
+    print(f"[7/9] HE via simulated joint distribution "
+          f"[MOM19; RU00; VB04]...")
+    print(f"      ES/VaR on shortfall below mean | alpha={ALPHA} | "
+          f"n_sims={N_SIMS:,}")
+    he_records   = []
+    cara_records = []
+
+    for _, row in ctr_df.iterrows():
+        region   = row["region"]
+        opt_type = row["option_type"]
+        strike_K = row["strike_K"]
+        tick     = row["tick_size"]
+
+        if region not in mc_store or region not in ols_store:
+            continue
+
+        mc      = mc_store[region]
+        ols     = ols_store[region]
+        premium = mc["premium_mc"]
+
+        rev_u, rev_h = simulate_joint_distribution(
+            idx_sims=mc["idx_sims"],
+            ols_alpha=ols["alpha"], ols_beta=ols["beta"],
+            ols_residuals=ols["residuals"],
+            strike=strike_K, tick=tick,
+            option_type=opt_type, premium=premium,
+            n_sims=N_SIMS, b=BLOCK_LENGTH, rng=rng2,
+        )
+
+        he = hedging_effectiveness(rev_u, rev_h, alpha=ALPHA)
+        he["region"]     = region
+        he["instrument"] = "single"
+        he["ols_r2"]     = ols["r2"]
+        he_records.append(he)
+
+        payoffs_sim = (tick * np.maximum(mc["idx_sims"] - strike_K, 0)
+                       if opt_type == "call"
+                       else tick * np.maximum(strike_K - mc["idx_sims"], 0))
+        for lam in LAMBDA_GRID:
+            c = cara_ce(rev_u, payoffs_sim, lam)
+            c["region"] = region
+            cara_records.append(c)
+
+        ce_base = [c["CE_gain"] for c in cara_records
+                   if c["region"] == region and c["lambda"] == LAMBDA_BASE][-1]
+        print(f"      R{region}: HE_ES={he['HE_ES']:+.3f}  "
+              f"HE_VaR={he['HE_VaR']:+.3f}  HE_SD={he['HE_SD']:+.3f}  "
+              f"R2={ols['r2']:.3f}  CE_gain(0.001)={ce_base:+,.0f} EUR")
+
+    he_df   = pd.DataFrame(he_records)
+    cara_df = pd.DataFrame(cara_records)
+
+    # -- 15.9  EVOI ------------------------------------------------------------
+    print("[8/9] EVOI cost-loss analysis [MU77; RI00]...")
+    evoi_frames = []
+    for _, row in ctr_df.iterrows():
+        region   = row["region"]
+        opt_type = row["option_type"]
+        strike_K = row["strike_K"]
+        tick     = row["tick_size"]
+        if region not in mc_store:
+            continue
+        mc       = mc_store[region]
+        ac_col   = f"{row['best_window']}_act"
+        oos_act  = idx_oos[(idx_oos["region"] == region) &
+                           idx_oos["year"].isin(OOS_YEARS)][ac_col].dropna().values
+        hist_act = idx_all[idx_all["region"] == region][ac_col].dropna().values
+
+        if opt_type == "call":
+            events = (oos_act > strike_K).astype(float)
+            p_hba  = float((hist_act > strike_K).mean())
+            p_xgb  = float((mc["idx_sims"] > strike_K).mean())
+        else:
+            events = (oos_act < strike_K).astype(float)
+            p_hba  = float((hist_act < strike_K).mean())
+            p_xgb  = float((mc["idx_sims"] < strike_K).mean())
+
+        loss_idx = oos_act[events == 1]
+        L_val = (float(tick * abs(loss_idx.mean() - strike_K)) if len(loss_idx) > 0
+                 else float(tick * abs(oos_act.mean() - strike_K) * 0.5))
+
+        ev = compute_evoi(events, p_hba, p_xgb, L_val, mc["premium_mc"])
+        ev["region"] = region
+        evoi_frames.append(ev)
+        max_rev = ev["REV"].max()
+        opt_cl  = ev.loc[ev["REV"].idxmax(), "cl_ratio"]
+        print(f"      R{region}: p_HBA={p_hba:.3f}  p_XGB={p_xgb:.3f}  "
+              f"maxREV={max_rev:.3f} at C/L={opt_cl:.2f}")
+
+    evoi_df = pd.concat(evoi_frames, ignore_index=True)
+
+    # -- 15.10  Straddle -------------------------------------------------------
+    print("[9/9] Two-index straddle [STU16; PRE24]...")
+    straddle_records = []
+    straddle_he_list = []
+
+    for region in REGIONS:
+        r_xgb     = xgb_df[xgb_df["region"] == region]
+        residuals  = r_xgb["residual"].dropna().values
+        price_yr   = max(OOS_YEARS)
+
+        row_match = ctr_df[ctr_df["region"] == region]
+        if row_match.empty or region not in mc_store:
+            continue
+        row     = row_match.iloc[0]
+        mc_leg1 = mc_store[region]
+        primary = row["best_window"]
+
+        # Leg 2: best spring CDD, EXCLUDING the primary window to avoid
+        # identical legs (fixes R32 which had CDD_MayJun in both legs)
+        spring_sel = select_spring_cdd_window(
+            idx_all, yield_df, region,
+            exclude_windows=[primary],
+        )
+        if spring_sel["best_window"] is None:
+            print(f"      [WARN] R{region}: no valid spring CDD -- skipping.")
+            continue
+
+        bwin2  = spring_sel["best_window"]
+        d1_2   = spring_sel["doy_start"]
+        d2_2   = spring_sel["doy_end"]
+        idx_t2 = spring_sel["index_type"]
+
+        ac_col2  = f"{bwin2}_act"
+        cdd_hist = idx_all[idx_all["region"] == region][ac_col2].dropna().values
+        k2       = float(np.quantile(cdd_hist, 1 - QUANTILE_TAU))
+        tick2    = row["tick_size"]
+
+        mask2 = ((r_xgb["year"] == price_yr) &
+                 (r_xgb["doy"]  >= d1_2) & (r_xgb["doy"] <= d2_2))
+        fc2   = r_xgb[mask2]["T_forecast"].values
+
+        if len(fc2) < 5:
+            print(f"      [WARN] R{region}: insufficient spring data.")
+            continue
+
+        mc_leg2  = mc_price(fc2, residuals, k2, tick2, "call", idx_t2,
+                            N_SIMS, BLOCK_LENGTH, RISK_FREE, rng)
+        straddle = price_straddle(mc_leg1, mc_leg2)
+        straddle.update({
+            "region": region, "window_l1": primary, "window_l2": bwin2,
+            "K_leg1": row["strike_K"], "K_leg2": k2,
+        })
+        straddle_records.append({
+            k: v for k, v in straddle.items()
+            if k not in ("total_payoffs", "idx_sims_leg1", "idx_sims_leg2")
+        })
+
+        # Straddle HE via simulated joint distribution
+        if region in ols_store:
+            ols = ols_store[region]
+            rev_u_st, _ = simulate_joint_distribution(
+                idx_sims=mc_leg1["idx_sims"],
+                ols_alpha=ols["alpha"], ols_beta=ols["beta"],
+                ols_residuals=ols["residuals"],
+                strike=row["strike_K"], tick=row["tick_size"],
+                option_type=row["option_type"], premium=0.0,
+                n_sims=N_SIMS, b=BLOCK_LENGTH, rng=rng3,
+            )
+            pay1 = (row["tick_size"] *
+                    (np.maximum(mc_leg1["idx_sims"] - row["strike_K"], 0)
+                     if row["option_type"] == "call"
+                     else np.maximum(row["strike_K"] - mc_leg1["idx_sims"], 0)))
+            pay2 = tick2 * np.maximum(mc_leg2["idx_sims"] - k2, 0)
+            rev_h_st = rev_u_st + pay1 + pay2 - straddle["premium_straddle"]
+            he_st = hedging_effectiveness(rev_u_st, rev_h_st, alpha=ALPHA)
+            he_st["region"]     = region
+            he_st["instrument"] = "straddle"
+            he_st["ols_r2"]     = ols["r2"]
+            straddle_he_list.append(he_st)
+
+        print(f"      R{region}: total={straddle['premium_straddle']:>10,.0f}  "
+              f"leg1={straddle['premium_leg1']:,.0f}[{primary}]  "
+              f"leg2={straddle['premium_leg2']:,.0f}[{bwin2}]")
+
+    straddle_df    = pd.DataFrame(straddle_records)
+    straddle_he_df = pd.DataFrame(straddle_he_list)
+    if not straddle_he_df.empty:
+        he_df = pd.concat([he_df, straddle_he_df], ignore_index=True)
+
+    # -- Export ----------------------------------------------------------------
+    print("\n[Export] Writing CSV results...")
+    rho_rows = []
+    for rec in sel_records:
+        for rank, (win, rho) in enumerate(rec["all_rhos"].items(), start=1):
+            if rank > 5:
+                break
+            rho_rows.append({"region": rec["region"], "rank": rank,
+                              "window": win, "rho": rho})
+
+    export_tables = {
+        "1_window_selection":      sel_df,
+        "2_spearman_top5":         pd.DataFrame(rho_rows),
+        "3_contract_design":       ctr_df,
+        "4_hba_pricing":           hba_df,
+        "5_mc_pricing": pd.DataFrame([
+            {"region": r, "premium_mc": mc["premium_mc"],
+             "mean_payoff": mc["mean_payoff"], "std_payoff": mc["std_payoff"]}
+            for r, mc in mc_store.items()
+        ]),
+        "6_hedging_effectiveness": he_df,
+        "7_cara_sensitivity":      cara_df,
+        "8_straddle":              straddle_df,
+    }
+    for sheet, df in export_tables.items():
+        p = OUT_DIR / f"{sheet}.csv"
+        df.round(4).to_csv(p, index=False)
+        print(f"    {p.name}")
+    evoi_df.to_csv(OUT_DIR / "evoi_cost_loss.csv", index=False)
+    print(f"    evoi_cost_loss.csv")
+
+    # -- Plots -----------------------------------------------------------------
+    print("[Plots] Generating figures...")
+    plot_rev_curves(evoi_df, OUT_DIR / "evoi_rev_curves.png")
+    plot_window_selection(sel_records, OUT_DIR / "window_selection.png")
+    plot_he_comparison(he_df, OUT_DIR / "he_comparison.png")
+    plot_cara_sensitivity(cara_df, OUT_DIR / "cara_sensitivity.png")
+
+    # -- Terminal summary ------------------------------------------------------
+    print_results_summary(
+        sel_df, ctr_df, hba_df, mc_store,
+        he_df, cara_df, evoi_df, straddle_df
+    )
+
+    print("=" * 72)
+    print("  PHASE 2 COMPLETE")
+    print(f"  Outputs: {OUT_DIR}")
+    print("=" * 72)
+
+    return {
+        "selection": sel_df, "contracts": ctr_df, "hba": hba_df,
+        "mc": {r: {k: v for k, v in mc.items()
+                   if k not in ("payoffs", "idx_sims")}
+               for r, mc in mc_store.items()},
+        "he": he_df, "cara": cara_df, "evoi": evoi_df, "straddle": straddle_df,
+    }
+
+
+# ==============================================================================
+# ENTRY POINT
+# ==============================================================================
+
+if __name__ == "__main__":
+    results = run_phase2()
