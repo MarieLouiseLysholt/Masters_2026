@@ -38,8 +38,9 @@ EXTENDED_CSV = "EDA/region_temp_extended.csv"   # pre-computed features (wavelet
 EXTENDED_CSV = "EDA/region_temp_extended.csv"
 ALATON_DIR   = "alaton_models"
 BENTH_DIR    = "benth_models"
-PAPER_XGB_DIR    = Path(r"C:\Users\victo\Downloads\Python\Projects\Masters_2026\Outputs\xgBoost_rolling_exports")
-WAVELET_FNN_DIR  = Path(r"C:\Users\victo\Downloads\Python\Projects\Masters_2026\Outputs\WaveletFNN_rolling_exports")
+PAPER_XGB_DIR    = Path(r"/Users/marielouiselysholt/Desktop/Master/Masters_2026/Outputs/xgBoost_rolling_exports")
+WAVELET_FNN_DIR  = Path(r"/Users/marielouiselysholt/Desktop/Master/Masters_2026/Outputs/WaveletFNN_rolling_exports")
+
 
 OOS_START    = 2015
 OOS_END      = 2024
@@ -410,18 +411,29 @@ def forecast_hba(df_train, doy_stats, test_dates):
 
 def forecast_alaton(alaton_params, df_train, test_dates):
     A, B, C, phi = [float(alaton_params[k]) for k in ("A", "B", "C", "phi")]
-    a = float(alaton_params["a"]); exp_a = np.exp(-a)
-    df_pkl = alaton_params["df"].copy()
-    t_origin = df_pkl.index[0] if isinstance(df_pkl.index[0], pd.Timestamp) else pd.Timestamp(df_pkl.index[0])
-    test_t = _t_idx_for_dates(pd.DatetimeIndex(test_dates), t_origin)
-    T_last = float(df_train.iloc[-1]["T"])
-    t_last = float(_t_idx_for_dates(pd.DatetimeIndex([df_train.iloc[-1]["date"]]), t_origin)[0])
-    forecasts = np.empty(len(test_dates)); T_prev, t_prev = T_last, t_last
-    for i, t_curr in enumerate(test_t):
-        T_m_prev = alaton_seasonal_mean(np.array([t_prev]), A, B, C, phi)[0]
-        T_m_curr = alaton_seasonal_mean(np.array([t_curr]), A, B, C, phi)[0]
+    a = float(alaton_params["a"])
+    exp_a = np.exp(-a)
+    # Use the exact calibration convention stored in the model
+    df_calib = alaton_params["df_calib"].copy()
+    # Last observed temperature
+    T_prev = float(df_train.iloc[-1]["T"])
+    # Continue the calibration time index directly
+    if "t" in df_calib.columns:
+        t_last = float(df_calib["t"].iloc[-1])
+    elif "t_idx" in df_calib.columns:
+        # if your exporter saved a 0-based index, convert to the same convention
+        t_last = float(df_calib["t_idx"].iloc[-1])
+    else:
+        raise KeyError("Alaton PKL must contain df_calib['t'] or df_calib['t_idx'].")
+    forecasts = np.empty(len(test_dates), dtype=float)
+    for i in range(len(test_dates)):
+        t_prev_step = t_last + i
+        t_curr_step = t_last + i + 1
+        T_m_prev = alaton_seasonal_mean(np.array([t_prev_step]), A, B, C, phi)[0]
+        T_m_curr = alaton_seasonal_mean(np.array([t_curr_step]), A, B, C, phi)[0]
         T_curr = T_m_curr + exp_a * (T_prev - T_m_prev)
-        forecasts[i] = T_curr; T_prev = T_curr; t_prev = t_curr
+        forecasts[i] = T_curr
+        T_prev = T_curr
     return forecasts
 
 def forecast_benth(benth_params, df_train, test_dates):
