@@ -504,7 +504,6 @@ def forecast_alaton(alaton_params, df_train, test_dates):
         forecasts[i] = T_curr
         T_prev = T_curr
     return forecasts
-
 def forecast_benth(benth_params, df_train, test_dates):
     if all(k in benth_params for k in ["a0", "a1", "t0", "slope", "intercept"]):
         a0 = float(benth_params["a0"])
