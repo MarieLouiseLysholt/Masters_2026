@@ -45,7 +45,7 @@ CALIB_END  = "2014-12-31"
 PKL_FOLDER = "hba_models"
 os.makedirs(PKL_FOLDER, exist_ok=True)
 
-T_REF = 10.0
+T_REF = 18.0
 
 CONTRACTS = [
     ("Summer",    "CDD",  5,  1,  9, 30),
