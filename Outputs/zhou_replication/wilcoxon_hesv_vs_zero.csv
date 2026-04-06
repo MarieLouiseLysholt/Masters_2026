@@ -1,0 +1,8 @@
+model,n,stat,p_value,significant
+HBA,80,3003.0,0.0,True
+Alaton,80,2628.0,0.0,True
+Benth,80,2701.0,0.0,True
+XGB,80,2850.0,0.0,True
+WaveletFNN,80,2926.0,0.0,True
+LSTM,80,2485.0,0.0,True
+FeedForwardNN,80,2485.0,0.0,True
