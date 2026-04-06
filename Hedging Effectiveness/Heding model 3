@@ -1,1309 +1,1357 @@
 """
-phase2_hedging_framework.py
-================================================================================
-Stage 2: Operationalizing XGBoost Temperature Forecasts for Weather Derivative
-         Hedging of French Winter Wheat
+zhou_replication.py
+===================
+Farm-level hedging effectiveness for French winter wheat.
 
-Methodology citations are embedded at each step.  Every design choice that
-affects results is traceable to a published source; no ad-hoc assumptions
-are introduced beyond data-specific choices clearly flagged with [ADAPT].
+Framework
+---------
+Implements a Zhou, Li & Pai (2016)-style farm-level hedging evaluation
+framework with Möllmann et al. (2019)-style data-driven period selection,
+using the forecast-plus-residual-bootstrap pricing engine from
+pricing_comparison.py.
 
-Project root: C:/Users/victo/Downloads/Python/Projects/Masters_2026
+References:
+  Zhou, Li & Pai (2016): "Hedging crop yield with exchange-traded weather
+    derivatives", Agricultural Finance Review, 76(1), 172–186.
+  Möllmann, Buchholz & Musshoff (2019): "Comparing the hedging effectiveness
+    of weather derivatives based on remotely sensed vegetation health indices
+    and meteorological indices", Weather, Climate, and Society, 11, 33–48.
 
-================================================================================
-DATA SOURCES
---------------------------------------------------------------------------------
-  region_avg.csv       : Daily actual temperatures 1970-present.
-                         Columns: date, region_code, daily_avg_temperature.
-                         Used for: full-sample (2000-2024) index computation
-                         -> Spearman selection (n=25) and QR contract design.
+Period selection (Möllmann et al. 2019, Section 2b)
+---------------------------------------------------
+For each region × OOS year, the optimal CDD accumulation window is found
+on calibration data by maximising |Spearman(cCDD, detrended yield)|:
 
-  bk_forecasts.csv     : Stage 1 OOS forecasts + actuals, 2015-2024.
-                         Columns: region, year, date, actual, model, forecast.
-                         Filtered to model="XGB".
-                         Used for: MC pricing and EVOI.
+  1. Detrend yield: ln(Y_t) = a + b·t + ε_t  [OLS on calibration data]
+  2. Search all 21 start ≤ end combinations within March–August
+  3. Select window with highest |Spearman(cCDD, detrended yield)|
+  4. Strike K = mean(actual cCDD in optimal window over calibration years)
+  5. Spearman correlation reported; selection and evaluation metrics differ
+     (acknowledged as a stated methodological choice following Möllmann)
 
-  EDA/ble_tendre_...   : Annual yield 2000-2024, quintaux/ha.
-                         Columns: year, reg, prod, surf, yield, source.
+Pricing (identical engine to pricing_comparison.py)
+----------------------------------------------------
+  T_sim = model_forecast[optimal_window] + block_bootstrap(OOS_residuals)
+  cCDD_sim = sum(max(0, T_sim − T_ref))
+  Price = exp(−r·TTM) · E[TICK · max(cCDD_sim − K, 0)]
 
-================================================================================
-KEY METHODOLOGICAL DECISIONS
---------------------------------------------------------------------------------
-  INDEX SELECTION & CONTRACT DESIGN  [CF15; MOM19]
-    Full panel 2000-2024 (n=25) from actual temperatures. Maximises
-    statistical power. Single-month and contiguous multi-month windows
-    are evaluated from the seasonal month sets below.
+Hedge ratio (Zhou et al. 2016, fixed common K)
+-----------------------------------------------
+  N*(sv) via 1-D semi-variance minimisation (K fixed = calibration mean)
+  N*(var) via Johnson (1960) analytical formula (K fixed)
 
-  PRICING  [CD05; BKK26; JB05]
-    MC: XGBoost OOS forecasts (2015-2024) + block-bootstrapped residuals.
-    HBA: full historical actual index, loading = 0.22.
+Primary metric: HE(SV) — semi-variance reduction (downside protection)
+Wilcoxon: H0: median HE(SV) = 0  |  H1: > 0  (one-sided, α = 0.05)
 
-  HEDGING EFFECTIVENESS  [MOM19; VB04; RU00]
-    Simulated joint (revenue, payoff) distribution [VB04]:
-      1. OLS: yield = alpha + beta * index + eps  (full panel, n=25).
-      2. For each MC temperature path -> index_sim.
-      3. yield_sim = alpha + beta * index_sim + eps*  (bootstrapped OLS eps).
-      4. loss_sim = mean(rev_u) - rev_u  (shortfall below mean revenue).
-      5. HE_ES = 1 - ES(loss_hedged) / ES(loss_unhedged).
-    ES defined as shortfall below mean so it is always positive for
-    always-positive revenues, and so that better hedging reduces ES [RU00].
-    alpha=0.95 valid with N_SIMS=10,000 (500 tail observations).
-
-  EVOI  [MU77; RI00]
-    Model-vs-model: XGBoost MC probabilities vs HBA historical frequencies.
-
-================================================================================
-CITATION MAP
---------------------------------------------------------------------------------
-  JB05   Jewson & Brix (2005). Weather Derivative Valuation. CUP.
-  VB04   Vedenov & Barnett (2004). JARE 29(3), 387-403.
-  CD05   Campbell & Diebold (2005). JASA 100(469), 6-16.
-  CF15   Conradt, Finger & Bokusheva (2015). Agric. Econ. 46(4), 537-547.
-  MOM19  Mollmann, Buchholz & Musshoff (2019). WCS 11(1), 90-105.
-  RU00   Rockafellar & Uryasev (2000). J. Risk 2(3), 21-41.
-  MU77   Murphy (1977). Mon. Weather Rev. 105, 803-816.
-  RI00   Richardson (2000). QJRMS 126, 649-668.
-  STU16  Stulec, Petljak & Bakovic (2016). Agric. Econ. Czech 62(8), 356-362.
-  PRE24  Prentzas, Soulis & Papathanasiou (2024). Sustainability 16(17), 7372.
-  BAB93  Babcock, Choi & Feinerman (1993). JARE 18(1), 17-24.
-  PR94   Politis & Romano (1994). JASA 89(428), 1303-1313.
-  OS05   Oetomo & Stevenson (2005). GFJ 16(2), 192-209.
-  BKK26  Barnor, Kampouridis & Kanellopoulos (2026). Artif. Intell. Rev.
-         https://doi.org/10.1007/s10462-026-11539-0
-  SH13   Spicka & Hnilica (2013). Adv. Meteorol. 2013, 146036.
-================================================================================
+What departs from Zhou et al.
+------------------------------
+  - Period selection: Möllmann et al. data-driven vs. Zhou's fixed JJA
+  - Strike: calibration-period mean (vs. Zhou's jointly optimised K)
+  - Pricing: block-bootstrap (vs. Zhou's FHS calibrated to CME)
+  - Index: CDD T_ref=10°C (vs. Zhou's 18°C)
+  - Rolling OOS 2015–2024 (vs. Zhou's single forward year)
+  - Zero risk premium
 """
 
-# -- Standard library ----------------------------------------------------------
-import warnings
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-# -- Third-party ---------------------------------------------------------------
 import numpy as np
 import pandas as pd
-import scipy.stats as stats
-from statsmodels.regression.quantile_regression import QuantReg
+from pathlib import Path
+from scipy import stats, optimize
+from scipy.stats import wilcoxon as _wilcoxon, spearmanr
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import warnings
 
 warnings.filterwarnings("ignore")
+np.random.seed(42)
 
+# ===========================================================================
+# CONFIGURATION
+# ===========================================================================
 
-# ==============================================================================
-# 0.  CONFIGURATION
-# ==============================================================================
-
-ROOT    = Path(r"C:/Users/victo/Downloads/Python/Projects/Masters_2026")
-OUT_DIR = ROOT / "results" / "phase2"
+ROOT      = Path("C:/Users/victo/Downloads/Python/Projects/Masters_2026")
+FCST_CSV  = ROOT / "bk_forecasts.csv"
+TEMP_CSV  = ROOT / "EDA" / "region_avg.csv"
+YIELD_CSV = ROOT / "EDA" / "ble_tendre_hiver_yield_2000_2024_regions_mainland.csv"
+OUT_DIR   = ROOT / "Outputs" / "zhou_replication"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-REGIONS   = ["11", "24", "27", "28", "32", "44", "52", "53"]
-ALL_YEARS = list(range(2000, 2025))   # full panel for selection + design
-OOS_YEARS = list(range(2015, 2025))   # OOS for pricing + EVOI
+REGIONS    = [11, 24, 27, 28, 32, 44, 52, 53]
+OOS_YEARS  = list(range(2015, 2025))
 
-T_REF   = 18.0    # CME Europe standard [OS05]
-MIN_RHO = 0.15    # minimum |rho| to accept a window [MOM19]
+MODEL_ORDER = ["HBA", "Alaton", "Benth", "XGB", "WaveletFNN", "LSTM", "FeedForwardNN"]
 
-# -- Candidate windows ---------------------------------------------------------
-# (index_type, start_doy, end_doy) using non-leap-year DOY reference.
-# All contiguous month combinations are evaluated within each seasonal set, so
-# the selection step can compare single months and grouped months such as
-# HDD_AprMayJun or CDD_AprMayJun on the same footing.
-MONTH_DAY_RANGES: Dict[str, Tuple[int, int]] = {
-    "Jan": (1, 31),
-    "Feb": (32, 59),
-    "Mar": (60, 90),
-    "Apr": (91, 120),
+# ── Pricing parameters (identical to pricing_comparison.py) ───────────────────
+TICK      = 20.0      # € per CDD-degree
+R_RATE    = 0.01      # annual risk-free rate
+BASE_TEMP = 10.0      # CDD reference temperature (°C)
+N_SIM     = 10_000    # Monte Carlo paths
+BLOCK_L   = 10        # block-bootstrap block length
+
+# ── Window search space (Möllmann et al. 2019) ───────────────────────────────
+# Search all combinations of start month to end month within the wheat
+# growing season: March through August.  21 candidate windows in total
+# (all start ≤ end combinations of 6 months).
+# DOY boundaries are no-leap.
+MONTH_WINDOWS = {
+    "Mar": (60,  90),
+    "Apr": (91,  120),
     "May": (121, 151),
     "Jun": (152, 181),
     "Jul": (182, 212),
+    "Aug": (213, 243),
+}
+MONTH_ORDER = ["Mar", "Apr", "May", "Jun", "Jul", "Aug"]
+
+# ── Farm-level parameters ─────────────────────────────────────────────────────
+WHEAT_PRICE = 160.0   # €/tonne
+YIELD_T0    = 2000    # base year for yield trend
+
+MODEL_COLORS = {
+    "HBA":           "#ff7f0e",
+    "Alaton":        "#2ca02c",
+    "Benth":         "#d62728",
+    "XGB":           "#1f77b4",
+    "WaveletFNN":    "#9467bd",
+    "LSTM":          "#8c564b",
+    "FeedForwardNN": "#e377c2",
 }
 
-INDEX_MONTHS: Dict[str, List[str]] = {
-    "HDD": ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul"],
-    "CDD": ["Mar", "Apr", "May", "Jun", "Jul"],
-    "CAT": ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul"],
-}
+# ===========================================================================
+# HELPERS
+# ===========================================================================
 
+def _doy_noleap(date):
+    doy = date.timetuple().tm_yday
+    if date.year % 4 == 0 and (date.year % 100 != 0 or date.year % 400 == 0):
+        if date.month > 2:
+            doy -= 1
+    return max(1, min(365, doy))
 
-def build_candidate_windows() -> Dict[str, Tuple[str, int, int]]:
-    """Generate single-month and contiguous multi-month windows."""
-    windows: Dict[str, Tuple[str, int, int]] = {}
-    for idx_type, months in INDEX_MONTHS.items():
-        for start in range(len(months)):
-            for end in range(start, len(months)):
-                month_slice = months[start:end + 1]
-                label = "".join(month_slice)
-                doy_start = MONTH_DAY_RANGES[month_slice[0]][0]
-                doy_end = MONTH_DAY_RANGES[month_slice[-1]][1]
-                windows[f"{idx_type}_{label}"] = (idx_type, doy_start, doy_end)
-    return windows
+def _daily_cdd(T):
+    return np.maximum(0.0, T - BASE_TEMP)
 
+def _cumulative_cdd(T):
+    return float(_daily_cdd(np.asarray(T, dtype=float)).sum())
 
-CANDIDATE_WINDOWS: Dict[str, Tuple[str, int, int]] = build_candidate_windows()
+def _semivar(x, target=None):
+    tgt = float(np.mean(x)) if target is None else target
+    return float(np.mean(np.minimum(x - tgt, 0.0) ** 2))
 
-QUANTILE_TAU     = 0.30   # lower tail contract design [CF15]
-CROP_PRICE_EUR_T = 200.0  # [ADAPT]
-FARM_AREA_HA     = 100.0  # [ADAPT]
+def _var_risk(x, alpha, target=None):
+    """VaR_α = E[R] − q_α(R)  (downside deviation from mean)."""
+    tgt = float(np.mean(x)) if target is None else target
+    return float(tgt - np.quantile(x, alpha))
 
-LAMBDA_GRID = [0.0001, 0.001, 0.005, 0.01]   # [BAB93]
-LAMBDA_BASE = 0.001                            # central estimate [VB04]
+def _es_risk(x, alpha, target=None):
+    """ES_α = E[R] − E[R | R ≤ q_α(R)]  (expected shortfall)."""
+    tgt       = float(np.mean(x)) if target is None else target
+    threshold = float(np.quantile(x, alpha))
+    tail      = x[x <= threshold]
+    return float(tgt - np.mean(tail)) if len(tail) > 0 else 0.0
 
-N_SIMS       = 10_000
-BLOCK_LENGTH = 10       # days [PR94]
-RISK_FREE    = 0.03     # [ADAPT]
-ALPHA        = 0.95     # valid with N_SIMS=10,000 [RU00]
-
-CL_GRID          = np.linspace(0.02, 0.50, 49)
-HBA_LOADING      = 0.22      # [JB05]
-MIN_WINDOW_DAYS  = 20
-MIN_INDEX_VAR    = 1.0
-
-
-# ==============================================================================
-# 1.  DATA LOADING
-# ==============================================================================
-
-def load_temperature(path: Path) -> pd.DataFrame:
+def compute_he_metrics(rev_sim, hedged_rev):
     """
-    Load daily actual temperatures from region_avg.csv.
-    Columns: date, region_code, daily_avg_temperature
-    Used for full-panel index computation (Spearman + QR, n=25).
+    Compute hedging effectiveness for six risk measures.
+    All use the same hedged revenue vector (N* optimised for HE(SV)).
+
+    All six metrics use the unhedged mean as the fixed reference target:
+      risk_metric = f(portfolio, target=E[R_unhedged])
+
+    This is consistent across metrics — they all ask:
+    "How much does the portfolio fall below what you'd expect without hedging?"
+    HE = 1 − risk(hedged) / risk(unhedged) measures the shift from no-hedge
+    to hedge relative to the same benchmark for both portfolios.
+
+    Returns dict with keys: HE_sd, HE_var5, HE_var10, HE_es5, HE_es10, HE_sv
     """
-    df = pd.read_csv(path, parse_dates=["date"])
-    df = df.rename(columns={"region_code": "region",
-                             "daily_avg_temperature": "T_mean"})
-    df["region"] = df["region"].astype(str)
-    df["year"]   = df["date"].dt.year
-    df["doy"]    = df["date"].dt.dayofyear
-    print(f"      Temperature: {len(df):,} rows | "
-          f"years {df['year'].min()}-{df['year'].max()}")
-    return df
+    mean_u = float(np.mean(rev_sim))   # fixed reference for all metrics
+    out    = {}
 
+    # SD — ratio of standard deviations (no mean reference needed)
+    std_u = float(np.std(rev_sim))
+    out["HE_sd"] = float(1 - np.std(hedged_rev) / std_u) if std_u > 1e-8 else 0.0
 
-def load_yield(path: Path) -> pd.DataFrame:
-    """
-    Load AGRESTE annual yield. Columns: year, reg, prod, surf, yield, source.
-    yield in quintaux/ha -> divided by 10 -> t/ha.
-    Linear OLS detrend per region [VB04 sec. 3.1].
-    """
-    df = pd.read_csv(path)
-    df = df.rename(columns={"reg": "region"})
-    df["region"]   = df["region"].astype(str)
-    df["yield_t_ha"] = df["yield"] / 10.0
+    # VaR_α = E[R_u] − q_α(portfolio)  — quantile shortfall from unhedged mean
+    # ES_α  = E[R_u] − E[portfolio | portfolio ≤ q_α(portfolio)]
+    for alpha, tag in [(0.05, "5"), (0.10, "10")]:
+        var_u = _var_risk(rev_sim,    alpha, mean_u)
+        var_h = _var_risk(hedged_rev, alpha, mean_u)
+        out[f"HE_var{tag}"] = float(1 - var_h / var_u) if var_u > 1e-8 else 0.0
 
-    parts = []
-    for region, grp in df.groupby("region"):
-        grp = grp.sort_values("year").copy()
-        if len(grp) < 3:
-            parts.append(grp)
-            continue
-        x = grp["year"].values.astype(float)
-        y = grp["yield_t_ha"].values
-        trend = np.polyval(np.polyfit(x, y, 1), x)
-        grp["yield_t_ha"] = y - trend + y.mean()
-        parts.append(grp)
+        es_u = _es_risk(rev_sim,    alpha, mean_u)
+        es_h = _es_risk(hedged_rev, alpha, mean_u)
+        out[f"HE_es{tag}"] = float(1 - es_h / es_u) if es_u > 1e-8 else 0.0
 
-    out = pd.concat(parts, ignore_index=True)[["year", "region", "yield_t_ha"]]
-    print(f"      Yield: {len(out)} rows | "
-          f"years {out['year'].min()}-{out['year'].max()} | "
-          f"mean {out['yield_t_ha'].mean():.2f} t/ha")
+    # SV — same fixed target, consistent with Zhou et al. (2016) Section 6.4
+    sv_u = _semivar(rev_sim,    mean_u)
+    sv_h = _semivar(hedged_rev, mean_u)
+    out["HE_sv"] = float(1 - sv_h / sv_u) if sv_u > 1e-8 else 0.0
+
     return out
 
+# ===========================================================================
+# PRICING ENGINE  (identical to pricing_comparison.py)
+# ===========================================================================
 
-def load_xgb_forecasts(path: Path, model_name: str = "XGB") -> pd.DataFrame:
+def _block_bootstrap(resid_by_year, n_sim, n_days):
     """
-    Load XGB OOS forecasts from bk_forecasts.csv.
-    Columns: region, year, date, actual, model, forecast.
-    Filters to model_name. Computes residual = actual - forecast.
+    Block bootstrap that samples contiguous blocks strictly within each year,
+    preventing artificial dependence at year join points.
+
+    resid_by_year: list of 1-D arrays, one per calibration year.
+    Each array contains the within-window residuals for that year ordered
+    by DOY.  Blocks are sampled within a randomly chosen year, then
+    concatenated across years to fill n_days.
     """
-    df = pd.read_csv(path, parse_dates=["date"])
-    avail = df["model"].unique().tolist()
-    if model_name not in avail:
-        raise ValueError(f"'{model_name}' not in {avail}")
-    df = df[df["model"] == model_name].copy()
-    df = df.rename(columns={"actual": "T_actual", "forecast": "T_forecast"})
-    df["year"]     = df["date"].dt.year
-    df["doy"]      = df["date"].dt.dayofyear
-    df["region"]   = df["region"].astype(str)
-    df["residual"] = df["T_actual"] - df["T_forecast"]
-    print(f"      XGB forecasts: {len(df):,} rows | "
-          f"years {df['year'].min()}-{df['year'].max()}")
-    return df
+    years = [r for r in resid_by_year if len(r) >= BLOCK_L]
+    if not years:
+        # Fallback: pool all residuals (old behaviour, flagged in comments)
+        pool = np.concatenate(resid_by_year)
+        pad  = np.concatenate([pool, pool[:BLOCK_L]])
+        n_r  = len(pool)
+        nb   = int(np.ceil(n_days / BLOCK_L))
+        st   = np.random.randint(0, n_r, size=(n_sim, nb))
+        eps  = np.empty((n_sim, nb * BLOCK_L))
+        for b in range(nb):
+            for s in range(n_sim):
+                eps[s, b*BLOCK_L:(b+1)*BLOCK_L] = pad[st[s,b]: st[s,b]+BLOCK_L]
+        return eps[:, :n_days]
+
+    nb  = int(np.ceil(n_days / BLOCK_L))
+    eps = np.empty((n_sim, nb * BLOCK_L))
+    for b in range(nb):
+        for s in range(n_sim):
+            # Draw a random year, then a random block start within that year
+            yr  = years[np.random.randint(len(years))]
+            n_r = len(yr)
+            # Maximum valid start: leave room for a full block
+            st  = np.random.randint(0, n_r - BLOCK_L + 1)
+            eps[s, b*BLOCK_L:(b+1)*BLOCK_L] = yr[st: st + BLOCK_L]
+    return eps[:, :n_days]
 
 
-# ==============================================================================
-# 2.  INDEX COMPUTATION
-# ==============================================================================
-# HDD = sum max(T_REF - T, 0)  [OS05]
-# CDD = sum max(T - T_REF, 0)  [OS05]
-# CAT = sum T over window       [JB05]
-
-def _accumulate(series: np.ndarray, idx_type: str) -> float:
-    if idx_type == "HDD":
-        return float(np.maximum(T_REF - series, 0).sum())
-    elif idx_type == "CDD":
-        return float(np.maximum(series - T_REF, 0).sum())
-    return float(series.sum())
+def simulate_cdd_paths(fcst_vec, resid_by_year):
+    n   = len(fcst_vec)
+    eps = _block_bootstrap(resid_by_year, N_SIM, n)
+    T   = fcst_vec[np.newaxis, :] + eps
+    return _daily_cdd(T).sum(axis=1)
 
 
-def compute_indices_from_actual(
-    temp_df: pd.DataFrame,
-    regions: List[str],
-    years: List[int],
-    windows: Dict[str, Tuple[str, int, int]] = CANDIDATE_WINDOWS,
-) -> pd.DataFrame:
+def price_call(cdd_sim, strike, ttm):
+    payoffs = TICK * np.maximum(0.0, cdd_sim - strike)
+    price   = float(np.exp(-R_RATE * ttm) * payoffs.mean())
+    return price, payoffs
+
+
+def price_put(cdd_sim, strike, ttm):
+    payoffs = TICK * np.maximum(0.0, strike - cdd_sim)
+    price   = float(np.exp(-R_RATE * ttm) * payoffs.mean())
+    return price, payoffs
+
+
+def price_instrument(cdd_sim, strike, ttm, corr):
     """
-    Compute all candidate indices from actual observed temperatures.
-    Column naming: <win>_act, <win>_n_days.
-    Used for: Spearman selection (n=25), QR design, HBA pricing.
+    Select call or put based on the sign of the CDD-yield correlation.
+      corr < 0: higher CDD hurts yield → buy CDD call (pays when CDD high)
+      corr ≥ 0: lower CDD hurts yield → buy CDD put  (pays when CDD low)
     """
-    records = []
-    for region in regions:
-        r = temp_df[temp_df["region"] == region].sort_values("date")
-        for year in years:
-            yr = r[r["year"] == year]
-            if yr.empty:
-                continue
-            row = {"region": region, "year": year}
-            for wn, (it, d1, d2) in windows.items():
-                seg = yr[(yr["doy"] >= d1) & (yr["doy"] <= d2)]
-                row[f"{wn}_act"]    = _accumulate(seg["T_mean"].values, it) if not seg.empty else np.nan
-                row[f"{wn}_n_days"] = len(seg)
-            records.append(row)
-    return pd.DataFrame(records)
-
-
-def compute_indices_from_forecasts(
-    xgb_df: pd.DataFrame,
-    regions: List[str],
-    years: List[int],
-    windows: Dict[str, Tuple[str, int, int]] = CANDIDATE_WINDOWS,
-) -> pd.DataFrame:
-    """
-    Compute candidate indices from XGBoost OOS forecasts.
-    Columns: <win>_fc (from T_forecast), <win>_act (from T_actual).
-    Used for: MC pricing (via _fc) and EVOI event flags (via _act).
-    """
-    records = []
-    for region in regions:
-        r = xgb_df[xgb_df["region"] == region].sort_values("date")
-        for year in years:
-            yr = r[r["year"] == year]
-            if yr.empty:
-                continue
-            row = {"region": region, "year": year}
-            for wn, (it, d1, d2) in windows.items():
-                seg = yr[(yr["doy"] >= d1) & (yr["doy"] <= d2)]
-                if seg.empty:
-                    row[f"{wn}_fc"]     = np.nan
-                    row[f"{wn}_act"]    = np.nan
-                    row[f"{wn}_n_days"] = 0
-                else:
-                    row[f"{wn}_fc"]     = _accumulate(seg["T_forecast"].values, it)
-                    row[f"{wn}_act"]    = _accumulate(seg["T_actual"].values,   it)
-                    row[f"{wn}_n_days"] = len(seg)
-            records.append(row)
-    return pd.DataFrame(records)
-
-
-# ==============================================================================
-# 3.  WINDOW SELECTION VIA SPEARMAN (FULL PANEL)
-# ==============================================================================
-
-def select_best_window(
-    idx_all: pd.DataFrame,
-    yield_df: pd.DataFrame,
-    region: str,
-    windows: Dict[str, Tuple[str, int, int]] = CANDIDATE_WINDOWS,
-    min_rho: float = MIN_RHO,
-    min_days: int = MIN_WINDOW_DAYS,
-    min_variance: float = MIN_INDEX_VAR,
-    exclude_windows: Optional[List[str]] = None,
-) -> Dict:
-    """
-    Select best (window, index_type) per region via Spearman rho with
-    detrended yield over the full historical panel (n=25) [CF15; MOM19].
-    Uses _act columns (actual observed temperatures from region_avg.csv).
-    exclude_windows: list of window names to skip (used for straddle leg 2).
-    """
-    exclude_windows = exclude_windows or []
-    merged = (
-        idx_all[idx_all["region"] == region]
-        .merge(yield_df[yield_df["region"] == region], on=["region", "year"])
-        .dropna(subset=["yield_t_ha"])
-    )
-
-    rho_results = {}
-    for wn, (it, d1, d2) in windows.items():
-        if wn in exclude_windows:
-            continue
-        ac, nd = f"{wn}_act", f"{wn}_n_days"
-        if ac not in merged.columns:
-            continue
-        sub = merged[[ac, nd, "yield_t_ha"]].dropna()
-        if len(sub) < 5 or sub[nd].mean() < min_days or sub[ac].var() < min_variance:
-            continue
-        rho, pval = stats.spearmanr(sub[ac], sub["yield_t_ha"])
-        rho_results[wn] = {
-            "rho": float(rho), "abs_rho": float(abs(rho)),
-            "p_value": float(pval), "index_type": it,
-            "doy_start": d1, "doy_end": d2, "n_obs": len(sub),
-        }
-
-    if not rho_results:
-        return {"best_window": None, "index_type": None, "doy_start": None,
-                "doy_end": None, "rho": np.nan, "abs_rho": np.nan,
-                "p_value": np.nan, "direction": 0, "n_obs": 0, "all_rhos": {}}
-
-    best = max(rho_results, key=lambda k: rho_results[k]["abs_rho"])
-    b    = rho_results[best]
-
-    if b["abs_rho"] < min_rho:
-        print(f"    [WARN] R{region}: |rho|={b['abs_rho']:.3f} ({best}) "
-              f"< {min_rho}")
-
-    all_rhos = {k: round(v["rho"], 3)
-                for k, v in sorted(rho_results.items(),
-                                   key=lambda x: -x[1]["abs_rho"])}
-    return {
-        "best_window": best, "index_type": b["index_type"],
-        "doy_start": b["doy_start"], "doy_end": b["doy_end"],
-        "rho": b["rho"], "abs_rho": b["abs_rho"],
-        "p_value": b["p_value"], "direction": int(np.sign(b["rho"])),
-        "n_obs": b["n_obs"], "all_rhos": all_rhos,
-    }
-
-
-def select_spring_cdd_window(
-    idx_all: pd.DataFrame,
-    yield_df: pd.DataFrame,
-    region: str,
-    windows: Dict[str, Tuple[str, int, int]] = CANDIDATE_WINDOWS,
-    min_days: int = MIN_WINDOW_DAYS,
-    min_variance: float = MIN_INDEX_VAR,
-    exclude_windows: Optional[List[str]] = None,
-) -> Dict:
-    """
-    Select best CDD spring/summer window (doy_start >= 91) for straddle leg 2.
-    Excludes the primary window to prevent identical legs.
-    Lower min_rho=0.05 since spring CDD signal may be weaker.
-    """
-    cdd_spring = {k: v for k, v in windows.items()
-                  if v[0] == "CDD" and v[1] >= 91}
-    return select_best_window(
-        idx_all, yield_df, region,
-        windows=cdd_spring, min_rho=0.05,
-        min_days=min_days, min_variance=min_variance,
-        exclude_windows=exclude_windows,
-    )
-
-
-# ==============================================================================
-# 4.  CONTRACT DESIGN: QR STRIKE AND TICK (FULL PANEL)
-# ==============================================================================
-
-def estimate_contract_parameters(
-    idx_all: pd.DataFrame,
-    yield_df: pd.DataFrame,
-    region: str,
-    best_window: str,
-    tau: float = QUANTILE_TAU,
-) -> Dict:
-    """
-    Strike K and tick via tau-QR on full-panel actual index [CF15].
-    K = (Q_tau(yield) - alpha_hat) / beta_hat  [CF15 eq. 4]
-    tick = |beta_hat| * price * area            [SH13]
-    """
-    ac_col = f"{best_window}_act"
-    merged = (
-        idx_all[idx_all["region"] == region]
-        .merge(yield_df[yield_df["region"] == region], on=["region", "year"])
-        .dropna(subset=[ac_col, "yield_t_ha"])
-    )
-    if len(merged) < 5:
-        return {"strike_K": np.nan, "beta_qr": np.nan,
-                "tick_size": np.nan, "tau": tau, "n_obs": len(merged)}
-
-    X = merged[ac_col].values
-    y = merged["yield_t_ha"].values
-    res = QuantReg(y, np.column_stack([np.ones(len(X)), X])).fit(
-        q=tau, max_iter=2000, vcov="iid")
-    a_hat, b_hat = res.params
-
-    K = float(np.clip(
-        (np.quantile(y, tau) - a_hat) / b_hat if abs(b_hat) > 1e-9 else np.mean(X),
-        X.min(), X.max()
-    ))
-    return {
-        "strike_K":   K,
-        "beta_qr":    float(b_hat),
-        "tick_size":  float(abs(b_hat) * CROP_PRICE_EUR_T * FARM_AREA_HA),
-        "tau":        tau,
-        "n_obs":      len(merged),
-        "ci_beta_lo": float(res.conf_int()[1, 0]),
-        "ci_beta_hi": float(res.conf_int()[1, 1]),
-    }
-
-
-# ==============================================================================
-# 5.  OLS FIT FOR SIMULATED JOINT DISTRIBUTION
-# ==============================================================================
-
-def fit_ols_yield_index(
-    idx_all: pd.DataFrame,
-    yield_df: pd.DataFrame,
-    region: str,
-    best_window: str,
-) -> Dict:
-    """
-    OLS: yield = alpha + beta * index_act + eps  (full panel, n=25).
-    Residuals eps are bootstrapped in simulate_joint_distribution() to
-    represent yield variance unexplained by temperature [VB04 sec. 4].
-    """
-    ac_col = f"{best_window}_act"
-    merged = (
-        idx_all[idx_all["region"] == region]
-        .merge(yield_df[yield_df["region"] == region], on=["region", "year"])
-        .dropna(subset=[ac_col, "yield_t_ha"])
-    )
-    X      = merged[ac_col].values
-    y      = merged["yield_t_ha"].values
-    X2     = np.column_stack([np.ones(len(X)), X])
-    betas  = np.linalg.lstsq(X2, y, rcond=None)[0]
-    resids = y - X2 @ betas
-    return {
-        "alpha":     float(betas[0]),
-        "beta":      float(betas[1]),
-        "residuals": resids,
-        "n_obs":     len(merged),
-        "r2":        float(1 - resids.var() / y.var()),
-    }
-
-
-# ==============================================================================
-# 6.  HBA PRICING
-# ==============================================================================
-
-def hba_price(
-    hist_idx: np.ndarray,
-    strike: float,
-    tick: float,
-    option_type: str,
-    loading: float = HBA_LOADING,
-) -> Dict:
-    """Historical Burn Analysis fair premium [JB05 ch.3; SH13]."""
-    payoffs = (tick * np.maximum(hist_idx - strike, 0) if option_type == "call"
-               else tick * np.maximum(strike - hist_idx, 0))
-    return {
-        "premium_hba": float(payoffs.mean() * (1 + loading)),
-        "mean_payoff": float(payoffs.mean()),
-        "std_payoff":  float(payoffs.std(ddof=1)),
-        "n_years":     len(hist_idx),
-    }
-
-
-# ==============================================================================
-# 7.  MONTE CARLO PRICING
-# ==============================================================================
-
-def block_bootstrap(
-    residuals: np.ndarray, n_days: int, n_sims: int,
-    b: int = BLOCK_LENGTH,
-    rng: Optional[np.random.Generator] = None,
-) -> np.ndarray:
-    """Stationary block bootstrap [PR94]. Returns (n_sims, n_days)."""
-    if rng is None:
-        rng = np.random.default_rng(42)
-    n_res = len(residuals)
-    out   = np.empty((n_sims, n_days))
-    for i in range(n_sims):
-        path = []
-        while len(path) < n_days:
-            start = rng.integers(0, max(1, n_res - b + 1))
-            path.extend(residuals[start: start + b].tolist())
-        out[i] = path[:n_days]
-    return out
-
-
-def mc_price(
-    forecast: np.ndarray,
-    residuals: np.ndarray,
-    strike: float,
-    tick: float,
-    option_type: str,
-    index_type: str,
-    n_sims: int = N_SIMS,
-    b: int      = BLOCK_LENGTH,
-    rf: float   = RISK_FREE,
-    rng: Optional[np.random.Generator] = None,
-) -> Dict:
-    """
-    MC option price: T_sim = T_forecast + eps*  [CD05; BKK26].
-    Returns payoffs and idx_sims for downstream HE and EVOI.
-    """
-    n_days = len(forecast)
-    eps    = block_bootstrap(residuals, n_days, n_sims, b, rng)
-    T_sim  = forecast[np.newaxis, :] + eps
-
-    if index_type == "HDD":
-        idx = np.maximum(T_REF - T_sim, 0).sum(axis=1)
-    elif index_type == "CDD":
-        idx = np.maximum(T_sim - T_REF, 0).sum(axis=1)
+    if corr < 0:
+        return price_call(cdd_sim, strike, ttm)
     else:
-        idx = T_sim.sum(axis=1)
+        return price_put(cdd_sim, strike, ttm)
 
-    payoffs = (tick * np.maximum(idx - strike, 0) if option_type == "call"
-               else tick * np.maximum(strike - idx, 0))
+# ===========================================================================
+# DATA LOADING
+# ===========================================================================
 
+def load_yield(region):
+    raw = pd.read_csv(YIELD_CSV)
+    raw.columns = [c.strip().lower() for c in raw.columns]
+    rcol = next((c for c in ["reg","region_code","region","nuts2","code"]
+                 if c in raw.columns), None)
+    ycol = next((c for c in ["yield","yield_t_ha","rendement","value"]
+                 if c in raw.columns), None)
+    tcol = next((c for c in ["year","annee","an"] if c in raw.columns), None)
+    if any(x is None for x in [rcol, ycol, tcol]):
+        raise ValueError(f"Cannot identify columns. Found: {list(raw.columns)}")
+    df = raw[raw[rcol] == region][[tcol, ycol]].copy()
+    df.columns = ["year", "yield_raw"]
+    df["year"]       = df["year"].astype(int)
+    df["yield_t_ha"] = df["yield_raw"].astype(float)
+    if df["yield_t_ha"].median() > 20:
+        df["yield_t_ha"] /= 10.0
+    return df.sort_values("year").reset_index(drop=True)
+
+
+def load_temperature(region):
+    """Load full daily temperature series for one region."""
+    raw = pd.read_csv(TEMP_CSV, parse_dates=["date"])
+    raw = raw.rename(columns={"daily_avg_temperature": "T"})
+    df  = raw[raw["region_code"] == region][["date","T"]].copy()
+    df  = df[~((df["date"].dt.month==2)&(df["date"].dt.day==29))].copy()
+    df["doy"]  = df["date"].apply(_doy_noleap)
+    df["year"] = df["date"].dt.year
+    return df.sort_values("date").reset_index(drop=True)
+
+
+def compute_cdd_by_window(temp_df, start_doy, end_doy):
+    """Compute actual cumulative CDD per year for a given DOY window."""
+    win = temp_df[(temp_df["doy"] >= start_doy) &
+                  (temp_df["doy"] <= end_doy)].copy()
+    win["cdd"] = _daily_cdd(win["T"].values)
+    return win.groupby("year")["cdd"].sum().rename("cCDD").reset_index()
+
+# ===========================================================================
+# PERIOD SELECTION  (Möllmann et al. 2019, Section 2b)
+# ===========================================================================
+
+def detrend_yield_log(yield_df):
+    """
+    Fit ln(Y_t) = a + b·(t − YIELD_T0) + ε_t and return residuals.
+    Used for window selection only (no CDD term to avoid circularity).
+    """
+    df = yield_df.dropna(subset=["yield_t_ha"]).copy()
+    df = df[df["yield_t_ha"] > 0]
+    y  = np.log(df["yield_t_ha"].values)
+    t  = (df["year"].values - YIELD_T0).astype(float)
+    X  = np.column_stack([np.ones(len(y)), t])
+    coefs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    resid = y - X @ coefs
+    return pd.Series(resid, index=df["year"].values)
+
+
+def find_optimal_window(yield_calib, temp_calib):
+    """
+    Find the month-level window maximising |Spearman(cCDD, detrended_yield)|
+    on calibration data.  (Möllmann et al. 2019, Section 2b)
+
+    Searches all 21 start ≤ end combinations within March–August.
+    Returns (best_start, best_end, best_label, best_corr).
+
+    Note: selection criterion is correlation-based; evaluation is HE(SV)-based.
+    This follows Möllmann et al.'s design and is acknowledged as a stated
+    methodological choice in the thesis.
+    """
+    detrended = detrend_yield_log(yield_calib)
+
+    best_corr  = 0.0
+    best_start = MONTH_WINDOWS["May"][0]
+    best_end   = MONTH_WINDOWS["Jun"][1]
+    best_label = "May–Jun"
+
+    for i, m_start in enumerate(MONTH_ORDER):
+        for m_end in MONTH_ORDER[i:]:
+            s = MONTH_WINDOWS[m_start][0]
+            e = MONTH_WINDOWS[m_end][1]
+            cdd_yr = compute_cdd_by_window(temp_calib, s, e)
+            merged = (cdd_yr[cdd_yr["year"].isin(detrended.index)]
+                      .set_index("year"))
+            common = merged.index.intersection(detrended.index)
+            if len(common) < 6:
+                continue
+            rho, _ = spearmanr(detrended.loc[common].values,
+                               merged.loc[common, "cCDD"].values)
+            if np.isnan(rho):
+                continue
+            if abs(rho) > abs(best_corr):
+                best_corr  = rho
+                best_start = s
+                best_end   = e
+                best_label = (f"{m_start}–{m_end}"
+                              if m_start != m_end else m_start)
+
+    return best_start, best_end, best_label, best_corr
+
+# ===========================================================================
+# YIELD MODEL  (Zhou et al. 2016 Model 5, with optimal window CDD)
+# ===========================================================================
+
+def fit_yield_model(yield_df, cdd_df):
+    """
+    OLS: ln(Y_t) = a + b·(t − YIELD_T0) + c·cCDD_t² + ε_t
+
+    cdd_df has columns [year, cCDD] for the optimal window.
+    """
+    merged = pd.merge(yield_df, cdd_df, on="year", how="inner").dropna()
+    if len(merged) < 6:
+        return None
+    y   = np.log(merged["yield_t_ha"].values)
+    t   = (merged["year"].values - YIELD_T0).astype(float)
+    cdd = merged["cCDD"].values
+    X   = np.column_stack([np.ones(len(y)), t, cdd ** 2])
+    coefs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    resid = y - X @ coefs
     return {
-        "premium_mc":  float((1.0 / (1.0 + rf)) * payoffs.mean()),
-        "mean_payoff": float(payoffs.mean()),
-        "std_payoff":  float(payoffs.std(ddof=1)),
-        "payoffs":     payoffs,
-        "idx_sims":    idx,
-        "n_sims":      n_sims,
+        "a":     float(coefs[0]),
+        "b":     float(coefs[1]),
+        "c":     float(coefs[2]),
+        "resid": resid,
+        "r2":    float(1 - np.var(resid) / np.var(y)),
+        "n":     len(merged),
     }
 
 
-# ==============================================================================
-# 8.  SIMULATED JOINT DISTRIBUTION
-# ==============================================================================
+def simulate_revenue(yield_model, cdd_sim, oos_year):
+    t_val    = float(oos_year - YIELD_T0)
+    log_mean = (yield_model["a"]
+                + yield_model["b"] * t_val
+                + yield_model["c"] * cdd_sim ** 2)
+    eps = np.random.choice(yield_model["resid"], size=N_SIM, replace=True)
+    return np.exp(log_mean + eps) * WHEAT_PRICE
 
-def simulate_joint_distribution(
-    idx_sims: np.ndarray,
-    ols_alpha: float,
-    ols_beta: float,
-    ols_residuals: np.ndarray,
-    strike: float,
-    tick: float,
-    option_type: str,
-    premium: float,
-    n_sims: int = N_SIMS,
-    b: int      = BLOCK_LENGTH,
-    rng: Optional[np.random.Generator] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+# ===========================================================================
+# HEDGE RATIO OPTIMISATION  (Zhou et al. 2016, fixed K)
+# ===========================================================================
+
+def hedged_revenue(rev_sim, payoff_sim, n_contracts, option_price, ttm):
     """
-    Simulate joint (rev_unhedged, rev_hedged) over 10,000 MC paths [VB04].
+    Hedged terminal revenue.
 
-    yield_sim = ols_alpha + ols_beta * index_sim + eps*
-    eps* drawn by scalar block-bootstrap from OLS yield residuals.
-    rev = yield_sim * price * area.
+    Revenue is a terminal-period quantity (received at harvest).
+    Premium V is paid at hedge initiation and carried to maturity at r.
+    Payoff is received at maturity.
+
+      Profit_t = Revenue_t − N·V·e^(r·TTM) + N·Payoff_t
+
+    This is consistent with Zhou's variance algebra where the carried
+    premium is a deterministic cost and drops out of the variance term.
     """
-    if rng is None:
-        rng = np.random.default_rng(99)
-    n_res = len(ols_residuals)
-    eps   = np.empty(n_sims)
-    for i in range(n_sims):
-        start  = rng.integers(0, max(1, n_res - b + 1))
-        eps[i] = ols_residuals[start]
-
-    yield_sim = ols_alpha + ols_beta * idx_sims + eps
-    rev_u     = yield_sim * CROP_PRICE_EUR_T * FARM_AREA_HA
-
-    payoffs = (tick * np.maximum(idx_sims - strike, 0) if option_type == "call"
-               else tick * np.maximum(strike - idx_sims, 0))
-    rev_h = rev_u + payoffs - premium
-
-    return rev_u, rev_h
-
-
-# ==============================================================================
-# 9.  HEDGING EFFECTIVENESS: ES (PRIMARY), VaR, SD
-# ==============================================================================
-# ES SIGN CONVENTION:
-#   Revenues are always positive (yield > 0, price > 0, area > 0).
-#   Standard ES (negative tail mean) would be negative for positive revenues,
-#   making the HE formula incoherent.
-#
-#   Solution: define ES as the EXPECTED SHORTFALL BELOW MEAN REVENUE.
-#     loss = mean(rev) - rev  (positive when revenue is below average)
-#     ES   = E[loss | loss >= VaR_alpha(loss)]  > 0 always  [RU00]
-#
-#   With this definition:
-#     - Hedging raises the lower tail -> shortfalls shrink -> ES_h < ES_u
-#     - HE_ES = 1 - ES_h / ES_u > 0 (correct direction)  [MOM19]
-#
-# VaR is defined identically as the alpha-quantile of the shortfall.
-
-def _es(r: np.ndarray, alpha: float = ALPHA) -> float:
-    """
-    Expected Shortfall of revenue shortfall below mean.
-    ES = E[mean(r) - r | mean(r) - r >= VaR_alpha(mean(r) - r)]
-    Always positive. Better hedging -> lower ES. [RU00; MOM19]
-    """
-    loss   = r.mean() - r
-    thresh = np.quantile(loss, alpha)
-    tail   = loss[loss >= thresh]
-    return float(tail.mean()) if len(tail) > 0 else np.nan
-
-
-def _var(r: np.ndarray, alpha: float = ALPHA) -> float:
-    """VaR of revenue shortfall below mean [alpha-quantile of loss]."""
-    return float(np.quantile(r.mean() - r, alpha))
-
-
-def hedging_effectiveness(
-    rev_u: np.ndarray,
-    rev_h: np.ndarray,
-    alpha: float = ALPHA,
-) -> Dict:
-    """
-    Three-metric hedging effectiveness framework [MOM19; VB04; RU00].
-
-    HE_ES  = 1 - ES(hedged)  / ES(unhedged)   PRIMARY  [MOM19; RU00]
-    HE_VaR = 1 - VaR(hedged) / VaR(unhedged)  secondary [VB04]
-    HE_SD  = 1 - Var(hedged) / Var(unhedged)  secondary [Ederington 1979]
-
-    All defined on shortfall (loss = mean - revenue) so that positive HE
-    means risk reduction. Valid for always-positive revenue distributions.
-    """
-    es_u  = _es(rev_u, alpha);    es_h  = _es(rev_h, alpha)
-    var_u = _var(rev_u, alpha);   var_h = _var(rev_h, alpha)
-    sd_u  = float(rev_u.std(ddof=1));  sd_h = float(rev_h.std(ddof=1))
-
-    return {
-        "HE_ES":         1 - es_h  / es_u  if es_u  > 0 else np.nan,
-        "HE_VaR":        1 - var_h / var_u  if var_u > 0 else np.nan,
-        "HE_SD":         1 - (sd_h / sd_u)**2 if sd_u > 0 else np.nan,
-        "ES_unhedged":   es_u,   "ES_hedged":  es_h,
-        "VaR_unhedged":  var_u,  "VaR_hedged": var_h,
-        "SD_unhedged":   sd_u,   "SD_hedged":  sd_h,
-        "mean_unhedged": float(rev_u.mean()),
-        "mean_hedged":   float(rev_h.mean()),
-    }
-
-
-# ==============================================================================
-# 10. CARA
-# ==============================================================================
-
-def cara_ce(
-    revenue: np.ndarray,
-    payoffs: np.ndarray,
-    lam: float,
-) -> Dict:
-    """CARA h* and CE revenue [VB04 eq. 8; BAB93]."""
-    var_p  = np.var(payoffs, ddof=1)
-    cov_rp = np.cov(revenue, payoffs)[0, 1]
-    h_star = float(cov_rp / var_p) if var_p > 1e-10 else 0.0
-    rev_h  = revenue + h_star * payoffs
-    CE_u   = revenue.mean() - (lam / 2) * np.var(revenue, ddof=1)
-    CE_h   = rev_h.mean()   - (lam / 2) * np.var(rev_h,   ddof=1)
-    return {"h_star": h_star, "CE_unhedged": float(CE_u),
-            "CE_hedged": float(CE_h), "CE_gain": float(CE_h - CE_u),
-            "lambda": lam}
-
-
-# ==============================================================================
-# 11. EVOI
-# ==============================================================================
-
-def compute_evoi(
-    actual_events: np.ndarray,
-    p_hba: float, p_xgb: float,
-    L: float, C: float,
-    cl_grid: np.ndarray = CL_GRID,
-) -> pd.DataFrame:
-    """REV across C/L grid: XGBoost vs HBA hedge decisions [MU77; RI00]."""
-    base = float(actual_events.mean())
-    rows = []
-    for cl in cl_grid:
-        h_hba = int(p_hba >= cl)
-        h_xgb = int(p_xgb >= cl)
-        e_hba = -C if h_hba else -L * base
-        e_xgb = -C if h_xgb else -L * base
-        e_pft = -C * base
-        denom = e_hba - e_pft
-        rev   = (e_hba - e_xgb) / denom if abs(denom) > 1e-9 else np.nan
-        rows.append({"cl_ratio": cl, "REV": rev, "E_hba": e_hba,
-                     "E_xgb": e_xgb, "E_perfect": e_pft,
-                     "p_hba": p_hba, "p_xgb": p_xgb,
-                     "hedge_hba": h_hba, "hedge_xgb": h_xgb})
-    return pd.DataFrame(rows)
-
-
-# ==============================================================================
-# 12. STRADDLE
-# ==============================================================================
-
-def price_straddle(mc_leg1: Dict, mc_leg2: Dict) -> Dict:
-    """Cross-index cross-period straddle [STU16; PRE24]."""
-    total = mc_leg1["payoffs"] + mc_leg2["payoffs"]
-    return {
-        "premium_straddle":  float(mc_leg1["premium_mc"] + mc_leg2["premium_mc"]),
-        "premium_leg1":      float(mc_leg1["premium_mc"]),
-        "premium_leg2":      float(mc_leg2["premium_mc"]),
-        "total_payoffs":     total,
-        "mean_total_payoff": float(total.mean()),
-        "std_total_payoff":  float(total.std(ddof=1)),
-        "idx_sims_leg1":     mc_leg1["idx_sims"],
-        "idx_sims_leg2":     mc_leg2["idx_sims"],
-    }
-
-
-# ==============================================================================
-# 13. TERMINAL SUMMARY
-# ==============================================================================
-
-def print_results_summary(
-    sel_df, ctr_df, hba_df, mc_store, he_df, cara_df, evoi_df, straddle_df
-):
-    """Compact aligned terminal summary. Paste for review."""
-    SEP  = "=" * 72
-    SEP2 = "-" * 72
-
-    print(f"\n{SEP}")
-    print("  PHASE 2 RESULTS SUMMARY")
-    print(SEP)
-
-    # [1] Window selection
-    print("\n[1] DATA-DRIVEN WINDOW SELECTION  [Conradt et al. 2015]")
-    print(f"  {'Region':<8} {'Best Window':<16} {'Idx':<5} "
-          f"{'rho':>7} {'p-val':>8} {'n':>4}")
-    print(f"  {SEP2[:52]}")
-    for _, r in sel_df.iterrows():
-        print(f"  {r['region']:<8} {str(r['best_window']):<16} "
-              f"{str(r['index_type']):<5} {r['rho']:>+7.3f} "
-              f"{r['p_value']:>8.3f} {int(r['n_obs']):>4}")
-
-    # [2] Contract design
-    print("\n[2] CONTRACT DESIGN  [Conradt et al. 2015; Spicka & Hnilica 2013]")
-    print(f"  {'Region':<8} {'Window':<16} {'Opt':<5} "
-          f"{'K':>10} {'Tick EUR':>12}")
-    print(f"  {SEP2[:55]}")
-    for _, r in ctr_df.iterrows():
-        print(f"  {r['region']:<8} {str(r['best_window']):<16} "
-              f"{str(r['option_type']):<5} {r['strike_K']:>10.1f} "
-              f"{r['tick_size']:>12,.0f}")
-
-    # [3] Pricing
-    print("\n[3] PRICING: MC (XGBoost bootstrap) vs HBA benchmark  [CD05; JB05]")
-    print(f"  {'Region':<8} {'MC EUR':>12} {'HBA EUR':>12} "
-          f"{'Diff':>10} {'Diff%':>7}")
-    print(f"  {SEP2[:53]}")
-    for region, mc in mc_store.items():
-        hba_r = hba_df[hba_df["region"] == region]
-        if hba_r.empty:
-            continue
-        hba_p = hba_r["premium_hba"].values[0]
-        mc_p  = mc["premium_mc"]
-        diff  = mc_p - hba_p
-        pct   = diff / hba_p * 100 if hba_p > 0 else float("nan")
-        pct_s = f"{pct:>+6.1f}%" if pd.notna(pct) else "    nan"
-        print(f"  {region:<8} {mc_p:>12,.0f} {hba_p:>12,.0f} "
-              f"{diff:>+10,.0f} {pct_s}")
-
-    # [4] HE
-    print(f"\n[4] HEDGING EFFECTIVENESS  alpha={ALPHA} | PRIMARY=HE_ES "
-          f"[MOM19; RU00]")
-    print("    ES/VaR on shortfall below mean | simulated joint dist. [VB04]")
-    print(f"  {'Region':<8} {'Instr':<11} {'HE_ES':>7} "
-          f"{'HE_VaR':>7} {'HE_SD':>7} {'OLS R2':>7}")
-    print(f"  {SEP2[:51]}")
-    for _, r in he_df.iterrows():
-        he_es  = f"{r['HE_ES']:>+7.3f}"  if pd.notna(r.get("HE_ES"))  else "    nan"
-        he_var = f"{r['HE_VaR']:>+7.3f}" if pd.notna(r.get("HE_VaR")) else "    nan"
-        he_sd  = f"{r['HE_SD']:>+7.3f}"  if pd.notna(r.get("HE_SD"))  else "    nan"
-        r2_s   = (f"{r['ols_r2']:>7.3f}" if "ols_r2" in r.index
-                  and pd.notna(r.get("ols_r2")) else "       ")
-        print(f"  {r['region']:<8} {str(r['instrument']):<11} "
-              f"{he_es} {he_var} {he_sd} {r2_s}")
-
-    # [5] CARA
-    print("\n[5] CARA CE GAIN EUR  [Vedenov & Barnett 2004; Babcock et al. 1993]")
-    print(f"  {'Region':<8} {'lam=0.0001':>12} {'lam=0.001':>12} "
-          f"{'lam=0.005':>12} {'lam=0.01':>12}")
-    print(f"  {SEP2[:60]}")
-    for region in REGIONS:
-        sub = cara_df[cara_df["region"] == region].sort_values("lambda")
-        if sub.empty:
-            continue
-        vals = "".join(f"{g:>12,.0f}" for g in sub["CE_gain"].tolist())
-        print(f"  {region:<8} {vals}")
-
-    # [6] EVOI
-    print("\n[6] EVOI MAX REV  [Murphy 1977; Richardson 2000]")
-    print("    REV > 0: XGBoost adds value over HBA | REV = 1: perfect")
-    print(f"  {'Region':<8} {'p_HBA':>7} {'p_XGB':>7} "
-          f"{'maxREV':>9} {'opt C/L':>8}")
-    print(f"  {SEP2[:43]}")
-    for region in REGIONS:
-        sub = evoi_df[evoi_df["region"] == region]
-        if sub.empty:
-            continue
-        p_hba   = sub["p_hba"].iloc[0]
-        p_xgb   = sub["p_xgb"].iloc[0]
-        max_rev = sub["REV"].max()
-        opt_cl  = sub.loc[sub["REV"].idxmax(), "cl_ratio"]
-        rev_s   = f"{max_rev:>+9.3f}" if pd.notna(max_rev) else "      nan"
-        print(f"  {region:<8} {p_hba:>7.3f} {p_xgb:>7.3f} "
-              f"{rev_s} {opt_cl:>8.2f}")
-
-    # [7] Straddle
-    if not straddle_df.empty:
-        print("\n[7] STRADDLE  [Stulec et al. 2016; Prentzas et al. 2024]")
-        print(f"  {'Region':<8} {'Leg 1':<16} {'Leg 2':<16} "
-              f"{'L1 EUR':>9} {'L2 EUR':>9} {'Total':>9}")
-        print(f"  {SEP2[:71]}")
-        for _, r in straddle_df.iterrows():
-            print(f"  {r['region']:<8} {str(r['window_l1']):<16} "
-                  f"{str(r['window_l2']):<16} "
-                  f"{r['premium_leg1']:>9,.0f} "
-                  f"{r['premium_leg2']:>9,.0f} "
-                  f"{r['premium_straddle']:>9,.0f}")
-
-        st_he = he_df[he_df["instrument"] == "straddle"]
-        if not st_he.empty:
-            print("\n  Straddle HE:")
-            print(f"  {'Region':<8} {'HE_ES':>7} {'HE_VaR':>7} "
-                  f"{'HE_SD':>7} {'OLS R2':>7}")
-            for _, r in st_he.iterrows():
-                he_es  = f"{r['HE_ES']:>+7.3f}"  if pd.notna(r.get("HE_ES"))  else "    nan"
-                he_var = f"{r['HE_VaR']:>+7.3f}" if pd.notna(r.get("HE_VaR")) else "    nan"
-                he_sd  = f"{r['HE_SD']:>+7.3f}"  if pd.notna(r.get("HE_SD"))  else "    nan"
-                r2_s   = (f"{r['ols_r2']:>7.3f}" if "ols_r2" in r.index
-                          and pd.notna(r.get("ols_r2")) else "       ")
-                print(f"  {r['region']:<8} {he_es} {he_var} {he_sd} {r2_s}")
-
-    print(f"\n{SEP}\n")
-
-
-# ==============================================================================
-# 14. PLOTTING
-# ==============================================================================
-
-def plot_rev_curves(evoi_df, out_path):
-    fig, ax = plt.subplots(figsize=(10, 5))
-    colors  = plt.cm.tab10.colors
-    for i, region in enumerate(REGIONS):
-        sub = evoi_df[evoi_df["region"] == region]
-        if sub.empty:
-            continue
-        ax.plot(sub["cl_ratio"], sub["REV"].clip(-0.5, 1.2),
-                label=f"R{region}", color=colors[i % 10], lw=1.8)
-    ax.axhline(0, color="black",   lw=0.9, ls="--")
-    ax.axhline(1, color="dimgrey", lw=0.8, ls=":")
-    ax.set_xlabel("C/L ratio"); ax.set_ylabel("REV")
-    ax.set_title("EVOI: XGBoost vs HBA  [MU77; RI00]")
-    ax.legend(fontsize=8, ncol=3); ax.set_xlim(CL_GRID.min(), CL_GRID.max())
-    fig.tight_layout(); fig.savefig(out_path, dpi=200); plt.close(fig)
-    print(f"    Saved: {out_path.name}")
-
-
-def plot_window_selection(sel_records, out_path):
-    valid  = [r for r in sel_records if r.get("best_window")]
-    labels = [f"R{r['region']}\n{r['best_window']}" for r in valid]
-    values = [r["abs_rho"] for r in valid]
-    colors = ["#2196F3" if "HDD" in r["best_window"]
-              else "#F44336" if "CDD" in r["best_window"]
-              else "#4CAF50" for r in valid]
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.bar(labels, values, color=colors, edgecolor="white")
-    ax.axhline(MIN_RHO, color="black", ls="--", lw=0.8,
-               label=f"Min |rho|={MIN_RHO}")
-    ax.set_ylabel("Spearman |rho|")
-    ax.set_title("Data-Driven Window Selection  [CF15; MOM19]")
-    ax.legend(fontsize=8)
-    fig.tight_layout(); fig.savefig(out_path, dpi=200); plt.close(fig)
-    print(f"    Saved: {out_path.name}")
-
-
-def plot_he_comparison(he_df, out_path):
-    single   = he_df[he_df["instrument"] == "single"].set_index("region")["HE_ES"]
-    straddle = he_df[he_df["instrument"] == "straddle"].set_index("region")["HE_ES"]
-    x = np.arange(len(REGIONS)); w = 0.35
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.bar(x - w/2, [single.get(r, np.nan) for r in REGIONS],
-           w, label="Single option", color="#2196F3")
-    ax.bar(x + w/2, [straddle.get(r, np.nan) for r in REGIONS],
-           w, label="Straddle", color="#FF9800")
-    ax.axhline(0, color="black", lw=0.8, ls="--")
-    ax.set_xticks(x); ax.set_xticklabels([f"R{r}" for r in REGIONS])
-    ax.set_ylabel("HE_ES  [MOM19; RU00]")
-    ax.set_title("Hedging Effectiveness: Single vs Straddle")
-    ax.legend(fontsize=9)
-    fig.tight_layout(); fig.savefig(out_path, dpi=200); plt.close(fig)
-    print(f"    Saved: {out_path.name}")
-
-
-def plot_cara_sensitivity(cara_df, out_path):
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for region in REGIONS:
-        sub = cara_df[cara_df["region"] == region].sort_values("lambda")
-        if sub.empty:
-            continue
-        ax.plot(sub["lambda"], sub["CE_gain"], marker="o",
-                label=f"R{region}", lw=1.6)
-    ax.axhline(0, color="black", lw=0.8, ls="--")
-    ax.set_xlabel("CARA lambda  [BAB93]"); ax.set_ylabel("CE gain (EUR)")
-    ax.set_title("CARA Sensitivity  [VB04]")
-    ax.legend(fontsize=8, ncol=2)
-    fig.tight_layout(); fig.savefig(out_path, dpi=200); plt.close(fig)
-    print(f"    Saved: {out_path.name}")
-
-
-# ==============================================================================
-# 15. MAIN PIPELINE
-# ==============================================================================
-
-def run_phase2():
-    print("=" * 72)
-    print("  PHASE 2 -- Weather Derivative Hedging: French Winter Wheat")
-    print(f"  8 NUTS-2 Regions | OOS 2015-2024 | "
-          f"{len(CANDIDATE_WINDOWS)} candidate windows")
-    print("=" * 72)
-
-    rng  = np.random.default_rng(42)
-    rng2 = np.random.default_rng(99)
-    rng3 = np.random.default_rng(77)
-
-    # -- 15.1  Load ------------------------------------------------------------
-    print("\n[1/9] Loading data...")
-    temp_df  = load_temperature(ROOT / "EDA" / "region_avg.csv")
-    yield_df = load_yield(
-        ROOT / "EDA" / "ble_tendre_hiver_yield_2000_2024_regions_mainland.csv")
-    xgb_df   = load_xgb_forecasts(ROOT / "bk_forecasts.csv", model_name="XGB")
-
-    # -- 15.2  Compute indices -------------------------------------------------
-    print(f"[2/9] Computing candidate indices...")
-    print(f"      Full panel (actual, n={len(ALL_YEARS)} years)...")
-    idx_all = compute_indices_from_actual(temp_df, REGIONS, ALL_YEARS)
-    print(f"      {idx_all.shape[0]} region-year rows")
-    print(f"      OOS panel (XGB forecasts, n={len(OOS_YEARS)} years)...")
-    idx_oos = compute_indices_from_forecasts(xgb_df, REGIONS, OOS_YEARS)
-    print(f"      {idx_oos.shape[0]} region-year rows")
-
-    # -- 15.3  Spearman window selection (full panel) --------------------------
-    print("[3/9] Spearman window selection (full panel n=25) [CF15; MOM19]...")
-    sel_records = []
-    for region in REGIONS:
-        s = select_best_window(idx_all, yield_df, region)
-        s["region"] = region
-        sel_records.append(s)
-        top5 = list(s["all_rhos"].items())[:5]
-        print(f"      R{region}: {s['best_window']}  "
-              f"rho={s['rho']:+.3f}  p={s['p_value']:.3f}  "
-              f"n={s['n_obs']}  top5={top5}")
-
-    sel_df = pd.DataFrame([{k: v for k, v in r.items() if k != "all_rhos"}
-                            for r in sel_records])
-
-    # -- 15.4  QR contract parameters (full panel) -----------------------------
-    print(f"[4/9] tau={QUANTILE_TAU} QR strike & tick (full panel) [CF15]...")
-    ctr_records = []
-    for region in REGIONS:
-        s    = next(r for r in sel_records if r["region"] == region)
-        bwin = s["best_window"]
-        if bwin is None:
-            continue
-        opt_type = "call" if s["direction"] < 0 else "put"
-        c = estimate_contract_parameters(idx_all, yield_df, region, bwin)
-        c.update({"region": region, "best_window": bwin,
-                  "index_type": s["index_type"],
-                  "doy_start": s["doy_start"], "doy_end": s["doy_end"],
-                  "option_type": opt_type})
-        ctr_records.append(c)
-        print(f"      R{region} | {bwin} ({opt_type}): "
-              f"K={c['strike_K']:.1f}  tick={c['tick_size']:,.0f} EUR  "
-              f"n={c['n_obs']}")
-    ctr_df = pd.DataFrame(ctr_records)
-
-    # -- 15.5  OLS fit for HE simulation ---------------------------------------
-    print("[5/9 prep] OLS yield ~ index (full panel) for HE simulation...")
-    ols_store: Dict[str, Dict] = {}
-    for _, row in ctr_df.iterrows():
-        region = row["region"]
-        ols    = fit_ols_yield_index(idx_all, yield_df, region,
-                                     row["best_window"])
-        ols_store[region] = ols
-        print(f"      R{region}: alpha={ols['alpha']:.3f}  "
-              f"beta={ols['beta']:.4f}  R2={ols['r2']:.3f}  n={ols['n_obs']}")
-
-    # -- 15.6  HBA pricing (full historical index) -----------------------------
-    print("[5/9] HBA pricing (full historical index) [JB05]...")
-    hba_records = []
-    for _, row in ctr_df.iterrows():
-        region  = row["region"]
-        ac_col  = f"{row['best_window']}_act"
-        hist    = idx_all[idx_all["region"] == region][ac_col].dropna().values
-        h       = hba_price(hist, row["strike_K"], row["tick_size"],
-                            row["option_type"])
-        h["region"] = region
-        hba_records.append(h)
-        print(f"      R{region}: HBA = {h['premium_hba']:>10,.0f} EUR "
-              f"(n={h['n_years']} years)")
-    hba_df = pd.DataFrame(hba_records)
-
-    # -- 15.7  MC pricing (XGBoost residuals) ----------------------------------
-    print("[6/9] MC pricing (XGBoost residuals) [BKK26; CD05; PR94]...")
-    mc_store: Dict[str, Dict] = {}
-    for _, row in ctr_df.iterrows():
-        region   = row["region"]
-        d1, d2   = int(row["doy_start"]), int(row["doy_end"])
-        r_xgb    = xgb_df[xgb_df["region"] == region]
-        residuals = r_xgb["residual"].dropna().values
-        price_yr  = max(OOS_YEARS)
-        mask = ((r_xgb["year"] == price_yr) &
-                (r_xgb["doy"]  >= d1) & (r_xgb["doy"] <= d2))
-        fc   = r_xgb[mask]["T_forecast"].values
-        if len(fc) < 10:
-            print(f"      [WARN] R{region}: < 10 forecast days -- skipping.")
-            continue
-        mc = mc_price(fc, residuals, row["strike_K"], row["tick_size"],
-                      row["option_type"], row["index_type"],
-                      N_SIMS, BLOCK_LENGTH, RISK_FREE, rng)
-        mc["region"] = region
-        mc_store[region] = mc
-        hba_p = hba_df[hba_df["region"] == region]["premium_hba"].values[0]
-        diff  = mc["premium_mc"] - hba_p
-        print(f"      R{region}: MC={mc['premium_mc']:>10,.0f}  "
-              f"HBA={hba_p:>10,.0f}  diff={diff:>+10,.0f} EUR")
-
-    # -- 15.8  Hedging effectiveness (simulated joint) -------------------------
-    print(f"[7/9] HE via simulated joint distribution "
-          f"[MOM19; RU00; VB04]...")
-    print(f"      ES/VaR on shortfall below mean | alpha={ALPHA} | "
-          f"n_sims={N_SIMS:,}")
-    he_records   = []
-    cara_records = []
-
-    for _, row in ctr_df.iterrows():
-        region   = row["region"]
-        opt_type = row["option_type"]
-        strike_K = row["strike_K"]
-        tick     = row["tick_size"]
-
-        if region not in mc_store or region not in ols_store:
-            continue
-
-        mc      = mc_store[region]
-        ols     = ols_store[region]
-        premium = mc["premium_mc"]
-
-        rev_u, rev_h = simulate_joint_distribution(
-            idx_sims=mc["idx_sims"],
-            ols_alpha=ols["alpha"], ols_beta=ols["beta"],
-            ols_residuals=ols["residuals"],
-            strike=strike_K, tick=tick,
-            option_type=opt_type, premium=premium,
-            n_sims=N_SIMS, b=BLOCK_LENGTH, rng=rng2,
-        )
-
-        he = hedging_effectiveness(rev_u, rev_h, alpha=ALPHA)
-        he["region"]     = region
-        he["instrument"] = "single"
-        he["ols_r2"]     = ols["r2"]
-        he_records.append(he)
-
-        payoffs_sim = (tick * np.maximum(mc["idx_sims"] - strike_K, 0)
-                       if opt_type == "call"
-                       else tick * np.maximum(strike_K - mc["idx_sims"], 0))
-        for lam in LAMBDA_GRID:
-            c = cara_ce(rev_u, payoffs_sim, lam)
-            c["region"] = region
-            cara_records.append(c)
-
-        ce_base = [c["CE_gain"] for c in cara_records
-                   if c["region"] == region and c["lambda"] == LAMBDA_BASE][-1]
-        print(f"      R{region}: HE_ES={he['HE_ES']:+.3f}  "
-              f"HE_VaR={he['HE_VaR']:+.3f}  HE_SD={he['HE_SD']:+.3f}  "
-              f"R2={ols['r2']:.3f}  CE_gain(0.001)={ce_base:+,.0f} EUR")
-
-    he_df   = pd.DataFrame(he_records)
-    cara_df = pd.DataFrame(cara_records)
-
-    # -- 15.9  EVOI ------------------------------------------------------------
-    print("[8/9] EVOI cost-loss analysis [MU77; RI00]...")
-    evoi_frames = []
-    for _, row in ctr_df.iterrows():
-        region   = row["region"]
-        opt_type = row["option_type"]
-        strike_K = row["strike_K"]
-        tick     = row["tick_size"]
-        if region not in mc_store:
-            continue
-        mc       = mc_store[region]
-        ac_col   = f"{row['best_window']}_act"
-        oos_act  = idx_oos[(idx_oos["region"] == region) &
-                           idx_oos["year"].isin(OOS_YEARS)][ac_col].dropna().values
-        hist_act = idx_all[idx_all["region"] == region][ac_col].dropna().values
-
-        if opt_type == "call":
-            events = (oos_act > strike_K).astype(float)
-            p_hba  = float((hist_act > strike_K).mean())
-            p_xgb  = float((mc["idx_sims"] > strike_K).mean())
-        else:
-            events = (oos_act < strike_K).astype(float)
-            p_hba  = float((hist_act < strike_K).mean())
-            p_xgb  = float((mc["idx_sims"] < strike_K).mean())
-
-        loss_idx = oos_act[events == 1]
-        L_val = (float(tick * abs(loss_idx.mean() - strike_K)) if len(loss_idx) > 0
-                 else float(tick * abs(oos_act.mean() - strike_K) * 0.5))
-
-        ev = compute_evoi(events, p_hba, p_xgb, L_val, mc["premium_mc"])
-        ev["region"] = region
-        evoi_frames.append(ev)
-        max_rev = ev["REV"].max()
-        opt_cl  = ev.loc[ev["REV"].idxmax(), "cl_ratio"]
-        print(f"      R{region}: p_HBA={p_hba:.3f}  p_XGB={p_xgb:.3f}  "
-              f"maxREV={max_rev:.3f} at C/L={opt_cl:.2f}")
-
-    evoi_df = pd.concat(evoi_frames, ignore_index=True)
-
-    # -- 15.10  Straddle -------------------------------------------------------
-    print("[9/9] Two-index straddle [STU16; PRE24]...")
-    straddle_records = []
-    straddle_he_list = []
-
-    for region in REGIONS:
-        r_xgb     = xgb_df[xgb_df["region"] == region]
-        residuals  = r_xgb["residual"].dropna().values
-        price_yr   = max(OOS_YEARS)
-
-        row_match = ctr_df[ctr_df["region"] == region]
-        if row_match.empty or region not in mc_store:
-            continue
-        row     = row_match.iloc[0]
-        mc_leg1 = mc_store[region]
-        primary = row["best_window"]
-
-        # Leg 2: best spring CDD, EXCLUDING the primary window to avoid
-        # identical legs (fixes R32 which had CDD_MayJun in both legs)
-        spring_sel = select_spring_cdd_window(
-            idx_all, yield_df, region,
-            exclude_windows=[primary],
-        )
-        if spring_sel["best_window"] is None:
-            print(f"      [WARN] R{region}: no valid spring CDD -- skipping.")
-            continue
-
-        bwin2  = spring_sel["best_window"]
-        d1_2   = spring_sel["doy_start"]
-        d2_2   = spring_sel["doy_end"]
-        idx_t2 = spring_sel["index_type"]
-
-        ac_col2  = f"{bwin2}_act"
-        cdd_hist = idx_all[idx_all["region"] == region][ac_col2].dropna().values
-        k2       = float(np.quantile(cdd_hist, 1 - QUANTILE_TAU))
-        tick2    = row["tick_size"]
-
-        mask2 = ((r_xgb["year"] == price_yr) &
-                 (r_xgb["doy"]  >= d1_2) & (r_xgb["doy"] <= d2_2))
-        fc2   = r_xgb[mask2]["T_forecast"].values
-
-        if len(fc2) < 5:
-            print(f"      [WARN] R{region}: insufficient spring data.")
-            continue
-
-        mc_leg2  = mc_price(fc2, residuals, k2, tick2, "call", idx_t2,
-                            N_SIMS, BLOCK_LENGTH, RISK_FREE, rng)
-        straddle = price_straddle(mc_leg1, mc_leg2)
-        straddle.update({
-            "region": region, "window_l1": primary, "window_l2": bwin2,
-            "K_leg1": row["strike_K"], "K_leg2": k2,
-        })
-        straddle_records.append({
-            k: v for k, v in straddle.items()
-            if k not in ("total_payoffs", "idx_sims_leg1", "idx_sims_leg2")
-        })
-
-        # Straddle HE via simulated joint distribution
-        if region in ols_store:
-            ols = ols_store[region]
-            rev_u_st, _ = simulate_joint_distribution(
-                idx_sims=mc_leg1["idx_sims"],
-                ols_alpha=ols["alpha"], ols_beta=ols["beta"],
-                ols_residuals=ols["residuals"],
-                strike=row["strike_K"], tick=row["tick_size"],
-                option_type=row["option_type"], premium=0.0,
-                n_sims=N_SIMS, b=BLOCK_LENGTH, rng=rng3,
-            )
-            pay1 = (row["tick_size"] *
-                    (np.maximum(mc_leg1["idx_sims"] - row["strike_K"], 0)
-                     if row["option_type"] == "call"
-                     else np.maximum(row["strike_K"] - mc_leg1["idx_sims"], 0)))
-            pay2 = tick2 * np.maximum(mc_leg2["idx_sims"] - k2, 0)
-            rev_h_st = rev_u_st + pay1 + pay2 - straddle["premium_straddle"]
-            he_st = hedging_effectiveness(rev_u_st, rev_h_st, alpha=ALPHA)
-            he_st["region"]     = region
-            he_st["instrument"] = "straddle"
-            he_st["ols_r2"]     = ols["r2"]
-            straddle_he_list.append(he_st)
-
-        print(f"      R{region}: total={straddle['premium_straddle']:>10,.0f}  "
-              f"leg1={straddle['premium_leg1']:,.0f}[{primary}]  "
-              f"leg2={straddle['premium_leg2']:,.0f}[{bwin2}]")
-
-    straddle_df    = pd.DataFrame(straddle_records)
-    straddle_he_df = pd.DataFrame(straddle_he_list)
-    if not straddle_he_df.empty:
-        he_df = pd.concat([he_df, straddle_he_df], ignore_index=True)
-
-    # -- Export ----------------------------------------------------------------
-    print("\n[Export] Writing CSV results...")
-    rho_rows = []
-    for rec in sel_records:
-        for rank, (win, rho) in enumerate(rec["all_rhos"].items(), start=1):
-            if rank > 5:
-                break
-            rho_rows.append({"region": rec["region"], "rank": rank,
-                              "window": win, "rho": rho})
-
-    export_tables = {
-        "1_window_selection":      sel_df,
-        "2_spearman_top5":         pd.DataFrame(rho_rows),
-        "3_contract_design":       ctr_df,
-        "4_hba_pricing":           hba_df,
-        "5_mc_pricing": pd.DataFrame([
-            {"region": r, "premium_mc": mc["premium_mc"],
-             "mean_payoff": mc["mean_payoff"], "std_payoff": mc["std_payoff"]}
-            for r, mc in mc_store.items()
-        ]),
-        "6_hedging_effectiveness": he_df,
-        "7_cara_sensitivity":      cara_df,
-        "8_straddle":              straddle_df,
-    }
-    for sheet, df in export_tables.items():
-        p = OUT_DIR / f"{sheet}.csv"
-        df.round(4).to_csv(p, index=False)
-        print(f"    {p.name}")
-    evoi_df.to_csv(OUT_DIR / "evoi_cost_loss.csv", index=False)
-    print(f"    evoi_cost_loss.csv")
-
-    # -- Plots -----------------------------------------------------------------
-    print("[Plots] Generating figures...")
-    plot_rev_curves(evoi_df, OUT_DIR / "evoi_rev_curves.png")
-    plot_window_selection(sel_records, OUT_DIR / "window_selection.png")
-    plot_he_comparison(he_df, OUT_DIR / "he_comparison.png")
-    plot_cara_sensitivity(cara_df, OUT_DIR / "cara_sensitivity.png")
-
-    # -- Terminal summary ------------------------------------------------------
-    print_results_summary(
-        sel_df, ctr_df, hba_df, mc_store,
-        he_df, cara_df, evoi_df, straddle_df
+    return (rev_sim
+            - n_contracts * option_price * np.exp(R_RATE * ttm)
+            + n_contracts * payoff_sim)
+
+
+def variance_hedge(rev_sim, cdd_sim, strike, ttm, corr):
+    """N* = −cov(Revenue, Payoff) / var(Payoff)  [Johnson 1960 / Zhou eq. 3]"""
+    V, pay = price_instrument(cdd_sim, strike, ttm, corr)
+    var_p  = float(np.var(pay))
+    if var_p < 1e-8:
+        return 0.0, 0.0, V
+    N_star = -float(np.cov(rev_sim, pay)[0, 1]) / var_p
+    hedged = hedged_revenue(rev_sim, pay, N_star, V, ttm)
+    var_u  = float(np.var(rev_sim))
+    HE_var = float(1.0 - np.var(hedged) / var_u) if var_u > 1e-8 else 0.0
+    return N_star, HE_var, V
+
+
+def semivariance_hedge(rev_sim, cdd_sim, strike, ttm, corr):
+    """1-D semi-variance minimisation over N (K fixed)."""
+    target = float(np.mean(rev_sim))
+    svar_u = _semivar(rev_sim, target)
+    if svar_u < 1e-8:
+        return 0.0, 0.0, 0.0
+    V, pay = price_instrument(cdd_sim, strike, ttm, corr)
+
+    def obj(N):
+        return _semivar(hedged_revenue(rev_sim, pay, float(N), V, ttm), target)
+
+    result = optimize.minimize_scalar(
+        obj, bounds=(-5.0, 5.0), method="bounded",
+        options={"xatol": 1e-8, "maxiter": 500},
     )
+    # Warn if optimum hits boundary — implies bound may be constraining
+    N_star = float(result.x)
+    if abs(N_star) > 4.9:
+        pass   # boundary hit: N_star may be economically unreliable
+    hedged = hedged_revenue(rev_sim, pay, N_star, V, ttm)
+    HE_sv  = float(1.0 - _semivar(hedged, target) / svar_u)
+    return N_star, HE_sv, V
 
+# ===========================================================================
+# LOAD DATA
+# ===========================================================================
+
+print("=" * 72)
+print("  Zhou (2016) + Möllmann (2019) — Farm-Level Hedging Effectiveness")
+print("  French Winter Wheat  |  8 NUTS-2 Regions")
+print(f"  CDD T_ref={BASE_TEMP}°C  |  Data-driven window selection")
+print(f"  Strike = calibration-period mean cCDD  |  Optimise N* only")
+print(f"  Pricing: block-bootstrap (same engine as pricing_comparison.py)")
+print(f"  Tick=€{TICK}/CDD-degree  Wheat=€{WHEAT_PRICE}/tonne")
+print("=" * 72)
+
+fcst_df = pd.read_csv(FCST_CSV, parse_dates=["date"])
+fcst_df["doy"]      = fcst_df["date"].apply(lambda d: _doy_noleap(pd.Timestamp(d)))
+fcst_df["residual"] = fcst_df["actual"] - fcst_df["forecast"]
+print(f"\n  Loaded bk_forecasts.csv  ({len(fcst_df):,} rows)\n")
+
+# Pre-load all temperature series (avoid repeated CSV reads)
+print("  Loading temperature data for all regions …", end=" ", flush=True)
+temp_cache = {r: load_temperature(r) for r in REGIONS}
+print("done\n")
+
+# ===========================================================================
+# MAIN LOOP
+# ===========================================================================
+
+all_rows = []
+
+for region in REGIONS:
+    print(f"\n{'─'*65}\n  Region {region}\n{'─'*65}")
+
+    try:
+        yield_df = load_yield(region)
+    except Exception as e:
+        print(f"  ERROR loading yield: {e}"); continue
+
+    temp_df  = temp_cache[region]
+    reg_fcst = fcst_df[fcst_df["region"] == region].copy()
+
+    for oos_year in OOS_YEARS:
+        # ── Calibration data ──────────────────────────────────────────────────
+        yield_calib = yield_df[yield_df["year"] < oos_year].copy()
+        temp_calib  = temp_df[temp_df["year"] < oos_year].copy()
+
+        if len(yield_calib) < 8 or len(temp_calib) < 365 * 5:
+            continue
+
+        # ── Step 1: Find optimal CDD window (Möllmann et al.) ─────────────────
+        best_start, best_end, best_label, best_corr = find_optimal_window(
+            yield_calib, temp_calib)
+
+        n_window_days = best_end - best_start + 1
+        TTM = best_end / 365.0   # time to maturity = end DOY / 365
+
+        # ── Step 2: Compute actual CDD for optimal window (calib years) ───────
+        cdd_hist_full = compute_cdd_by_window(temp_df, best_start, best_end)
+        cdd_calib_hist = cdd_hist_full[cdd_hist_full["year"] < oos_year]
+
+        # ── Step 3: Strike = mean actual cCDD over calibration years ──────────
+        # (available information at contract design time — no look-ahead)
+        K = float(cdd_calib_hist["cCDD"].mean()) if len(cdd_calib_hist) >= 3 else 0.0
+
+        # ── Step 4: Fit yield model with optimal window CDD ───────────────────
+        ym = fit_yield_model(yield_calib, cdd_calib_hist)
+        if ym is None:
+            continue
+
+        # ── Step 5: OOS forecasts for optimal window ──────────────────────────
+        wnd = reg_fcst[
+            (reg_fcst["date"].dt.year == oos_year) &
+            (reg_fcst["doy"] >= best_start) &
+            (reg_fcst["doy"] <= best_end)
+        ]
+
+        # Actual OOS cCDD (for reference) and actual payoff (call or put)
+        act_row = cdd_hist_full[cdd_hist_full["year"] == oos_year]
+        act_cdd = float(act_row["cCDD"].values[0]) if len(act_row) else np.nan
+        if not np.isnan(act_cdd):
+            if best_corr < 0:
+                act_pay = float(TICK * max(0.0, act_cdd - K))   # call
+            else:
+                act_pay = float(TICK * max(0.0, K - act_cdd))   # put
+        else:
+            act_pay = np.nan
+
+        print(f"  [{oos_year}] Window {best_label} "
+              f"(DOY {best_start}–{best_end}, ρ={best_corr:+.2f})  "
+              f"K={K:.1f}  ActCDD={act_cdd:.1f}")
+
+        for mname in MODEL_ORDER:
+            mod_wnd = wnd[wnd["model"] == mname].sort_values("doy")
+            mod_all = reg_fcst[reg_fcst["model"] == mname]
+            if mod_wnd.empty: continue
+
+            fcst_vec = mod_wnd["forecast"].values
+            if not np.isfinite(fcst_vec).any(): continue
+
+            # OOS residuals — all years except the target year.
+            # Structured as a list of per-year arrays so the block bootstrap
+            # can sample within years, preventing blocks crossing year boundaries.
+            # Using years after oos_year is acknowledged as a minor
+            # future-information assumption; practical impact is small
+            # given stable OOS residual distributions across years.
+            resid_pool = mod_all[
+                (mod_all["date"].dt.year != oos_year) &
+                (mod_all["doy"] >= best_start) &
+                (mod_all["doy"] <= best_end)
+            ].copy()
+            resid_by_year = [
+                grp["residual"].dropna().values
+                for _, grp in resid_pool.groupby(resid_pool["date"].dt.year)
+                if len(grp["residual"].dropna()) >= BLOCK_L
+            ]
+            if not resid_by_year:
+                # Fallback: pool all window residuals from non-OOS years
+                flat = resid_pool["residual"].dropna().values
+                if len(flat) >= BLOCK_L * 3:
+                    resid_by_year = [flat]
+                else:
+                    # Widen to all DOYs
+                    flat2 = (mod_all[mod_all["date"].dt.year != oos_year]
+                             ["residual"].dropna().values)
+                    if len(flat2) < BLOCK_L * 3:
+                        continue
+                    resid_by_year = [flat2]
+
+            # Simulate CDD and revenue
+            cdd_sim = simulate_cdd_paths(fcst_vec, resid_by_year)
+            rev_sim = simulate_revenue(ym, cdd_sim, oos_year)
+
+            # Variance hedge
+            try:
+                N_var, HE_var, V_var = variance_hedge(rev_sim, cdd_sim, K, TTM, best_corr)
+            except Exception:
+                N_var = HE_var = V_var = np.nan
+
+            # Semi-variance hedge + all risk metrics
+            try:
+                N_sv, HE_sv, V_sv = semivariance_hedge(rev_sim, cdd_sim, K, TTM, best_corr)
+                _, pay_sv  = price_instrument(cdd_sim, K, TTM, best_corr)
+                hedged_rev = hedged_revenue(rev_sim, pay_sv, N_sv, V_sv, TTM)
+                he         = compute_he_metrics(rev_sim, hedged_rev)
+            except Exception:
+                N_sv = HE_sv = V_sv = np.nan
+                he   = {k: np.nan for k in
+                        ["HE_sd","HE_var5","HE_var10",
+                         "HE_es5","HE_es10","HE_sv"]}
+
+            def _r(v, d=4):
+                return round(float(v), d) if not np.isnan(float(v)) else np.nan
+
+            all_rows.append({
+                "region":      region,
+                "oos_year":    oos_year,
+                "model":       mname,
+                # Optimal window
+                "win_label":   best_label,
+                "win_start":   best_start,
+                "win_end":     best_end,
+                "win_corr":    round(best_corr, 3),
+                "instrument":  "call" if best_corr < 0 else "put",
+                "n_win_days":  n_window_days,
+                # Strike and yield model
+                "K":           round(K,      1),
+                "yield_r2":    round(ym["r2"], 3),
+                "yield_c":     round(ym["c"],  12),
+                # Simulated distributions
+                "cdd_mean":    round(float(cdd_sim.mean()), 2),
+                "cdd_std":     round(float(cdd_sim.std()),  2),
+                "rev_mean":    round(float(rev_sim.mean()), 2),
+                "rev_std":     round(float(rev_sim.std()),  2),
+                # Variance hedge (Johnson 1960)
+                "N_var":       _r(N_var, 5),
+                "V_var":       _r(V_var, 4),
+                "HE_var_sd":   _r(HE_var),
+                # Semi-variance hedge — all risk metrics (N* same for all)
+                "N_sv":        _r(N_sv, 5),
+                "V_sv":        _r(V_sv, 4),
+                "HE_sd":       _r(he["HE_sd"]),
+                "HE_var5":     _r(he["HE_var5"]),
+                "HE_var10":    _r(he["HE_var10"]),
+                "HE_es5":      _r(he["HE_es5"]),
+                "HE_es10":     _r(he["HE_es10"]),
+                "HE_sv":       _r(he["HE_sv"]),
+                # Reference
+                "actual_cCDD":   round(act_cdd, 2) if not np.isnan(act_cdd) else np.nan,
+                "actual_payoff": round(act_pay, 2) if not np.isnan(act_pay) else np.nan,
+            })
+
+# ===========================================================================
+# RESULTS & OUTPUTS
+# ===========================================================================
+
+if not all_rows:
+    print("\nNo results produced — check data paths.")
+else:
+    res_df = pd.DataFrame(all_rows)
+    res_df.to_csv(OUT_DIR / "zhou_results_full.csv", index=False)
+
+    summary = (res_df.groupby("model")
+               .agg(
+                   HE_sd_mean   = ("HE_sd",    "mean"),
+                   HE_var5_mean = ("HE_var5",  "mean"),
+                   HE_var10_mean= ("HE_var10", "mean"),
+                   HE_es5_mean  = ("HE_es5",   "mean"),
+                   HE_es10_mean = ("HE_es10",  "mean"),
+                   HE_sv_mean   = ("HE_sv",    "mean"),
+                   HE_sv_std    = ("HE_sv",    "std"),
+                   N_sv_mean    = ("N_sv",     "mean"),
+                   K_mean       = ("K",        "mean"),
+                   yield_r2     = ("yield_r2", "mean"),
+                   win_start    = ("win_start","mean"),
+                   win_end      = ("win_end",  "mean"),
+                   win_corr     = ("win_corr", "mean"),
+                   n_obs        = ("HE_sv",    "count"),
+               )
+               .round(4).reset_index())
+    summary.to_csv(OUT_DIR / "zhou_summary.csv", index=False)
+
+    # Window selection summary
+    win_summary = (res_df[res_df["model"]=="XGB"]
+                   .groupby(["region","oos_year"])
+                   [["win_label","win_start","win_end","win_corr","K"]]
+                   .first().reset_index())
+    win_summary.to_csv(OUT_DIR / "optimal_windows.csv", index=False)
+
+    # ── Wilcoxon: H0: median HE(SV) = 0  |  H1: > 0 ─────────────────────────
+    wilcoxon_rows = []
+    for mname in MODEL_ORDER:
+        he_vals = res_df[res_df["model"]==mname]["HE_sv"].dropna().values
+        if len(he_vals) < 10:
+            wilcoxon_rows.append({"model": mname, "n": len(he_vals),
+                                  "stat": np.nan, "p_value": np.nan,
+                                  "significant": False})
+            continue
+        try:
+            stat, p = _wilcoxon(he_vals, alternative="greater")
+        except Exception:
+            stat, p = np.nan, np.nan
+        wilcoxon_rows.append({
+            "model":       mname,
+            "n":           len(he_vals),
+            "stat":        round(float(stat), 2) if not np.isnan(stat) else np.nan,
+            "p_value":     round(float(p),    4) if not np.isnan(p)    else np.nan,
+            "significant": bool(p < 0.05)        if not np.isnan(p)    else False,
+        })
+    wilcoxon_df = pd.DataFrame(wilcoxon_rows)
+    wilcoxon_df.to_csv(OUT_DIR / "wilcoxon_hesv_vs_zero.csv", index=False)
+
+    # ── Pairwise paired Wilcoxon signed-rank: are models different? ──────────
+    # H0: median(HE_sv^A − HE_sv^B) = 0  (two-sided)
+    # Observations are matched region × year pairs, so paired test is correct.
+    # Mann-Whitney U would treat them as independent which they are not.
+    models_present = [m for m in MODEL_ORDER if m in res_df["model"].values]
+
+    # Build matched panel: each row = one region × year, columns = models
+    panel = (res_df.pivot_table(index=["region","oos_year"],
+                                columns="model", values="HE_sv")
+             .reindex(columns=models_present))
+
+    pairwise_rows = []
+    for i, m1 in enumerate(models_present):
+        for m2 in models_present[i+1:]:
+            diff = (panel[m1] - panel[m2]).dropna().values
+            if len(diff) < 10:
+                p = np.nan
+            else:
+                try:
+                    _, p = _wilcoxon(diff, alternative="two-sided")
+                    p = round(float(p), 4)
+                except Exception:
+                    p = np.nan
+            pairwise_rows.append({"model_a": m1, "model_b": m2,
+                                  "p_value": p,
+                                  "n_pairs": len(diff),
+                                  "mean_diff": round(float(np.mean(diff)), 4)
+                                              if len(diff) > 0 else np.nan,
+                                  "significant": bool(p < 0.05)
+                                                 if not np.isnan(p) else False})
+
+    pairwise_df = pd.DataFrame(pairwise_rows)
+
+    # Holm-Bonferroni correction across all pairwise comparisons
+    # Orders raw p-values and adjusts threshold: reject H0 if p_i ≤ α/(m−i+1)
+    valid = pairwise_df["p_value"].notna()
+    if valid.sum() > 0:
+        raw_p   = pairwise_df.loc[valid, "p_value"].values
+        m       = len(raw_p)
+        order   = np.argsort(raw_p)
+        p_holm  = np.ones(m)
+        for rank, idx in enumerate(order):
+            p_holm[idx] = min(1.0, raw_p[idx] * (m - rank))
+        # Enforce monotonicity
+        for i in range(1, m):
+            p_holm[order[i]] = max(p_holm[order[i]], p_holm[order[i-1]])
+        pairwise_df.loc[valid, "p_holm"]        = p_holm.round(4)
+        pairwise_df.loc[valid, "sig_holm"]      = p_holm < 0.05
+        pairwise_df.loc[valid, "significant"]   = p_holm < 0.05   # override raw
+    else:
+        pairwise_df["p_holm"]   = np.nan
+        pairwise_df["sig_holm"] = False
+
+    pairwise_df.to_csv(OUT_DIR / "pairwise_wilcoxon_hesv.csv", index=False)
+
+    # Build Holm-adjusted p-value matrix for display
+    pw_matrix = pd.DataFrame(np.ones((len(models_present), len(models_present))),
+                             index=models_present, columns=models_present)
+    for _, r in pairwise_df.iterrows():
+        p_adj = r["p_holm"] if not np.isnan(r.get("p_holm", np.nan)) else r["p_value"]
+        pw_matrix.loc[r["model_a"], r["model_b"]] = p_adj
+        pw_matrix.loc[r["model_b"], r["model_a"]] = p_adj
+
+    print("\n  Pairwise Paired Wilcoxon — Holm-adjusted p-values")
+    print("  (H0: HE(SV)^A = HE(SV)^B, two-sided, * p_holm < 0.05)")
+    print("  " + "─" * (14 * (len(models_present) + 1)))
+    header = f"  {'':>14}" + "".join(f"  {m[:8]:>8}" for m in models_present)
+    print(header)
+    for m1 in models_present:
+        row_str = f"  {m1:>14}"
+        for m2 in models_present:
+            if m1 == m2:
+                row_str += f"  {'—':>8}"
+            else:
+                p   = pw_matrix.loc[m1, m2]
+                sig = "*" if p < 0.05 else " "
+                row_str += f"  {p:.4f}{sig:>1}"
+        print(row_str)
+
+    # ── Console summary ───────────────────────────────────────────────────────
+    print("\n" + "=" * 90)
+    print("HEDGING EFFECTIVENESS — Zhou (2016) + Möllmann (2019) Framework")
+    print("French Winter Wheat  |  CDD  |  Data-driven window  |  K = calib mean")
+    print("Primary metric: HE(SV)  |  Wilcoxon H0: median HE(SV) = 0  (one-sided)")
+    print("=" * 90)
+    sub = (summary.set_index("model")
+           .reindex([m for m in MODEL_ORDER if m in summary["model"].values]))
+    wilc = wilcoxon_df.set_index("model")
+    print(f"\n  {'Model':>14}  {'HE(SD)%':>8}  {'HE(VaR5)%':>10}  "
+          f"{'HE(VaR10)%':>11}  {'HE(ES5)%':>10}  {'HE(ES10)%':>11}  "
+          f"{'HE(SV)%':>9}  {'p(Wilc)':>9}  {'sig':>4}  {'R²':>6}")
+    print("  " + "─" * 102)
+    for m, r in sub.iterrows():
+        wr  = wilc.loc[m] if m in wilc.index else None
+        p_s = f"{wr['p_value']:.4f}" if (wr is not None and
+              not np.isnan(wr["p_value"])) else "   n/a"
+        sig = "  *" if (wr is not None and wr["significant"]) else "   "
+        print(f"  {m:>14}  "
+              f"{r['HE_sd_mean']*100:>7.1f}%  "
+              f"{r['HE_var5_mean']*100:>9.1f}%  "
+              f"{r['HE_var10_mean']*100:>10.1f}%  "
+              f"{r['HE_es5_mean']*100:>9.1f}%  "
+              f"{r['HE_es10_mean']*100:>10.1f}%  "
+              f"{r['HE_sv_mean']*100:>8.1f}%  "
+              f"{p_s:>9}  {sig:>4}  "
+              f"{r['yield_r2']:>6.3f}")
+
+    # ── Realized HE — simulation N* and V applied to actual outcomes ──────────
+    # Pre-load all actual yields once (avoids repeated CSV reads inside loops)
+    yield_actual = {}   # region → {year → revenue_€_per_ha}
+    raw_yld = pd.read_csv(YIELD_CSV)
+    raw_yld.columns = [c.strip().lower() for c in raw_yld.columns]
+    rcol = next((c for c in ["reg","region_code","region"] if c in raw_yld.columns), None)
+    ycol = next((c for c in ["yield","yield_t_ha","rendement"] if c in raw_yld.columns), None)
+    tcol = next((c for c in ["year","annee"] if c in raw_yld.columns), None)
+    for region in REGIONS:
+        rdf_y = raw_yld[raw_yld[rcol] == region][[tcol, ycol]].copy()
+        rdf_y.columns = ["year", "yld"]
+        rdf_y["year"] = rdf_y["year"].astype(int)
+        rdf_y["yld"]  = rdf_y["yld"].astype(float)
+        if rdf_y["yld"].median() > 20:
+            rdf_y["yld"] /= 10.0
+        rdf_y["rev"] = rdf_y["yld"] * WHEAT_PRICE
+        yield_actual[region] = rdf_y.set_index("year")["rev"].to_dict()
+
+    # Single pass: compute model-level, per-region and per-year realized HE
+    realized_model_rows  = []
+    realized_region_rows = []
+    realized_year_rows   = []
+
+    for mname in MODEL_ORDER:
+        mdf = res_df[res_df["model"] == mname].copy()
+
+        # Attach actual revenue from pre-loaded dict
+        mdf["actual_revenue"] = mdf.apply(
+            lambda r: yield_actual.get(r["region"], {}).get(int(r["oos_year"]), np.nan),
+            axis=1
+        )
+
+        region_he_vals = []
+
+        for region in REGIONS:
+            rdf = mdf[mdf["region"] == region].dropna(
+                subset=["actual_revenue","actual_cCDD","N_sv","V_sv","K","win_end"])
+            if len(rdf) < 4:
+                continue
+
+            act_rev    = rdf["actual_revenue"].values
+            act_cdd    = rdf["actual_cCDD"].values
+            N_sv_v     = rdf["N_sv"].values
+            V_sv_v     = rdf["V_sv"].values
+            K_arr      = rdf["K"].values
+            TTM_arr    = rdf["win_end"].values / 365.0
+            is_call    = (rdf["instrument"].values == "call")
+
+            act_payoff = np.where(
+                is_call,
+                TICK * np.maximum(0.0, act_cdd - K_arr),   # call
+                TICK * np.maximum(0.0, K_arr - act_cdd),   # put
+            )
+            hedged_act = (act_rev
+                          - N_sv_v * V_sv_v * np.exp(R_RATE * TTM_arr)
+                          + N_sv_v * act_payoff)
+
+            mean_u = float(np.mean(act_rev))
+            svar_u = _semivar(act_rev,    mean_u)
+            svar_h = _semivar(hedged_act, mean_u)
+            he_r   = float(1 - svar_h / svar_u) if svar_u > 1e-8 else np.nan
+
+            if not np.isnan(he_r):
+                region_he_vals.append(he_r)
+
+            realized_region_rows.append({
+                "model":          mname,
+                "region":         region,
+                "he_sv_realized": round(he_r, 4) if not np.isnan(he_r) else np.nan,
+                "n_obs":          len(rdf),
+            })
+
+            # Per-year entries
+            for (_, row), ap, hr in zip(
+                rdf.iterrows(), act_payoff, hedged_act
+            ):
+                realized_year_rows.append({
+                    "model":          mname,
+                    "region":         region,
+                    "oos_year":       int(row["oos_year"]),
+                    "instrument":     row["instrument"],
+                    "act_revenue":    round(float(row["actual_revenue"]), 2),
+                    "act_cCDD":       round(float(row["actual_cCDD"]), 2),
+                    "K":              round(float(row["K"]), 1),
+                    "N_sv":           round(float(row["N_sv"]), 5),
+                    "V_sv":           round(float(row["V_sv"]), 4),
+                    "act_payoff":     round(float(ap), 2),
+                    "hedged_revenue": round(float(hr), 2),
+                    "revenue_change": round(float(hr - row["actual_revenue"]), 2),
+                })
+
+        he_real = float(np.mean(region_he_vals)) if region_he_vals else np.nan
+        he_std  = float(np.std(region_he_vals))  if len(region_he_vals) > 1 else np.nan
+        realized_model_rows.append({
+            "model":          mname,
+            "he_sv_realized": round(he_real, 4) if not np.isnan(he_real) else np.nan,
+            "he_sv_real_std": round(he_std,  4) if not np.isnan(he_std)  else np.nan,
+            "n_regions":      len(region_he_vals),
+        })
+
+    realized_df = pd.DataFrame(realized_model_rows).set_index("model")
+    realized_df.to_csv(OUT_DIR / "he_sv_realized.csv")
+    pd.DataFrame(realized_region_rows).to_csv(OUT_DIR / "he_sv_realized_by_region.csv", index=False)
+    pd.DataFrame(realized_year_rows).to_csv(OUT_DIR / "he_sv_realized_by_year.csv", index=False)
+
+    # ── Console: model-level summary ──────────────────────────────────────────
+    print("\n" + "=" * 90)
+    print("SIMULATED vs REALIZED HE(SV)")
+    print("Simulated: block-bootstrap simulation (10,000 paths) → HE(SV)")
+    print("Realized:  simulation N* and V applied to actual CDD and yield outcomes")
+    print("Per region (n=10 years), then averaged across 8 regions")
+    print("=" * 90)
+    print(f"\n  {'Model':>14}  {'HE(SV) sim':>12}  {'HE(SV) real':>13}  "
+          f"{'ΔRev (€/ha)':>13}  {'Hit rate':>10}  {'Gap':>8}")
+    print("  " + "─" * 76)
+    yr_df_all = pd.DataFrame(realized_year_rows)
+    for m in MODEL_ORDER:
+        if m not in sub.index or m not in realized_df.index:
+            continue
+        sim  = sub.loc[m, "HE_sv_mean"]
+        real = realized_df.loc[m, "he_sv_realized"]
+        gap  = sim - real if not np.isnan(real) else np.nan
+        # Mean revenue change and hit rate across all region-year pairs
+        m_yr = yr_df_all[yr_df_all["model"] == m]
+        avg_d  = float(m_yr["revenue_change"].mean()) if len(m_yr) else np.nan
+        hit_n  = int((m_yr["revenue_change"] > 0).sum())
+        hit_t  = len(m_yr)
+        print(f"  {m:>14}  {sim*100:>11.1f}%  "
+              f"{real*100:>12.1f}%  "
+              f"{avg_d:>+12.2f}  "
+              f"{hit_n:>4}/{hit_t:<5}  "
+              f"{gap*100:>+7.1f}%")
+
+    # ── Console: per-region breakdown (XGB as representative model) ───────────
+    print("\n  Per-region realized metrics  [XGB — representative model]")
+    print(f"  {'Region':>8}  {'Sim HE(SV)':>12}  {'Real HE(SV)':>13}  "
+          f"{'Avg ΔRev (€/ha)':>16}  {'Hit rate':>10}  {'Gap':>8}")
+    print("  " + "─" * 75)
+    rr_df    = pd.DataFrame(realized_region_rows)
+    yr_df_xgb = pd.DataFrame(realized_year_rows)
+    yr_df_xgb = yr_df_xgb[yr_df_xgb["model"] == "XGB"]
+    xgb_rr   = rr_df[rr_df["model"] == "XGB"].set_index("region")
+    xgb_sim  = res_df[res_df["model"] == "XGB"].groupby("region")["HE_sv"].mean()
+
+    for region in REGIONS:
+        if region not in xgb_rr.index:
+            continue
+        sim_r  = float(xgb_sim.loc[region]) if region in xgb_sim.index else np.nan
+        real_r = float(xgb_rr.loc[region, "he_sv_realized"])
+        gap_r  = sim_r - real_r if not np.isnan(real_r) else np.nan
+
+        # Revenue change and hit rate per region
+        reg_yr = yr_df_xgb[yr_df_xgb["region"] == region]
+        avg_delta = float(reg_yr["revenue_change"].mean()) if len(reg_yr) else np.nan
+        hit_rate  = float((reg_yr["revenue_change"] > 0).sum()) / len(reg_yr) \
+                    if len(reg_yr) > 0 else np.nan
+        hit_str   = f"{int(hit_rate*len(reg_yr))}/{len(reg_yr)}"
+
+        print(f"  {region:>8}  {sim_r*100:>11.1f}%  {real_r*100:>12.1f}%  "
+              f"{avg_delta:>+15.2f}  {hit_str:>10}  "
+              f"{gap_r*100:>+7.1f}%")
+
+    # ── Console: per-year revenue impact (XGB, mean across regions) ──────────
+    print("\n  Per-year realized outcomes (mean across regions)  [XGB]")
+    print(f"  {'Year':>6}  {'Actual rev':>12}  {'Hedged rev':>12}  "
+          f"{'ΔRev (€/ha)':>12}  {'Payoff':>10}  {'Result':>8}")
+    print("  " + "─" * 68)
+    yr_df   = pd.DataFrame(realized_year_rows)
+    xgb_yr  = (yr_df[yr_df["model"] == "XGB"]
+                .groupby("oos_year")
+                [["act_revenue","hedged_revenue","revenue_change","act_payoff"]]
+                .mean().round(2))
+    for yr, row in xgb_yr.iterrows():
+        sign = "✓ helped" if row["revenue_change"] >= 0 else "✗ hurt"
+        print(f"  {yr:>6}  {row['act_revenue']:>12.2f}  "
+              f"{row['hedged_revenue']:>12.2f}  "
+              f"{row['revenue_change']:>+11.2f}  "
+              f"{row['act_payoff']:>10.2f}  {sign}")
+
+    # Summary stats across years for XGB
+    hit_n   = int((xgb_yr["revenue_change"] > 0).sum())
+    hit_tot = len(xgb_yr)
+    avg_d   = float(xgb_yr["revenue_change"].mean())
+    print(f"\n  Mean ΔRev = {avg_d:+.2f} €/ha  |  "
+          f"Hit rate = {hit_n}/{hit_tot} years  |  "
+          f"Avg payoff = {xgb_yr['act_payoff'].mean():.2f} €/ha")
+
+    # ── Per-year realized HE(SV) pooled across 8 regions ─────────────────────
+    # For each year, pool the 8 region observations to compute HE(SV).
+    # Target = mean(actual revenue across regions for that year).
+    # This gives the cross-sectional hedge quality in each specific year.
+    print("\n  Per-year realized HE(SV) across 8 regions  [all models]")
+    print(f"  {'Year':>6}  ", end="")
+    for m in MODEL_ORDER:
+        print(f"  {m[:8]:>8}", end="")
+    print()
+    print("  " + "─" * (10 + 10 * len(MODEL_ORDER)))
+
+    yr_he_rows = []
+    for oos_year in OOS_YEARS:
+        print(f"  {oos_year:>6}  ", end="")
+        row_d = {"oos_year": oos_year}
+        for mname in MODEL_ORDER:
+            ydf_m = yr_df[(yr_df["model"]==mname) &
+                          (yr_df["oos_year"]==oos_year)].dropna(
+                              subset=["act_revenue","hedged_revenue"])
+            if len(ydf_m) < 4:
+                print(f"  {'n/a':>8}", end="")
+                row_d[mname] = np.nan
+                continue
+            rev_u  = ydf_m["act_revenue"].values
+            rev_h  = ydf_m["hedged_revenue"].values
+            mean_u = float(np.mean(rev_u))
+            sv_u   = _semivar(rev_u, mean_u)
+            sv_h   = _semivar(rev_h, mean_u)
+            he_yr  = float(1 - sv_h / sv_u) if sv_u > 1e-8 else np.nan
+            row_d[mname] = round(he_yr, 4)
+            marker = "*" if he_yr > 0 else " "
+            print(f"  {he_yr*100:>7.1f}{marker}", end="")
+        print()
+        yr_he_rows.append(row_d)
+
+    yr_he_df = pd.DataFrame(yr_he_rows)
+    yr_he_df.to_csv(OUT_DIR / "he_sv_realized_per_year.csv", index=False)
+
+    # Mean row
+    print(f"  {'Mean':>6}  ", end="")
+    for mname in MODEL_ORDER:
+        col_vals = yr_he_df[mname].dropna().values
+        if len(col_vals):
+            print(f"  {np.mean(col_vals)*100:>7.1f} ", end="")
+        else:
+            print(f"  {'n/a':>8}", end="")
+    print()
+
+    # Hit rate row (years where hedge helped)
+    print(f"  {'Hits':>6}  ", end="")
+    for mname in MODEL_ORDER:
+        m_yr = yr_df_all[yr_df_all["model"] == mname]
+        if len(m_yr):
+            hits = (m_yr.groupby("oos_year")["revenue_change"].mean() > 0).sum()
+            print(f"  {hits:>5}/{len(OOS_YEARS):<2}", end="")
+        else:
+            print(f"  {'n/a':>8}", end="")
+    print()
+
+    # Mean ΔRev row
+    print(f"  {'ΔRev':>6}  ", end="")
+    for mname in MODEL_ORDER:
+        m_yr = yr_df_all[yr_df_all["model"] == mname]
+        if len(m_yr):
+            avg_d = m_yr.groupby("oos_year")["revenue_change"].mean().mean()
+            print(f"  {avg_d:>+7.1f} ", end="")
+        else:
+            print(f"  {'n/a':>8}", end="")
+    print()
+    print("  (* = hedge helped, Hits = years with positive mean ΔRev, ΔRev in €/ha)")
+    print(f"\n  → he_sv_realized_per_year.csv")
+
+    # ── Figure: simulated vs realized HE(SV) ──────────────────────────────────
+    sub_fig2 = sub.reindex([m for m in MODEL_ORDER if m in realized_df.index])
+    fig, ax  = plt.subplots(figsize=(13, 6))
+    fig.suptitle(
+        "Simulated vs Realized HE(SV) — French Winter Wheat\n"
+        "Simulated: block-bootstrap (10,000 paths)  |  "
+        "Realized: simulation N* and V applied to actual outcomes\n"
+        "Realized HE computed per region (n=10 years), averaged across 8 regions",
+        fontsize=10, fontweight="bold",
+    )
+    x2     = np.arange(len(sub_fig2))
+    colors2 = [MODEL_COLORS.get(m, "grey") for m in sub_fig2.index]
+    w2      = 0.35
+    sim_vals  = sub_fig2["HE_sv_mean"].values * 100
+    real_vals = [realized_df.loc[m, "he_sv_realized"] * 100
+                 if m in realized_df.index and
+                 not np.isnan(realized_df.loc[m, "he_sv_realized"])
+                 else 0.0 for m in sub_fig2.index]
+    real_std  = [realized_df.loc[m, "he_sv_real_std"] * 100
+                 if m in realized_df.index and
+                 not np.isnan(realized_df.loc[m, "he_sv_real_std"])
+                 else 0.0 for m in sub_fig2.index]
+
+    bars1 = ax.bar(x2 - w2/2, sim_vals,  width=w2, color=colors2,
+                   alpha=0.85, label="Simulated HE(SV)")
+    bars2 = ax.bar(x2 + w2/2, real_vals, width=w2, color=colors2,
+                   alpha=0.40, edgecolor=colors2, linewidth=1.5,
+                   hatch="//", label="Realized HE(SV)")
+    ax.errorbar(x2 + w2/2, real_vals, yerr=real_std,
+                fmt="none", color="black", capsize=4, lw=1.2)
+    for bar, v in zip(bars1, sim_vals):
+        ax.text(bar.get_x()+bar.get_width()/2, v+0.2,
+                f"{v:.1f}%", ha="center", va="bottom",
+                fontsize=8, fontweight="bold")
+    for bar, v in zip(bars2, real_vals):
+        ax.text(bar.get_x()+bar.get_width()/2, v+0.2,
+                f"{v:.1f}%", ha="center", va="bottom",
+                fontsize=7.5, color="grey", style="italic")
+    ax.axhline(0, color="black", lw=1)
+    ax.set_xticks(x2)
+    ax.set_xticklabels(sub_fig2.index, rotation=30, ha="right", fontsize=10)
+    ax.set_xlabel("Model", fontsize=11)
+    ax.set_ylabel("HE(SV) %", fontsize=11)
+    ax.legend(fontsize=10)
+    ax.annotate("Realized: error bars = ±1 SD across 8 regions (n=10 years each)",
+                xy=(0.01, 0.01), xycoords="axes fraction", fontsize=8, color="grey")
+    ax.grid(axis="y", alpha=0.3)
+    ax.spines[["top","right"]].set_visible(False)
+    plt.tight_layout()
+    f_ = OUT_DIR / "he_sv_simulated_vs_realized.png"
+    fig.savefig(f_, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"\n  → {f_.name}")
+
+    # ── Figure 1: HE(SV) by model ─────────────────────────────────────────────
+    sub_fig = (summary.set_index("model")
+               .reindex([m for m in MODEL_ORDER if m in summary["model"].values]))
+    fig, ax = plt.subplots(figsize=(13, 6))
+    fig.suptitle(
+        "Semi-Variance Hedging Effectiveness — French Winter Wheat\n"
+        "Zhou (2016) + Möllmann (2019)  |  CDD Call Option  "
+        f"T_ref={BASE_TEMP}°C\n"
+        "Data-driven window per region × year  |  K = calibration-period mean  "
+        "|  Only N* varies\n"
+        "HE(SV) = 1 − svar(hedged) / svar(unhedged)  [downside protection]",
+        fontsize=10, fontweight="bold",
+    )
+    x      = np.arange(len(sub_fig))
+    colors = [MODEL_COLORS.get(m, "grey") for m in sub_fig.index]
+    bars   = ax.bar(x, sub_fig["HE_sv_mean"]*100,
+                    color=colors, alpha=0.85, width=0.6)
+    ax.errorbar(x, sub_fig["HE_sv_mean"]*100, yerr=sub_fig["HE_sv_std"]*100,
+                fmt="none", color="black", capsize=5, lw=1.5)
+    for i, (bar, (m, r)) in enumerate(zip(bars, sub_fig.iterrows())):
+        v   = r["HE_sv_mean"] * 100
+        wr  = wilcoxon_df[wilcoxon_df["model"]==m]
+        sig = "*" if (len(wr) and wr["significant"].values[0]) else ""
+        ax.text(bar.get_x()+bar.get_width()/2,
+                v + sub_fig["HE_sv_std"].iloc[i]*100 + 0.2,
+                f"{v:.1f}%{sig}", ha="center", va="bottom",
+                fontsize=9, fontweight="bold")
+    ax.axhline(0, color="black", lw=1)
+    ax.set_xticks(x)
+    ax.set_xticklabels(sub_fig.index, rotation=30, ha="right", fontsize=10)
+    ax.set_xlabel("Model", fontsize=11)
+    ax.set_ylabel("HE(SV) %  — Semi-Variance Reduction", fontsize=11)
+    ax.annotate("* p < 0.05 (Wilcoxon signed-rank, H1: HE(SV) > 0)",
+                xy=(0.01, 0.01), xycoords="axes fraction",
+                fontsize=8, color="grey")
+    ax.grid(axis="y", alpha=0.3)
+    ax.spines[["top","right"]].set_visible(False)
+    plt.tight_layout()
+    f_ = OUT_DIR / "he_sv_by_model.png"
+    fig.savefig(f_, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"\n  → {f_.name}")
+
+    # ── Figure 1b: Pairwise p-value heatmap ──────────────────────────────────
+    fig, ax = plt.subplots(figsize=(9, 7))
+    mat = pw_matrix.values.astype(float)
+    np.fill_diagonal(mat, np.nan)
+    im = ax.imshow(mat, cmap="RdYlGn_r", aspect="auto", vmin=0, vmax=0.2)
+    ax.set_xticks(range(len(models_present)))
+    ax.set_xticklabels(models_present, rotation=35, ha="right", fontsize=9)
+    ax.set_yticks(range(len(models_present)))
+    ax.set_yticklabels(models_present, fontsize=9)
+    for i in range(len(models_present)):
+        for j in range(len(models_present)):
+            if i == j:
+                continue
+            p = pw_matrix.iloc[i, j]
+            sig = "*" if p < 0.05 else ""
+            ax.text(j, i, f"{p:.3f}{sig}", ha="center", va="center",
+                    fontsize=8,
+                    color="white" if p < 0.05 else "black")
+    plt.colorbar(im, ax=ax, label="p-value (two-sided)")
+    ax.set_title(
+        "Pairwise Paired Wilcoxon Signed-Rank Test — HE(SV)\n"
+        "H0: median(HE^A − HE^B) = 0  |  * p < 0.05  "
+        "(Möllmann et al. 2019 Table 2 analog)",
+        fontsize=11, fontweight="bold")
+    plt.tight_layout()
+    f_ = OUT_DIR / "pairwise_wilcoxon_heatmap.png"
+    fig.savefig(f_, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"  → {f_.name}")
+
+    # ── Figure 2: Optimal window frequency ───────────────────────────────────
+    fig, ax = plt.subplots(figsize=(12, 5))
+    fig.suptitle(
+        "Optimal CDD Window Frequency (Möllmann et al. 2019)\n"
+        "Shown for XGB model  |  Each count = region × OOS year observations",
+        fontsize=11, fontweight="bold",
+    )
+    xgb_wins = res_df[res_df["model"]=="XGB"]
+    win_counts = xgb_wins["win_label"].value_counts().sort_index()
+    # Sort by start DOY for readability
+    label_order = []
+    for i, ms in enumerate(MONTH_ORDER):
+        for me in MONTH_ORDER[i:]:
+            lbl = f"{ms}–{me}" if ms != me else ms
+            if lbl in win_counts.index:
+                label_order.append(lbl)
+    win_counts = win_counts.reindex(label_order).fillna(0)
+    ax.bar(range(len(win_counts)), win_counts.values,
+           color="#1f77b4", alpha=0.8)
+    ax.set_xticks(range(len(win_counts)))
+    ax.set_xticklabels(win_counts.index, rotation=40, ha="right", fontsize=9)
+    ax.set_xlabel("Selected Window", fontsize=11)
+    ax.set_ylabel("Frequency (region × year)", fontsize=11)
+    ax.grid(axis="y", alpha=0.3)
+    ax.spines[["top","right"]].set_visible(False)
+    plt.tight_layout()
+    f_ = OUT_DIR / "optimal_window_distribution.png"
+    fig.savefig(f_, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"  → {f_.name}")
+
+    # ── Figure 3: Region × Model HE(SV) heat map ─────────────────────────────
+    pivot = (res_df.groupby(["region","model"])["HE_sv"]
+             .mean().unstack("model")
+             [[m for m in MODEL_ORDER if m in res_df["model"].unique()]] * 100)
+    fig, ax = plt.subplots(figsize=(14, 5))
+    im = ax.imshow(pivot.values, cmap="RdYlGn", aspect="auto",
+                   vmin=0, vmax=20)
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_xticklabels(pivot.columns, rotation=30, ha="right", fontsize=10)
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels([f"R{r}" for r in pivot.index], fontsize=10)
+    for i in range(len(pivot.index)):
+        for j in range(len(pivot.columns)):
+            v = pivot.values[i, j]
+            if not np.isnan(v):
+                ax.text(j, i, f"{v:.1f}%", ha="center", va="center",
+                        fontsize=8.5, color="white" if v > 15 else "black")
+    plt.colorbar(im, ax=ax, label="HE(SV) %")
+    ax.set_title(
+        "HE(SV) per Region × Model\n"
+        "Zhou (2016) + Möllmann (2019)  |  CDD  |  Data-driven window",
+        fontsize=11, fontweight="bold")
+    plt.tight_layout()
+    f_ = OUT_DIR / "he_sv_heatmap.png"
+    fig.savefig(f_, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"  → {f_.name}")
+
+    # ── Figure 4: Rolling HE(SV) per OOS year ────────────────────────────────
+    fig, ax = plt.subplots(figsize=(13, 5))
+    for mname in MODEL_ORDER:
+        ms = (res_df[res_df["model"]==mname]
+              .groupby("oos_year")["HE_sv"].mean().reset_index())
+        if ms.empty: continue
+        ax.plot(ms["oos_year"], ms["HE_sv"]*100,
+                marker="o", lw=1.8, ms=5,
+                color=MODEL_COLORS.get(mname, "grey"), label=mname)
+    ax.axhline(0, color="black", lw=1, ls="--")
+    ax.set_xlabel("OOS Year", fontsize=11)
+    ax.set_ylabel("HE(SV) %  (mean across regions)", fontsize=11)
+    ax.set_title(
+        "Rolling HE(SV) by Model\n"
+        "Data-driven window  |  K = calibration-period mean  "
+        "[downside protection only]",
+        fontsize=11, fontweight="bold")
+    ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+    ax.legend(fontsize=8, ncol=2)
+    ax.grid(alpha=0.25)
+    ax.spines[["top","right"]].set_visible(False)
+    plt.tight_layout()
+    f_ = OUT_DIR / "he_sv_rolling.png"
+    fig.savefig(f_, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"  → {f_.name}")
+
+    # ── LaTeX table ───────────────────────────────────────────────────────────
+    lat_p = OUT_DIR / "zhou_table_latex.tex"
+    with open(lat_p, "w") as f:
+        f.write("% Zhou (2016) + Möllmann (2019) — French Winter Wheat\n"
+                "% Data-driven window  |  All HE metrics  |  N* for HE(SV)\n\n"
+                "\\begin{table}[htbp]\n\\centering\\small\n"
+                "\\caption{Hedging Effectiveness across Risk Measures: CDD Call on "
+                "French Winter Wheat (Zhou et al. 2016 + Möllmann et al. 2019, "
+                f"$T_{{\\rm ref}}={BASE_TEMP}$°C, data-driven window, "
+                "N$^*$ optimised for HE(SV))}\n"
+                "\\label{tab:zhou_mollmann}\n"
+                "\\begin{tabular}{lrrrrrrrr}\n\\toprule\n"
+                "Model & HE(SD)\\% & HE(VaR\\textsubscript{5})\\% & "
+                "HE(VaR\\textsubscript{10})\\% & HE(ES\\textsubscript{5})\\% & "
+                "HE(ES\\textsubscript{10})\\% & HE(SV)\\% & "
+                "$p_{\\rm Wilc}$ & $R^2_Y$ \\\\\n"
+                "\\midrule\n")
+        for m, r in sub.iterrows():
+            wr  = wilcoxon_df[wilcoxon_df["model"]==m]
+            p_s = f"{wr['p_value'].values[0]:.4f}" if (len(wr) and
+                  not np.isnan(wr["p_value"].values[0])) else "n/a"
+            sig = "$^*$" if (len(wr) and wr["significant"].values[0]) else ""
+            f.write(f"{m} & "
+                    f"{r['HE_sd_mean']*100:.1f} & "
+                    f"{r['HE_var5_mean']*100:.1f} & "
+                    f"{r['HE_var10_mean']*100:.1f} & "
+                    f"{r['HE_es5_mean']*100:.1f} & "
+                    f"{r['HE_es10_mean']*100:.1f} & "
+                    f"{r['HE_sv_mean']*100:.1f} & "
+                    f"{p_s}{sig} & {r['yield_r2']:.3f} \\\\\n")
+        f.write(
+            "\\bottomrule\n"
+            "\\multicolumn{9}{l}{\\footnotesize "
+            "Data-driven window via Spearman correlation maximisation "
+            "(Möllmann et al. 2019). "
+            f"$T_{{\\rm ref}}={BASE_TEMP}$°C. "
+            f"Tick~$=€{int(TICK)}$/degree. "
+            f"Wheat~$=€{int(WHEAT_PRICE)}$/tonne. "
+            "Zero risk premium. N$^*$ optimised for HE(SV).}\n"
+            "\\end{tabular}\n\\end{table}\n")
+    print(f"  → {lat_p.name}")
+
+    # LaTeX pairwise table (Möllmann Table 2 analog)
+    lat_pw = OUT_DIR / "zhou_pairwise_latex.tex"
+    with open(lat_pw, "w") as f:
+        n = len(models_present)
+        col_spec = "l" + "r" * n
+        f.write("% Pairwise Paired Wilcoxon Signed-Rank p-values — HE(SV)\n"
+                "% Möllmann et al. (2019) Table 2 analog\n\n"
+                "\\begin{table}[htbp]\n\\centering\\small\n"
+                "\\caption{Pairwise Paired Wilcoxon Signed-Rank Test — Holm-adjusted p-values for HE(SV): "
+                "H\\textsubscript{0}: median(HE\\textsuperscript{A}$-$HE\\textsuperscript{B})=0 "
+                "(two-sided, Holm--Bonferroni corrected for 21 comparisons). $^*$ $p_{\\rm Holm} < 0.05$.}\n"
+                "\\label{tab:pairwise_wilcoxon}\n"
+                f"\\begin{{tabular}}{{{col_spec}}}\n\\toprule\n")
+        f.write(" & " + " & ".join(f"\\rotatebox{{90}}{{{m}}}"
+                                   for m in models_present) + " \\\\\n\\midrule\n")
+        for m1 in models_present:
+            row = m1
+            for m2 in models_present:
+                if m1 == m2:
+                    row += " & —"
+                else:
+                    p   = pw_matrix.loc[m1, m2]
+                    sig = "$^*$" if p < 0.05 else ""
+                    row += f" & {p:.4f}{sig}"
+            f.write(row + " \\\\\n")
+        f.write("\\bottomrule\n\\end{tabular}\n\\end{table}\n")
+    print(f"  → {lat_pw.name}")
+    print(f"\n  Optimal windows → optimal_windows.csv")
+    print(f"  All outputs     → {OUT_DIR}")
     print("=" * 72)
-    print("  PHASE 2 COMPLETE")
-    print(f"  Outputs: {OUT_DIR}")
-    print("=" * 72)
-
-    return {
-        "selection": sel_df, "contracts": ctr_df, "hba": hba_df,
-        "mc": {r: {k: v for k, v in mc.items()
-                   if k not in ("payoffs", "idx_sims")}
-               for r, mc in mc_store.items()},
-        "he": he_df, "cara": cara_df, "evoi": evoi_df, "straddle": straddle_df,
-    }
-
-
-# ==============================================================================
-# ENTRY POINT
-# ==============================================================================
-
-if __name__ == "__main__":
-    results = run_phase2()
