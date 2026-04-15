@@ -58,7 +58,7 @@ import matplotlib.pyplot as plt
 
 # set paths
 input_data_loc = 'EDA'
-pkl_folder = 'benth_models'
+pkl_folder = 'Outputs/benth_models'
 os.makedirs(pkl_folder, exist_ok=True)
 
 tdy = datetime.datetime.today().strftime('%Y-%m-%d')

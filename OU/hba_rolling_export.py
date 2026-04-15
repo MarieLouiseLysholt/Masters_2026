@@ -32,7 +32,7 @@ np.random.seed(42)
 REGIONS      = [11, 24, 27, 28, 32, 44, 52, 53]
 CALIB_YEARS  = range(2014, 2024)
 DIAG_YEAR    = 2014
-PKL_FOLDER   = "hba_models"
+PKL_FOLDER   = "Output/hba_models"
 os.makedirs(PKL_FOLDER, exist_ok=True)
 
 T_REF = 18.0
