@@ -60,7 +60,7 @@ start = datetime.datetime.now()
 
 # configuration
 REGIONS = [11, 24, 27, 28, 32, 44, 52, 53]
-CALIB_YEARS = range(2014, 2024)
+CALIB_YEARS = range(2010, 2024)
 MIN_CALIB_OBS = 1000
 MAX_LAG = 60
 
