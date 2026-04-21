@@ -37,20 +37,24 @@ np.random.seed(42)
 # CONFIGURATION
 # ===========================================================================
 
-REGIONS      = [11, 24, 27, 28, 32, 44, 52, 53]
-T_REF        = 18.0
-OMEGA        = 2 * np.pi / 365
-RAW_CSV      = "EDA/region_avg.csv"
-EXTENDED_CSV = "EDA/region_temp_extended.csv"
-HBA_DIR      = "hba_models"
-ALATON_DIR   = "alaton_models"
-BENTH_DIR    = "benth_models"
-PAPER_XGB_DIR    = Path(r"/Users/marielouiselysholt/Desktop/Master/Masters_2026/Outputs/xgBoost_rolling_exports")
-WAVELET_FNN_DIR  = Path(r"/Users/marielouiselysholt/Desktop/Master/Masters_2026/Outputs/WaveletFNN_rolling_exports")
-LSTM_DIR         = Path(r"/Users/marielouiselysholt/Desktop/Master/Masters_2026/Outputs/lstm_rolling_exports")
-FEEDFORWARD_DIR  = Path(r"/Users/marielouiselysholt/Desktop/Master/Masters_2026/Outputs/FeedForwardNN_rolling_exports")
+ROOT = Path(__file__).resolve().parents[1]
 
-OOS_START    = 2015
+REGIONS      = [11, 24, 27, 28, 32, 44, 52, 53] 
+T_REF        = 10.0
+OMEGA        = 2 * np.pi / 365
+RAW_CSV      = ROOT / "EDA/region_avg.csv"
+EXTENDED_CSV = ROOT / "EDA/region_temp_extended.csv"
+HBA_DIR      = ROOT / "Outputs/hba_models"
+ALATON_DIR   = ROOT / "Outputs/alaton_models"
+BENTH_DIR    = ROOT / "Outputs/benth_models"
+PAPER_XGB_DIR    = ROOT / "Outputs/xgBoost_rolling_exports"
+WAVELET_FNN_DIR  = ROOT / "Outputs/WaveletFNN_rolling_exports"
+LSTM_DIR         = ROOT / "Outputs/lstm_rolling_exports"
+FEEDFORWARD_DIR  = ROOT / "Outputs/FeedForwardNN_rolling_exports"
+BK_FORECASTS_CSV = ROOT / "bk_forecasts.csv"
+BK_OBS_METADATA_CSV = ROOT / "bk_obs_metadata.csv"
+
+OOS_START    = 2011
 OOS_END      = 2024
 TEST_YEARS   = list(range(OOS_START, OOS_END + 1))
 MIN_INDEX    = 15.0
@@ -67,6 +71,44 @@ LABELS       = {
     "LSTM":          "LSTM",
     "FeedForwardNN": "Feed Forward NN",
 }
+
+FORECAST_EXPORT_COLUMNS = ["region", "year", "date", "actual", "model", "forecast"]
+OBS_METADATA_COLUMNS = ["region", "year"]
+
+
+def _atomic_write_csv(df, path, index=False):
+    path = Path(path)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    df.to_csv(tmp_path, index=index)
+    tmp_path.replace(path)
+
+
+def checkpoint_forecast_exports(all_forecasts, obs_metadata):
+    fcst_df = pd.DataFrame(all_forecasts, columns=FORECAST_EXPORT_COLUMNS)
+    meta_df = pd.DataFrame(obs_metadata, columns=OBS_METADATA_COLUMNS)
+    _atomic_write_csv(fcst_df, BK_FORECASTS_CSV, index=False)
+    _atomic_write_csv(meta_df, BK_OBS_METADATA_CSV, index=False)
+
+
+def _safe_load(model_label, load_fn, region, calib_year):
+    """
+    Attempt to load a PKL for a given model. Returns the payload or None.
+    - FileNotFoundError is logged quietly (expected if a file is missing).
+    - Any other exception is logged loudly so schema drifts do not silently
+      produce NaN-only forecasts.
+    """
+    try:
+        return load_fn(region, calib_year)
+    except FileNotFoundError:
+        print(f"    !! {model_label} PKL missing: region={region} calib={calib_year}")
+        return None
+    except Exception as e:
+        print(
+            f"    !! {model_label} PKL LOAD ERROR "
+            f"(region={region} calib={calib_year}): {type(e).__name__}: {e}"
+        )
+        return None
+
 
 HORIZONS = {
     "30":(0,30), "60":(0,60), "90":(0,90), "120":(0,120), "180":(0,180),
@@ -341,21 +383,30 @@ def compute_wavelet_calib_context(region, calib_year, df_train_raw):
 # ===========================================================================
 
 def load_hba(region, calib_year):
-    with open(os.path.join(HBA_DIR, f"hba_model_{region}_calib_{calib_year}.pkl"), "rb") as f:
+    with open(HBA_DIR / f"hba_model_{region}_calib_{calib_year}.pkl", "rb") as f:
         return pickle.load(f)
 
 def load_alaton(region, calib_year):
-    with open(os.path.join(ALATON_DIR, f"alaton_model_{region}_calib_{calib_year}.pkl"), "rb") as f:
+    with open(ALATON_DIR / f"alaton_model_{region}_calib_{calib_year}.pkl", "rb") as f:
         return pickle.load(f)
 
 def load_benth(region, calib_year):
-    with open(os.path.join(BENTH_DIR, f"ou_levy_model_{region}_calib_{calib_year}.pkl"), "rb") as f:
+    with open(BENTH_DIR / f"ou_levy_model_{region}_calib_{calib_year}.pkl", "rb") as f:
         return pickle.load(f)
 
 def load_paper_xgb(region, calib_year):
-    pkl_path = PAPER_XGB_DIR / f"paper_xgb_region_{region}_calib_{calib_year}.pkl"
-    with open(pkl_path, "rb") as f:
-        return pickle.load(f)
+    candidates = [
+        PAPER_XGB_DIR / f"paper_xgboost_region_{region}_calib_{calib_year}_predict_{calib_year + 1}.pkl",
+        PAPER_XGB_DIR / f"paper_xgb_region_{region}_calib_{calib_year}.pkl",
+        PAPER_XGB_DIR / f"paper_xgboost_region_{region}_calib_{calib_year}.pkl",
+    ]
+    for pkl_path in candidates:
+        if pkl_path.exists():
+            with open(pkl_path, "rb") as f:
+                return pickle.load(f)
+    raise FileNotFoundError(
+        f"No XGB PKL found for region={region}, calib_year={calib_year}"
+    )
 
 def load_wavelet_fnn(region, calib_year):
     prediction_year = calib_year + 1
@@ -457,6 +508,7 @@ def benth_seasonal_mean(doy, a0, a1, t0):
 def forecast_hba(hba_params, test_dates):
     df_calib = hba_params.get("df_calib", hba_params.get("df"))
     if df_calib is None:
+        print(f"    !! HBA: no df_calib/df key. Keys available: {list(hba_params.keys())}")
         return np.full(len(test_dates), np.nan)
 
     dfc = df_calib.copy()
@@ -465,6 +517,7 @@ def forecast_hba(hba_params, test_dates):
     elif "date" in dfc.columns:
         idx_dates = pd.to_datetime(dfc["date"])
     else:
+        print(f"    !! HBA: df_calib has no DatetimeIndex or 'date' column. Columns: {list(dfc.columns)}")
         return np.full(len(test_dates), np.nan)
 
     temp_col = None
@@ -473,6 +526,7 @@ def forecast_hba(hba_params, test_dates):
             temp_col = c
             break
     if temp_col is None:
+        print(f"    !! HBA: no temperature column found. Columns: {list(dfc.columns)}")
         return np.full(len(test_dates), np.nan)
 
     doy = np.array([_doy_noleap(d) for d in idx_dates])
@@ -689,13 +743,14 @@ def _recursive_forecast(predict_fn, working_df, test_dates, trend_int, trend_slo
 
 def forecast_paper_xgb(payload, test_dates, calib_ctx):
     model = payload["fitted_model"]
-    scaler = payload["scaler"]
     trend_int, trend_slope, fourier_coefs, n_harmonics, n_calib_days = _extract_trend_ctx(payload, calib_ctx)
     working_df = _extract_working_df(payload, calib_ctx)
     feature_cols = _extract_feature_cols(payload, FEATURE_COLS)
 
     def predict_fn(X):
-        return float(model.predict(scaler.transform(X))[0])
+        if isinstance(payload, dict) and "scaler" in payload and payload["scaler"] is not None:
+            return float(model.predict(payload["scaler"].transform(X))[0])
+        return float(model.predict(X)[0])
 
     return _recursive_forecast(predict_fn, working_df, test_dates, trend_int, trend_slope, fourier_coefs,
                                n_harmonics, n_calib_days, feature_cols)
@@ -1102,7 +1157,7 @@ for region in REGIONS:
     _loaded_calib = None
     hba_params = alaton_params = benth_params = xgb_payload = wavelet_payload = lstm_payload = ffnn_payload = None
     calib_ctx = wavelet_calib_ctx = ffnn_calib_ctx = None
-    print(f"\n{'─'*60}\n  Region {region}\n{'─'*60}")
+    print(f"\n{'-'*60}\n  Region {region}\n{'-'*60}")
 
     for test_year in TEST_YEARS:
         calib_year = test_year - 1
@@ -1122,54 +1177,58 @@ for region in REGIONS:
 
         if calib_year != _loaded_calib:
             print(f"  [{test_year}] calib={calib_year}", end="  ", flush=True)
-            try:
-                hba_params = load_hba(region, calib_year)
-            except FileNotFoundError:
-                hba_params = None
-            try:
-                alaton_params = load_alaton(region, calib_year)
-            except FileNotFoundError:
-                alaton_params = None
-            try:
-                benth_params = load_benth(region, calib_year)
-            except FileNotFoundError:
-                benth_params = None
-            try:
-                xgb_payload = load_paper_xgb(region, calib_year)
-            except FileNotFoundError:
-                xgb_payload = None
-            try:
-                wavelet_payload = load_wavelet_fnn(region, calib_year)
-            except FileNotFoundError:
-                wavelet_payload = None
-            try:
-                lstm_payload = load_lstm(region, calib_year)
-            except FileNotFoundError:
-                lstm_payload = None
-            try:
-                ffnn_payload = load_feedforward_nn(region, calib_year)
-            except FileNotFoundError:
-                ffnn_payload = None
+
+            # Robust PKL loading — logs schema errors instead of silently NaN-ing
+            hba_params     = _safe_load("HBA",           load_hba,            region, calib_year)
+            alaton_params  = _safe_load("Alaton",        load_alaton,         region, calib_year)
+            benth_params   = _safe_load("Benth",         load_benth,          region, calib_year)
+            xgb_payload    = _safe_load("XGB",           load_paper_xgb,      region, calib_year)
+            wavelet_payload = _safe_load("WaveletFNN",   load_wavelet_fnn,    region, calib_year)
+            lstm_payload   = _safe_load("LSTM",          load_lstm,           region, calib_year)
+            ffnn_payload   = _safe_load("FeedForwardNN", load_feedforward_nn, region, calib_year)
 
             calib_ctx = compute_calib_context(df_train)
             wavelet_calib_ctx = compute_wavelet_calib_context(region, calib_year, df_train)
             ffnn_calib_ctx = compute_ffnn_calib_context(region, calib_year)
+
+            print(
+                "loaded: "
+                f"hba={hba_params is not None}, "
+                f"alaton={alaton_params is not None}, "
+                f"benth={benth_params is not None}, "
+                f"xgb={xgb_payload is not None}, "
+                f"wavelet={wavelet_payload is not None}, "
+                f"lstm={lstm_payload is not None}, "
+                f"ffnn={ffnn_payload is not None}",
+                end="  ",
+                flush=True,
+            )
 
             _loaded_calib = calib_year
             print("PKLs loaded")
         else:
             print(f"  [{test_year}]", end="  ", flush=True)
 
-        f_hba = forecast_hba(hba_params, test_dates) if hba_params else np.full(365, np.nan)
-        f_alaton = forecast_alaton(alaton_params, df_train, test_dates) if alaton_params else np.full(365, np.nan)
-        f_benth = forecast_benth(benth_params, df_train, test_dates) if benth_params else np.full(365, np.nan)
-        f_xgb = forecast_paper_xgb(xgb_payload, test_dates, calib_ctx) if xgb_payload else np.full(365, np.nan)
+        # Every forecast function is wrapped so schema surprises produce
+        # loud warnings and NaN forecasts rather than killing the whole run.
+        def _safe_forecast(label, fn):
+            try:
+                return fn()
+            except Exception as e:
+                print(f"    !! {label} FORECAST ERROR "
+                      f"(region={region} year={test_year}): {type(e).__name__}: {e}")
+                return np.full(365, np.nan)
+
+        f_hba        = _safe_forecast("HBA",           lambda: forecast_hba(hba_params, test_dates))           if hba_params     else np.full(365, np.nan)
+        f_alaton     = _safe_forecast("Alaton",        lambda: forecast_alaton(alaton_params, df_train, test_dates)) if alaton_params  else np.full(365, np.nan)
+        f_benth      = _safe_forecast("Benth",         lambda: forecast_benth(benth_params, df_train, test_dates))   if benth_params   else np.full(365, np.nan)
+        f_xgb        = _safe_forecast("XGB",           lambda: forecast_paper_xgb(xgb_payload, test_dates, calib_ctx)) if xgb_payload else np.full(365, np.nan)
         if wavelet_payload and wavelet_calib_ctx:
-            f_wavelet = forecast_wavelet_fnn(wavelet_payload, test_dates, wavelet_calib_ctx)
+            f_wavelet = _safe_forecast("WaveletFNN",   lambda: forecast_wavelet_fnn(wavelet_payload, test_dates, wavelet_calib_ctx))
         else:
             f_wavelet = np.full(365, np.nan)
-        f_lstm = forecast_lstm(lstm_payload, test_dates, calib_ctx) if lstm_payload else np.full(365, np.nan)
-        f_ffnn = forecast_feedforward_nn(ffnn_payload, test_dates, ffnn_calib_ctx) if ffnn_payload else np.full(365, np.nan)
+        f_lstm       = _safe_forecast("LSTM",          lambda: forecast_lstm(lstm_payload, test_dates, calib_ctx))    if lstm_payload else np.full(365, np.nan)
+        f_ffnn       = _safe_forecast("FeedForwardNN", lambda: forecast_feedforward_nn(ffnn_payload, test_dates, ffnn_calib_ctx)) if ffnn_payload else np.full(365, np.nan)
 
         forecasts = {
             "HBA": f_hba,
@@ -1180,6 +1239,12 @@ for region in REGIONS:
             "LSTM": f_lstm,
             "FeedForwardNN": f_ffnn,
         }
+
+        finite_counts = ", ".join(
+            f"{m}={int(np.isfinite(f_arr).sum())}/{len(f_arr)}"
+            for m, f_arr in forecasts.items()
+        )
+        print(f"    finite forecasts: {finite_counts}")
 
         for m, f_arr in forecasts.items():
             for d, T_hat, T_act in zip(test_dates, f_arr, T_actual):
@@ -1193,6 +1258,7 @@ for region in REGIONS:
                 })
 
         obs_metadata.append({"region": region, "year": test_year})
+        checkpoint_forecast_exports(all_forecasts, obs_metadata)
         for m, f_arr in forecasts.items():
             ape_results["CAT"][m].append(compute_ape(T_actual, f_arr, "CAT"))
             ape_results["HDD"][m].append(compute_ape(T_actual, f_arr, "HDD"))
@@ -1265,15 +1331,14 @@ df_mape.to_csv("bk_mape_cat.csv")
 df_rmse.to_csv("bk_rmse_hdd.csv")
 df_mae.to_csv("bk_mae_hdd.csv")
 df_wmape.to_csv("bk_wmape_cat.csv")
-pd.DataFrame(all_forecasts).to_csv("bk_forecasts.csv", index=False)
-pd.DataFrame(obs_metadata).to_csv("bk_obs_metadata.csv", index=False)
+checkpoint_forecast_exports(all_forecasts, obs_metadata)
 
 print("\n# SAVED OUTPUTS")
 for f in [
     "bk_ape_cat.csv", "bk_ape_hdd.csv", "bk_ape_cdd.csv", "bk_mape_cat.csv", "bk_rmse_hdd.csv",
     "bk_mae_hdd.csv", "bk_wmape_cat.csv", "bk_rank_counts_cat.csv", "bk_rank_counts_hdd.csv",
     "bk_rank_counts_cdd.csv", "bk_rank_avg_cat.csv", "bk_rank_avg_hdd.csv", "bk_rank_avg_cdd.csv",
-    "bk_friedman_nemenyi.csv", "bk_bootstrap_wilcoxon.csv", "bk_forecasts.csv", "bk_obs_metadata.csv"
+    "bk_friedman_nemenyi.csv", "bk_bootstrap_wilcoxon.csv", BK_FORECASTS_CSV, BK_OBS_METADATA_CSV
 ]:
     print(f"  Saved -> {f}")
 print(f"\nDone. {n_obs} observations, {len(all_forecasts)} forecast rows.")
