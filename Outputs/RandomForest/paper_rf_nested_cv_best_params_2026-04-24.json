@@ -1,0 +1,442 @@
+{
+    "11_fold1": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 20,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "11_fold2": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 100,
+            "rf__min_samples_split": 5,
+            "rf__min_samples_leaf": 5,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 8,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "11_fold3": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 20,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "11_fold4": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 100,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 8,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "11_fold5": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 200,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 12,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "24_fold1": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 200,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 12,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "24_fold2": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 20,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "24_fold3": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 20,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "24_fold4": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 200,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 12,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "24_fold5": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 20,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "27_fold1": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 20,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.3,
+            "rf__max_depth": 20,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "27_fold2": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 20,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.3,
+            "rf__max_depth": 20,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "27_fold3": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 20,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.3,
+            "rf__max_depth": 20,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "27_fold4": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 20,
+            "rf__min_samples_leaf": 5,
+            "rf__max_features": 0.3,
+            "rf__max_depth": 20,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "27_fold5": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 20,
+            "rf__min_samples_leaf": 5,
+            "rf__max_features": 0.3,
+            "rf__max_depth": 20,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "28_fold1": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 200,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 12,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "28_fold2": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 100,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 8,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "28_fold3": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 200,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 12,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "28_fold4": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 100,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 8,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "28_fold5": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 200,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 12,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "32_fold1": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 1,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 12,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "32_fold2": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 20,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "32_fold3": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 100,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 8,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "32_fold4": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 100,
+            "rf__min_samples_split": 5,
+            "rf__min_samples_leaf": 5,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 8,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "32_fold5": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 20,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "44_fold1": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 100,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 8,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "44_fold2": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 100,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 8,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "44_fold3": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 100,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 8,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "44_fold4": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 100,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 8,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "44_fold5": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 100,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 5,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 12,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "52_fold1": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 100,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 8,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "52_fold2": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 100,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 8,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "52_fold3": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 20,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "52_fold4": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 20,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "52_fold5": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 20,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "53_fold1": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 20,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "53_fold2": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 20,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "53_fold3": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 200,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 12,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "53_fold4": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 400,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 20,
+            "rf__criterion": "squared_error"
+        }
+    },
+    "53_fold5": {
+        "model": "paper_rf",
+        "params": {
+            "rf__n_estimators": 200,
+            "rf__min_samples_split": 10,
+            "rf__min_samples_leaf": 10,
+            "rf__max_features": 0.5,
+            "rf__max_depth": 12,
+            "rf__criterion": "squared_error"
+        }
+    }
+}

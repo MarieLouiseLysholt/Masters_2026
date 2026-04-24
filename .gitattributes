@@ -1,1 +1,8 @@
 EDA/region_temp_extended.csv filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+bk_shap_daily.csv filter=lfs diff=lfs merge=lfs -text
+bk_shap_daily_horizons.csv filter=lfs diff=lfs merge=lfs -text
+bk_shap_model_horizon_summary.csv filter=lfs diff=lfs merge=lfs -text
+bk_shap_region_model_horizon_summary.csv filter=lfs diff=lfs merge=lfs -text
+bk_shap_region_year_model_horizon_summary.csv filter=lfs diff=lfs merge=lfs -text
+bk_shap_year_model_horizon_summary.csv filter=lfs diff=lfs merge=lfs -text

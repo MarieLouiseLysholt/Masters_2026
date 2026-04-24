@@ -55,14 +55,14 @@ KNN_DIR = Path("Outputs/KNN_rolling_exports")
 LSTM_DIR = Path("Outputs/lstm_rolling_exports")
 FEEDFORWARD_DIR = Path("Outputs/FeedForwardNN_rolling_exports")
 
-OOS_START    = 2015
+OOS_START    = 2010
 OOS_END      = 2024
 TEST_YEARS   = list(range(OOS_START, OOS_END + 1))
 MIN_INDEX    = 15.0
 N_BOOTSTRAP  = 1_000
 N_HARMONICS  = 3
 SHAP_BACKGROUND_SIZE = 50
-SHAP_MODEL_ORDER = ["XGB", "RandomForest", "SVM", "KNN", "FeedForwardNN"]
+SHAP_MODEL_ORDER = ["XGB"]#, "RandomForest", "SVM", "KNN", "FeedForwardNN"]
 
 MODEL_ORDER  = [
     "HBA", "Alaton", "Benth", "XGB", "RandomForest", "SVM", "KNN", "LSTM", "FeedForwardNN"
