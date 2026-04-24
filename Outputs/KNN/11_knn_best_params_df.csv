@@ -1,0 +1,6 @@
+,algorithm,leaf_size,n_neighbors,weights,model
+11_fold1,ball_tree,1,10,distance,K-Nearest_Neighbors_Regression
+11_fold2,ball_tree,1,15,distance,K-Nearest_Neighbors_Regression
+11_fold3,auto,200,15,distance,K-Nearest_Neighbors_Regression
+11_fold4,ball_tree,100,10,distance,K-Nearest_Neighbors_Regression
+11_fold5,auto,30,15,distance,K-Nearest_Neighbors_Regression

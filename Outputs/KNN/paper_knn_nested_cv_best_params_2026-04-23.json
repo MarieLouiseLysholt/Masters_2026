@@ -1,0 +1,362 @@
+{
+    "11_fold1": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "11_fold2": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "11_fold3": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "11_fold4": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "11_fold5": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "24_fold1": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "24_fold2": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "24_fold3": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "24_fold4": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "24_fold5": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "27_fold1": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "27_fold2": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "27_fold3": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "27_fold4": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "27_fold5": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "ball_tree",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "28_fold1": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "28_fold2": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "28_fold3": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "28_fold4": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "28_fold5": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "32_fold1": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "ball_tree",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 15,
+            "knn__weights": "distance"
+        }
+    },
+    "32_fold2": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 15,
+            "knn__weights": "distance"
+        }
+    },
+    "32_fold3": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "32_fold4": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "32_fold5": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "44_fold1": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "ball_tree",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 15,
+            "knn__weights": "distance"
+        }
+    },
+    "44_fold2": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 15,
+            "knn__weights": "distance"
+        }
+    },
+    "44_fold3": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 15,
+            "knn__weights": "distance"
+        }
+    },
+    "44_fold4": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 15,
+            "knn__weights": "distance"
+        }
+    },
+    "44_fold5": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 15,
+            "knn__weights": "distance"
+        }
+    },
+    "52_fold1": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "52_fold2": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "52_fold3": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "52_fold4": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "52_fold5": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "53_fold1": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "53_fold2": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "ball_tree",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "53_fold3": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "53_fold4": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    },
+    "53_fold5": {
+        "model": "paper_knn",
+        "params": {
+            "knn__algorithm": "auto",
+            "knn__leaf_size": 1,
+            "knn__n_neighbors": 50,
+            "knn__weights": "distance"
+        }
+    }
+}

@@ -1,0 +1,47 @@
+{
+    "11_fold1": {
+        "model": "K-Nearest_Neighbors_Regression",
+        "params": {
+            "algorithm": "ball_tree",
+            "leaf_size": 1,
+            "n_neighbors": 10,
+            "weights": "distance"
+        }
+    },
+    "11_fold2": {
+        "model": "K-Nearest_Neighbors_Regression",
+        "params": {
+            "algorithm": "ball_tree",
+            "leaf_size": 1,
+            "n_neighbors": 15,
+            "weights": "distance"
+        }
+    },
+    "11_fold3": {
+        "model": "K-Nearest_Neighbors_Regression",
+        "params": {
+            "algorithm": "auto",
+            "leaf_size": 200,
+            "n_neighbors": 15,
+            "weights": "distance"
+        }
+    },
+    "11_fold4": {
+        "model": "K-Nearest_Neighbors_Regression",
+        "params": {
+            "algorithm": "ball_tree",
+            "leaf_size": 100,
+            "n_neighbors": 10,
+            "weights": "distance"
+        }
+    },
+    "11_fold5": {
+        "model": "K-Nearest_Neighbors_Regression",
+        "params": {
+            "algorithm": "auto",
+            "leaf_size": 30,
+            "n_neighbors": 15,
+            "weights": "distance"
+        }
+    }
+}

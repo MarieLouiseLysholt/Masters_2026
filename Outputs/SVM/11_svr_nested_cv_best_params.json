@@ -1,0 +1,57 @@
+{
+    "11_fold1": {
+        "model": "SVM_SVR",
+        "params": {
+            "C": 1.0,
+            "degree": 1,
+            "epsilon": 0.7,
+            "gamma": "scale",
+            "kernel": "poly",
+            "tol": 0.0001
+        }
+    },
+    "11_fold2": {
+        "model": "SVM_SVR",
+        "params": {
+            "C": 1.0,
+            "degree": 1,
+            "epsilon": 0.7,
+            "gamma": "scale",
+            "kernel": "poly",
+            "tol": 0.0005
+        }
+    },
+    "11_fold3": {
+        "model": "SVM_SVR",
+        "params": {
+            "C": 1.0,
+            "degree": 1,
+            "epsilon": 0.1,
+            "gamma": "auto",
+            "kernel": "poly",
+            "tol": 0.0005
+        }
+    },
+    "11_fold4": {
+        "model": "SVM_SVR",
+        "params": {
+            "C": 1.0,
+            "degree": 1,
+            "epsilon": 0.7,
+            "gamma": "auto",
+            "kernel": "poly",
+            "tol": 0.0001
+        }
+    },
+    "11_fold5": {
+        "model": "SVM_SVR",
+        "params": {
+            "C": 1.0,
+            "degree": 1,
+            "epsilon": 1.0,
+            "gamma": "auto",
+            "kernel": "poly",
+            "tol": 0.0001
+        }
+    }
+}
