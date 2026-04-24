@@ -1,0 +1,442 @@
+{
+    "11_fold1": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.2,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0001
+        }
+    },
+    "11_fold2": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.1,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0001
+        }
+    },
+    "11_fold3": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.1,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0001
+        }
+    },
+    "11_fold4": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.1,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0005
+        }
+    },
+    "11_fold5": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.1,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0001
+        }
+    },
+    "24_fold1": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 1.0,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0001
+        }
+    },
+    "24_fold2": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 1.0,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0001
+        }
+    },
+    "24_fold3": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 1.0,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0001
+        }
+    },
+    "24_fold4": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 1.0,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0005
+        }
+    },
+    "24_fold5": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 1.0,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0001
+        }
+    },
+    "27_fold1": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.1,
+            "svr__gamma": "scale",
+            "svr__kernel": "poly",
+            "svr__tol": 0.0001
+        }
+    },
+    "27_fold2": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.1,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0005
+        }
+    },
+    "27_fold3": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.1,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0001
+        }
+    },
+    "27_fold4": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.1,
+            "svr__gamma": "scale",
+            "svr__kernel": "poly",
+            "svr__tol": 0.0005
+        }
+    },
+    "27_fold5": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.1,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0005
+        }
+    },
+    "28_fold1": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 1.0,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0001
+        }
+    },
+    "28_fold2": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.7,
+            "svr__gamma": "scale",
+            "svr__kernel": "poly",
+            "svr__tol": 0.0005
+        }
+    },
+    "28_fold3": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.2,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0001
+        }
+    },
+    "28_fold4": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.2,
+            "svr__gamma": "scale",
+            "svr__kernel": "poly",
+            "svr__tol": 0.0001
+        }
+    },
+    "28_fold5": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.7,
+            "svr__gamma": "scale",
+            "svr__kernel": "poly",
+            "svr__tol": 0.0001
+        }
+    },
+    "32_fold1": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.1,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0005
+        }
+    },
+    "32_fold2": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.1,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0001
+        }
+    },
+    "32_fold3": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.1,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0001
+        }
+    },
+    "32_fold4": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.1,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0001
+        }
+    },
+    "32_fold5": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.1,
+            "svr__gamma": "scale",
+            "svr__kernel": "poly",
+            "svr__tol": 0.0005
+        }
+    },
+    "44_fold1": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.2,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0005
+        }
+    },
+    "44_fold2": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.2,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0005
+        }
+    },
+    "44_fold3": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.2,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0005
+        }
+    },
+    "44_fold4": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.2,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0001
+        }
+    },
+    "44_fold5": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.2,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0001
+        }
+    },
+    "52_fold1": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.7,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0005
+        }
+    },
+    "52_fold2": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.7,
+            "svr__gamma": "scale",
+            "svr__kernel": "poly",
+            "svr__tol": 0.0005
+        }
+    },
+    "52_fold3": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.7,
+            "svr__gamma": "scale",
+            "svr__kernel": "poly",
+            "svr__tol": 0.0005
+        }
+    },
+    "52_fold4": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.7,
+            "svr__gamma": "scale",
+            "svr__kernel": "poly",
+            "svr__tol": 0.0001
+        }
+    },
+    "52_fold5": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.7,
+            "svr__gamma": "scale",
+            "svr__kernel": "poly",
+            "svr__tol": 0.0005
+        }
+    },
+    "53_fold1": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.1,
+            "svr__gamma": "scale",
+            "svr__kernel": "poly",
+            "svr__tol": 0.0001
+        }
+    },
+    "53_fold2": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.1,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0005
+        }
+    },
+    "53_fold3": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.1,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0005
+        }
+    },
+    "53_fold4": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.2,
+            "svr__gamma": "scale",
+            "svr__kernel": "linear",
+            "svr__tol": 0.0001
+        }
+    },
+    "53_fold5": {
+        "model": "paper_svm",
+        "params": {
+            "svr__C": 1.0,
+            "svr__degree": 1,
+            "svr__epsilon": 0.1,
+            "svr__gamma": "auto",
+            "svr__kernel": "poly",
+            "svr__tol": 0.0001
+        }
+    }
+}
