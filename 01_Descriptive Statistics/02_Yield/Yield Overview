@@ -1,0 +1,107 @@
+"""
+Descriptive statistics of annual winter wheat yield – full sample
+Generates both CSV and PNG table for thesis insertion
+Yield unit: quintals per hectare (q/ha)
+"""
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+from pathlib import Path
+
+mpl.rcParams['font.family'] = 'serif'
+
+# ── Config ────────────────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
+THESIS_GRAPH_DIR = ROOT / "04_Thesis Graphs"
+THESIS_GRAPH_DIR.mkdir(parents=True, exist_ok=True)
+DATA_PATH = ROOT / "02_Data" / "02_Wheat" / "ble_tendre_hiver_yield_2000_2024_regions_mainland.csv"
+OUT_CSV   = SCRIPT_DIR / "yield_descriptive_stats.csv"
+OUT_PNG   = THESIS_GRAPH_DIR / "yield_descriptive_stats.png"
+
+REGION_NAMES = {
+    11: "Île-de-France",
+    24: "Centre-Val de Loire",
+    27: "Bourgogne-Franche-Comté",
+    28: "Normandie",
+    32: "Hauts-de-France",
+    44: "Grand Est",
+    52: "Pays de la Loire",
+    53: "Bretagne",
+}
+
+# ── Load ──────────────────────────────────────────────────────────────────────
+df = pd.read_csv(DATA_PATH)
+df = df[df["reg"].isin(REGION_NAMES.keys())].copy()
+
+# ── Compute stats ─────────────────────────────────────────────────────────────
+rows = []
+for code in sorted(REGION_NAMES.keys()):
+    name = REGION_NAMES[code]
+    y = df.loc[df["reg"] == code, "yield"].dropna()
+    rows.append({
+        "Region":   name,
+        "N":        int(y.count()),
+        "Mean":     y.mean(),
+        "St. Dev":  y.std(ddof=1),
+        "Max":      y.max(),
+        "Median":   y.median(),
+        "Min":      y.min(),
+        
+        
+    })
+
+results = pd.DataFrame(rows).set_index("Region")
+results.round(4).to_csv(OUT_CSV)
+
+# ── PNG table ─────────────────────────────────────────────────────────────────
+cols = ["N", "Mean", "St. Dev", "Max", "Median", "Min"]
+
+col_widths = [2.2, 0.55] + [0.78] * (len(cols) - 1)
+fig_w = sum(col_widths)
+fig_h = 0.30 * (len(results) + 1) + 0.15
+
+fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+ax.axis("off")
+
+n_rows = len(results)
+row_h  = 1.0 / (n_rows + 1.5)
+
+col_xs = []
+x = 0.0
+for w in col_widths:
+    col_xs.append(x / fig_w)
+    x += w
+col_xs.append(1.0)
+
+def row_y(i):
+    return 1.0 - (i + 0.5) * row_h
+
+# Three horizontal rules
+ax.axhline(1.0 - 0.08 * row_h, color="black", linewidth=1.0)
+ax.axhline(row_y(0) - 0.5 * row_h, color="black", linewidth=0.6)
+ax.axhline(row_y(n_rows) - 0.5 * row_h, color="black", linewidth=1.0)
+
+# Header
+for j, h in enumerate(["Region"] + cols):
+    x_pos = col_xs[j] + 0.01 if j == 0 else (col_xs[j] + col_xs[j+1]) / 2
+    ax.text(x_pos, row_y(0), h, ha="left" if j == 0 else "center",
+            va="center", fontsize=8.5, fontweight="bold",
+            transform=ax.transAxes)
+
+# Data rows
+for i, (region, row) in enumerate(results.iterrows()):
+    y = row_y(i + 1)
+    values = [region]
+    for c in cols:
+        values.append(f"{int(row[c])}" if c == "N" else f"{row[c]:.2f}")
+    for j, val in enumerate(values):
+        x_pos = col_xs[j] + 0.01 if j == 0 else (col_xs[j] + col_xs[j+1]) / 2
+        ax.text(x_pos, y, val, ha="left" if j == 0 else "center",
+                va="center", fontsize=8.5, transform=ax.transAxes)
+
+plt.tight_layout(pad=0.1)
+plt.savefig(OUT_PNG, dpi=220, bbox_inches="tight", facecolor="white")
+print(f"Saved PNG to: {OUT_PNG}")
+print(f"Saved CSV to: {OUT_CSV}")

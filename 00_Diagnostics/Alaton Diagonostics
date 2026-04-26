@@ -1,0 +1,362 @@
+"""
+Alaton missing-data diagnostic for regions 27 and 32.
+
+Hypothesis
+----------
+Regions 27 and 32 have gaps in the raw temperature series. The Alaton
+calibration assigns a sequential t index (1, 2, 3, ...) based on row count
+after dropna, not on calendar position. This causes two distinct problems:
+
+  Problem A — Phase shift in Tm
+    Every missing day shifts all subsequent t values one position earlier
+    than their true calendar date. This rotates the fitted sine wave relative
+    to the actual season and produces a systematically wrong Tm, which
+    corrupts Yi-1 weights, the global a estimate, and all OOS forecasts.
+
+  Problem B — Spurious cross-gap lag pairs
+    .shift(1) on the cleaned dataframe pairs observations that may be days
+    or weeks apart in real time. These pairs are fed into both the a
+    estimator (Eq. 3.26) and the sigma2 residuals (Eq. 3.17), both of which
+    assume daily consecutive observations.
+
+Other models (HBA) aggregate to annual indices and are immune to both.
+
+Outputs
+-------
+  alaton_diagnostics_missing_data.png  — 4-panel figure
+    Panel 1: Data completeness heatmap — all regions, all years
+    Panel 2: Gap size distribution — regions 27 and 32 vs the rest
+    Panel 3: t-index calendar misalignment — cumulative missing days
+    Panel 4: Calibrated a and KS-p across regions (from PKLs)
+"""
+
+import pickle
+import warnings
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+# --------------------------------------------------------------------------- #
+# Paths — adjust if your layout differs
+# --------------------------------------------------------------------------- #
+ROOT      = Path(__file__).resolve().parents[1]
+TEMP_DIR  = ROOT / "02_Data" / "01_Temprature"
+MODEL_DIR = Path(__file__).resolve().parent
+PKL_DIR   = MODEL_DIR / "01_PKL Files" / "02_Alaton"
+OUT_PATH  = MODEL_DIR / "alaton_diagnostics_missing_data.png"
+
+REGIONS     = [11, 24, 27, 28, 32, 44, 52, 53]
+PROBLEM_REGIONS = [27, 32]
+CALIB_YEAR  = 2019          # representative mid-sample calibration year to inspect
+DIAG_YEARS  = range(2010, 2024)
+
+BLUE  = "#2563EB"
+RED   = "#DC2626"
+GRAY  = "#6B7280"
+AMBER = "#D97706"
+
+# --------------------------------------------------------------------------- #
+# Load raw data
+# --------------------------------------------------------------------------- #
+raw = pd.read_csv(TEMP_DIR / "region_avg.csv", parse_dates=["date"])
+
+def remove_feb29(df):
+    return df[~((df.index.month == 2) & (df.index.day == 29))].copy()
+
+def load_region(region):
+    df = (raw[raw["region_code"] == region]
+          .set_index("date")
+          .rename(columns={"daily_avg_temperature": "T"})
+          [["T"]]
+          .sort_index())
+    return df
+
+# --------------------------------------------------------------------------- #
+# Panel 1 — completeness heatmap
+# Build a full calendar index and measure % days present per year per region
+# --------------------------------------------------------------------------- #
+print("Computing completeness...")
+
+full_idx = pd.date_range(
+    start=raw["date"].min(),
+    end=raw["date"].max(),
+    freq="D"
+)
+# Remove Feb 29 from the full index to match model preprocessing
+full_idx = full_idx[~((full_idx.month == 2) & (full_idx.day == 29))]
+
+completeness = {}   # region -> Series(year -> pct_present)
+gap_details  = {}   # region -> list of gap sizes (consecutive missing days)
+
+for region in REGIONS:
+    df = load_region(region)
+    df_clean = remove_feb29(df)
+    present  = df_clean.index[df_clean["T"].notna()]
+
+    # Completeness by year
+    by_year = {}
+    for yr in range(full_idx.year.min(), full_idx.year.max() + 1):
+        expected = full_idx[full_idx.year == yr]
+        n_present = present[present.year == yr].nunique()
+        by_year[yr] = n_present / len(expected) if len(expected) > 0 else np.nan
+    completeness[region] = pd.Series(by_year)
+
+    # Gap sizes — lengths of consecutive missing runs in the full calendar
+    full_yr = full_idx[(full_idx.year >= 2000) & (full_idx.year <= 2024)]
+    missing = full_yr[~full_yr.isin(present)]
+    gaps = []
+    if len(missing) > 0:
+        diffs = np.diff(missing)
+        gap = 1
+        for d in diffs:
+            if d == pd.Timedelta("1D"):
+                gap += 1
+            else:
+                gaps.append(gap)
+                gap = 1
+        gaps.append(gap)
+    gap_details[region] = gaps
+
+# --------------------------------------------------------------------------- #
+# Panel 3 — cumulative t-index misalignment
+# Cumulative missing days over time for problem vs other regions
+# --------------------------------------------------------------------------- #
+print("Computing t-index misalignment...")
+
+misalign = {}
+for region in REGIONS:
+    df = load_region(region)
+    df_clean = remove_feb29(df)
+    present = set(df_clean.index[df_clean["T"].notna()])
+
+    # For each calendar day in the analysis window, count cumulative missing
+    window = full_idx[(full_idx.year >= 2000) & (full_idx.year <= CALIB_YEAR)]
+    cum_missing = []
+    count = 0
+    for d in window:
+        if d not in present:
+            count += 1
+        cum_missing.append(count)
+    misalign[region] = pd.Series(cum_missing, index=window)
+
+# --------------------------------------------------------------------------- #
+# Panel 4 — calibrated a and KS-p from PKLs across regions and years
+# --------------------------------------------------------------------------- #
+print("Loading PKLs...")
+
+pkl_a   = {r: {} for r in REGIONS}
+pkl_ksp = {r: {} for r in REGIONS}
+pkl_sigma_range = {r: {} for r in REGIONS}
+
+for region in REGIONS:
+    for yr in DIAG_YEARS:
+        p = PKL_DIR / f"alaton_model_{region}_calib_{yr}.pkl"
+        if not p.exists():
+            continue
+        with open(p, "rb") as f:
+            m = pickle.load(f)
+        pkl_a[region][yr]   = m.get("a", np.nan)
+        pkl_ksp[region][yr] = m.get("ks_p", np.nan)
+        sm = m.get("sigma_monthly", {})
+        vals = list(sm.values())
+        pkl_sigma_range[region][yr] = (
+            (min(vals), max(vals)) if vals else (np.nan, np.nan)
+        )
+
+# --------------------------------------------------------------------------- #
+# Build figure
+# --------------------------------------------------------------------------- #
+print("Building figure...")
+
+fig = plt.figure(figsize=(18, 14))
+gs  = gridspec.GridSpec(2, 2, figure=fig, hspace=0.38, wspace=0.32)
+
+ax1 = fig.add_subplot(gs[0, 0])   # completeness heatmap
+ax2 = fig.add_subplot(gs[0, 1])   # gap size distribution
+ax3 = fig.add_subplot(gs[1, 0])   # cumulative misalignment
+ax4 = fig.add_subplot(gs[1, 1])   # calibrated a by region/year
+
+# ---- Panel 1: Completeness heatmap ----------------------------------------
+years   = sorted(set(y for s in completeness.values() for y in s.index))
+matrix  = np.array([[completeness[r].get(y, np.nan) for y in years]
+                    for r in REGIONS])
+
+im = ax1.imshow(matrix, aspect="auto", vmin=0.7, vmax=1.0,
+                cmap="RdYlGn", interpolation="nearest")
+ax1.set_xticks(range(len(years)))
+ax1.set_xticklabels([str(y) if y % 5 == 0 else "" for y in years], fontsize=6)
+ax1.set_yticks(range(len(REGIONS)))
+ax1.set_yticklabels([f"R{r}" for r in REGIONS], fontsize=8)
+ax1.set_title("Panel 1 — Data completeness by region & year\n"
+              "(% calendar days with observed temperature)",
+              fontsize=9, fontweight="bold")
+plt.colorbar(im, ax=ax1, fraction=0.03, pad=0.02).set_label("Completeness", fontsize=7)
+
+# Highlight problem regions
+for i, r in enumerate(REGIONS):
+    if r in PROBLEM_REGIONS:
+        ax1.add_patch(plt.Rectangle((-0.5, i - 0.5),
+                                    len(years), 1,
+                                    fill=False, edgecolor=RED, lw=2))
+
+# ---- Panel 2: Gap size distribution ----------------------------------------
+other_gaps   = []
+problem_gaps = []
+for region in REGIONS:
+    g = gap_details[region]
+    if region in PROBLEM_REGIONS:
+        problem_gaps.extend(g)
+    else:
+        other_gaps.extend(g)
+
+bins = np.arange(1, max(max(other_gaps or [1]),
+                        max(problem_gaps or [1])) + 2) - 0.5
+
+ax2.hist(other_gaps,   bins=bins, alpha=0.6, color=BLUE,
+         label=f"Other regions (n={len(other_gaps)} gaps)", density=True)
+ax2.hist(problem_gaps, bins=bins, alpha=0.8, color=RED,
+         label=f"R27+R32 (n={len(problem_gaps)} gaps)", density=True)
+ax2.set_xlim(0, min(60, bins[-1]))
+ax2.set_xlabel("Gap length (consecutive missing days)", fontsize=8)
+ax2.set_ylabel("Density", fontsize=8)
+ax2.legend(fontsize=7, frameon=False)
+ax2.set_title("Panel 2 — Gap size distribution (2000–present)\n"
+              "Larger/more frequent gaps → greater t-index misalignment",
+              fontsize=9, fontweight="bold")
+
+p_med = np.median(problem_gaps) if problem_gaps else 0
+o_med = np.median(other_gaps)   if other_gaps   else 0
+ax2.axvline(p_med, color=RED,  ls="--", lw=1.2, label=f"R27+R32 median={p_med:.0f}d")
+ax2.axvline(o_med, color=BLUE, ls="--", lw=1.2, label=f"Others median={o_med:.0f}d")
+ax2.legend(fontsize=7, frameon=False)
+
+# ---- Panel 3: Cumulative t-index misalignment ------------------------------
+for region in REGIONS:
+    s     = misalign[region]
+    color = RED   if region in PROBLEM_REGIONS else GRAY
+    lw    = 2.0   if region in PROBLEM_REGIONS else 0.8
+    alpha = 1.0   if region in PROBLEM_REGIONS else 0.4
+    label = f"R{region}" if region in PROBLEM_REGIONS else None
+    ax3.plot(s.index, s.values, color=color, lw=lw, alpha=alpha, label=label)
+
+ax3.set_xlabel("Date", fontsize=8)
+ax3.set_ylabel("Cumulative missing days\n(= t-index phase error in days)", fontsize=8)
+ax3.legend(fontsize=8, frameon=False)
+ax3.set_title("Panel 3 — Cumulative t-index misalignment (2000 → calib end)\n"
+              "Each missing day shifts the fitted sine wave 1 day out of phase",
+              fontsize=9, fontweight="bold")
+ax3.tick_params(labelsize=7)
+
+# Annotate: a 1-day phase error shifts peak Tm by how many days?
+# omega = 2pi/365, so 1 phase-unit = 365/2pi ~ 58 days of calendar shift
+omega_scale = 365 / (2 * np.pi)
+ax3_r = ax3.twinx()
+max_miss = max(s.values.max() for s in misalign.values())
+ax3_r.set_ylim(0, max_miss / omega_scale)
+ax3_r.set_ylabel("Implied Tm peak shift (days)", fontsize=7, color=AMBER)
+ax3_r.tick_params(labelsize=7, colors=AMBER)
+
+# ---- Panel 4: Calibrated a by region/year ----------------------------------
+years_list = sorted(DIAG_YEARS)
+
+for region in REGIONS:
+    a_vals = [pkl_a[region].get(yr, np.nan) for yr in years_list]
+    color  = RED   if region in PROBLEM_REGIONS else BLUE
+    lw     = 2.0   if region in PROBLEM_REGIONS else 0.8
+    alpha  = 1.0   if region in PROBLEM_REGIONS else 0.4
+    label  = f"R{region}" if region in PROBLEM_REGIONS else f"R{region} (ok)"
+    ax4.plot(years_list, a_vals, color=color, lw=lw, alpha=alpha,
+             marker="o", ms=3, label=label)
+
+# Expected range from Alaton paper: a ~ 0.2–0.4
+ax4.axhspan(0.1, 0.5, color="green", alpha=0.08,
+            label="Expected a range (0.1–0.5)")
+ax4.axhline(0, color="k", lw=0.5, ls="--")
+
+ax4.set_xlabel("Calibration year", fontsize=8)
+ax4.set_ylabel("Mean-reversion parameter â", fontsize=8)
+ax4.legend(fontsize=7, frameon=False, ncol=2)
+ax4.set_title("Panel 4 — Calibrated â across regions & calibration years\n"
+              "Anomalous values in R27/R32 confirm corrupted estimation",
+              fontsize=9, fontweight="bold")
+ax4.tick_params(labelsize=7)
+
+# Add KS-p text summary for problem regions at latest calib year
+latest = max(DIAG_YEARS)
+for region in PROBLEM_REGIONS:
+    ksp = pkl_ksp[region].get(latest, np.nan)
+    a   = pkl_a[region].get(latest, np.nan)
+    ax4.annotate(
+        f"R{region}: â={a:.3f}, KS-p={ksp:.3f}" if not np.isnan(a) else f"R{region}: missing",
+        xy=(latest, a if not np.isnan(a) else 0),
+        xytext=(latest - 3, (a + 0.15) if not np.isnan(a) else 0.3),
+        fontsize=7, color=RED,
+        arrowprops=dict(arrowstyle="->", color=RED, lw=0.8),
+    )
+
+# --------------------------------------------------------------------------- #
+# Title and save
+# --------------------------------------------------------------------------- #
+fig.suptitle(
+    "Alaton model — Missing data diagnostic for regions 27 and 32\n"
+    "Root cause: sequential t-index ignores calendar gaps → "
+    "phase-shifted Tm + spurious cross-gap lag pairs in â and σ estimation",
+    fontsize=11, fontweight="bold", y=1.01,
+)
+
+fig.savefig(OUT_PATH, dpi=150, bbox_inches="tight")
+plt.close(fig)
+print(f"Saved -> {OUT_PATH}")
+
+# --------------------------------------------------------------------------- #
+# Text summary
+# --------------------------------------------------------------------------- #
+print("\n" + "="*70)
+print("DIAGNOSTIC SUMMARY")
+print("="*70)
+
+for region in PROBLEM_REGIONS:
+    df = load_region(region)
+    df_clean = remove_feb29(df)
+    n_obs      = df_clean["T"].notna().sum()
+    n_expected = len(full_idx[
+        (full_idx >= df_clean.index.min()) &
+        (full_idx <= df_clean.index.max())
+    ])
+    n_missing  = n_expected - n_obs
+    max_gap    = max(gap_details[region]) if gap_details[region] else 0
+    cum_miss   = misalign[region].iloc[-1] if region in misalign else np.nan
+
+    print(f"\nRegion {region}:")
+    print(f"  Obs present   : {n_obs:,} / {n_expected:,} "
+          f"({100*n_obs/n_expected:.1f}%)")
+    print(f"  Total missing : {n_missing:,} days")
+    print(f"  Largest gap   : {max_gap} days")
+    print(f"  Cumulative t-index misalignment by {CALIB_YEAR}: "
+          f"{int(cum_miss)} days "
+          f"= {cum_miss/365*365/(2*np.pi):.1f}-day Tm peak shift")
+    for yr in [2010, 2015, 2019, 2023]:
+        a   = pkl_a[region].get(yr, np.nan)
+        ksp = pkl_ksp[region].get(yr, np.nan)
+        print(f"  Calib {yr}: â={a:.4f}  KS-p={ksp:.3f}")
+
+print("\nFor comparison — well-behaved regions:")
+for region in [r for r in REGIONS if r not in PROBLEM_REGIONS]:
+    a   = pkl_a[region].get(2019, np.nan)
+    ksp = pkl_ksp[region].get(2019, np.nan)
+    print(f"  R{region} (2019): â={a:.4f}  KS-p={ksp:.3f}")
+
+print("\nMechanical fix required in Alaton calibration script:")
+print("  Replace the sequential t-index with a calendar-based index:")
+print("    t_start = date of first observation in the FULL series")
+print("    calib_df['t'] = (calib_df.index - t_start).days + 1")
+print("  This preserves the correct phase even when days are missing.")
+print("  Also filter out cross-gap shift(1) pairs before feeding")
+print("  into the a estimator and sigma2 residuals.")

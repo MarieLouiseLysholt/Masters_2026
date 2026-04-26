@@ -1,0 +1,659 @@
+import os
+import json
+import pickle
+import warnings
+import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from sklearn.impute import SimpleImputer
+from sklearn.experimental import enable_halving_search_cv  # noqa: F401
+from sklearn.model_selection import TimeSeriesSplit, HalvingGridSearchCV
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_absolute_percentage_error,
+    mean_squared_error,
+    r2_score,
+)
+
+import xgboost as xgb
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+warnings.filterwarnings("ignore")
+warnings.simplefilter("ignore")
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT       = SCRIPT_DIR.parent
+INPUT_CSV  = ROOT / "02_Data" / "01_Temprature" / "region_temp_extended.csv"
+OUTPUT_DIR = SCRIPT_DIR / "01_PKL Files" / "07_XGBoost"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+TODAY = datetime.datetime.today().strftime("%Y-%m-%d")
+START = datetime.datetime.now()
+
+RANDOM_STATE = 23
+N_JOBS = -1
+HORIZON = 1
+TUNING_END_YEAR = 2010
+TUNING_END_DATE = pd.Timestamp(f"{TUNING_END_YEAR}-12-31")
+
+DATE_COL = "date"
+REGION_CANDIDATES = ["name", "region_code"]
+
+TARGET_COL = "next_day"
+
+TRAINING_FEATURES = [
+    "next_day",
+    "dayofyear",
+    "pdtn_doy",
+    "de_trend_seas",
+    "dts_doyavge",
+    "dts_doyvar",
+    "yday",
+    "IIdays_ago",
+    "IIIdays_ago",
+    "IVdays_ago",
+    "Vdays_ago",
+    "VIdays_ago",
+    "VIIdays_ago",
+    "last_year",
+    "last_2year",
+    "last_3year",
+    "last_4year",
+    "last_5year",
+    "h1_last_year",
+    "h1_last_2years",
+    "h1_last_3years",
+    "h1_last_4years",
+    "h1_last_5years",
+    "h1_ly_2days",
+    "h1_ly_3day",
+    "h1_ly_4day",
+    "h1_ly_5day",
+    "h1_ly_6day",
+    "h1_ly_7day",
+    "h1_ly_next_1day",
+    "h1_ly_next_2days",
+    "h1_ly_next_3days",
+    "h1_ly_next_4days",
+    "h1_ly_next_5days",
+    "h1_ly_next_6days",
+    "h1_ly_next_7days",
+    "diff_1year",
+    "diff_2year",
+    "diff_3year",
+    "diff_4year",
+    "diff_5year",
+    "diff_yday",
+    "diff_2days",
+    "diff_3days",
+    "diff_4days",
+    "diff_5days",
+    "diff_6days",
+    "diff_7days",
+    "last_7_1day_deltas_mean",
+    "last_7_1day_deltas_min",
+    "last_7_1day_deltas_max",
+]
+
+XGB_GRID = {
+    "n_estimators": [5, 50, 80, 100, 150, 200],
+    "max_depth": [2, 3, 4, 5, 6],
+    "learning_rate": [0.09, 0.10, 0.14, 0.18, 0.20, 0.21],
+}
+
+OUTER_CV = TimeSeriesSplit(n_splits=5, test_size=365)
+INNER_CV = TimeSeriesSplit(n_splits=3)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def find_region_col(df: pd.DataFrame) -> str:
+    for c in REGION_CANDIDATES:
+        if c in df.columns:
+            return c
+    raise ValueError(f"Could not find region column among {REGION_CANDIDATES}")
+
+
+def load_data() -> tuple[pd.DataFrame, str]:
+    df = pd.read_csv(INPUT_CSV)
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL])
+
+    region_col = find_region_col(df)
+
+    required = {DATE_COL, region_col, *TRAINING_FEATURES}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    df = df.sort_values([region_col, DATE_COL]).reset_index(drop=True)
+    return df, region_col
+
+
+def create_next_day_target(group: pd.DataFrame) -> pd.DataFrame:
+    g = group.copy().sort_values(DATE_COL)
+    g["next_day"] = g["de_trend_seas"].shift(-1)
+    return g
+
+
+def evaluate_fit(y_true, y_pred):
+    mae = mean_absolute_error(y_true, y_pred)
+    mape = mean_absolute_percentage_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    bias = np.mean(y_pred - y_true)
+    r2 = r2_score(y_true, y_pred)
+    return {
+        "MAE": mae,
+        "MAPE": mape,
+        "Bias": bias,
+        "R2": r2,
+        "RMSE": rmse,
+    }
+
+
+# ============================================================
+# MAIN  (tuning + initial model export)
+# ============================================================
+
+def main():
+    feat_df, region_col = load_data()
+
+    # pandas 3.x drops the grouping column from groupby(col).apply(...) output,
+    # which breaks later feat_df[region_col] lookups with KeyError. Do the
+    # shift directly instead — same result, no apply.
+    feat_df = feat_df.sort_values([region_col, DATE_COL]).reset_index(drop=True)
+    feat_df["next_day"] = feat_df.groupby(region_col)["de_trend_seas"].shift(-1)
+
+    nested_cv_results = []
+    best_params_dict = {}
+    best_params_rows = []
+    fit_metric_rows = []
+
+    imputer = SimpleImputer()
+    scaler = StandardScaler()
+
+    for region in feat_df[region_col].dropna().unique():
+        print(f"\n=== REGION {region} ===")
+
+        region_df = feat_df[feat_df[region_col] == region].copy().sort_values(DATE_COL)
+        tuning_df = region_df.loc[region_df[DATE_COL] <= TUNING_END_DATE].copy()
+        train = tuning_df[TRAINING_FEATURES].dropna(axis=0, how="any").copy()
+
+        print(f"Tuning rows through {TUNING_END_DATE.date()}: {len(train)}")
+
+        if len(train) < 365 * 6:
+            print(f"Skipping {region}: too few rows ({len(train)})")
+            continue
+
+        X_train = train.drop("next_day", axis="columns")
+        X_train = imputer.fit_transform(X_train)
+        X_train = scaler.fit_transform(X_train)
+        y_train = train["next_day"]
+
+        fold_results = []
+
+        for fold_idx, (train_idx, test_idx) in enumerate(OUTER_CV.split(X_train), start=1):
+            print(f"Outer Fold {fold_idx}")
+
+            X_outer_train, X_outer_test = X_train[train_idx], X_train[test_idx]
+            y_outer_train, y_outer_test = y_train.iloc[train_idx], y_train.iloc[test_idx]
+
+            grid_search = HalvingGridSearchCV(
+                estimator=xgb.XGBRegressor(
+                    objective="reg:squarederror",
+                    random_state=RANDOM_STATE,
+                    n_jobs=1,
+                ),
+                param_grid=XGB_GRID,
+                cv=INNER_CV,
+                scoring="neg_mean_absolute_percentage_error",
+                refit=True,
+                n_jobs=N_JOBS,
+            )
+            grid_search.fit(X_outer_train, y_outer_train)
+
+            best_model = grid_search.best_estimator_
+            y_pred = best_model.predict(X_outer_test)
+
+            mape = mean_absolute_percentage_error(y_outer_test, y_pred)
+            r2 = r2_score(y_outer_test, y_pred)
+
+            row = {
+                "model": "paper_xgboost",
+                "region": region,
+                "mape": mape,
+                "r2": r2,
+                "horizon": HORIZON,
+                "fold": fold_idx,
+            }
+            nested_cv_results.append(row)
+            fold_results.append(row)
+
+            fold_key = f"{region}_fold{fold_idx}"
+            best_params_dict[fold_key] = {
+                "model": "paper_xgboost",
+                "name": grid_search.best_params_,
+            }
+
+            fold_best_params = pd.DataFrame(grid_search.best_params_, index=[fold_key])
+            fold_best_params["model"] = "paper_xgboost"
+            fold_best_params["region"] = region
+            fold_best_params["fold"] = fold_idx
+            best_params_rows.append(fold_best_params)
+
+        nested_cv_df = pd.DataFrame(fold_results)
+        if nested_cv_df.empty:
+            continue
+
+        min_row = nested_cv_df.loc[nested_cv_df["mape"].idxmin()]
+        best_fold = f"{min_row['region']}_fold{int(min_row['fold'])}"
+        best_params = best_params_dict[best_fold]["name"]
+
+        final_model = xgb.XGBRegressor(
+            objective="reg:squarederror",
+            random_state=RANDOM_STATE,
+            n_jobs=1,
+            **best_params,
+        )
+        final_model.fit(X_train, y_train)
+
+        y_fit = final_model.predict(X_train)
+        fit_metrics = evaluate_fit(y_train, y_fit)
+        fit_metrics["Model"] = "paper_xgboost"
+        fit_metrics["region"] = region
+        fit_metric_rows.append(fit_metrics)
+
+        with open(OUTPUT_DIR / f"best_mod_{region}_paper_xgboost.pkl", "wb") as f:
+            pickle.dump(final_model, f)
+
+    nested_cv_all = pd.DataFrame(nested_cv_results)
+    best_params_df = pd.concat(best_params_rows, axis=0) if best_params_rows else pd.DataFrame()
+    fit_metrics_df = pd.DataFrame(fit_metric_rows)
+
+    print("Time taken:", datetime.datetime.now() - START)
+
+
+# ============================================================
+# EXPORT ROLLING-YEAR XGBOOST MODELS WITHOUT RE-TUNING
+# - loads tuned per-region XGBoost exports from the original run
+# - accepts either:
+#     1) a bare fitted XGBRegressor in the source PKL, or
+#     2) a dict payload containing "best_params" and/or "fitted_model"
+# - reuses tuned hyperparameters
+# - refits region models on expanding yearly samples
+# - saves one PKL per region per calibration year
+#
+# Example:
+#   calibrated through 2014-12-31 -> predicts 2015
+#   calibrated through 2015-12-31 -> predicts 2016
+#   ...
+#   calibrated through 2023-12-31 -> predicts 2024
+# ============================================================
+
+from sklearn.pipeline import Pipeline
+
+
+# ============================================================
+# CONFIG (rolling export)
+# ============================================================
+
+# original tuned outputs from your first XGBoost run
+SOURCE_DIR = OUTPUT_DIR
+
+# new rolling exports (same folder)
+EXPORT_DIR = OUTPUT_DIR
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+MODEL_NAME = "XGBoost (pure ML)"
+
+START_CALIB_YEAR = 2010
+END_CALIB_YEAR = 2023  # 2023 calibration -> 2024 prediction
+
+FEATURE_COLS = [
+    "dayofyear",
+    "pdtn_doy",
+    "de_trend_seas",
+    "dts_doyavge",
+    "dts_doyvar",
+    "yday",
+    "IIdays_ago",
+    "IIIdays_ago",
+    "IVdays_ago",
+    "Vdays_ago",
+    "VIdays_ago",
+    "VIIdays_ago",
+    "last_year",
+    "last_2year",
+    "last_3year",
+    "last_4year",
+    "last_5year",
+    "h1_last_year",
+    "h1_last_2years",
+    "h1_last_3years",
+    "h1_last_4years",
+    "h1_last_5years",
+    "h1_ly_2days",
+    "h1_ly_3day",
+    "h1_ly_4day",
+    "h1_ly_5day",
+    "h1_ly_6day",
+    "h1_ly_7day",
+    "h1_ly_next_1day",
+    "h1_ly_next_2days",
+    "h1_ly_next_3days",
+    "h1_ly_next_4days",
+    "h1_ly_next_5days",
+    "h1_ly_next_6days",
+    "h1_ly_next_7days",
+    "diff_1year",
+    "diff_2year",
+    "diff_3year",
+    "diff_4year",
+    "diff_5year",
+    "diff_yday",
+    "diff_2days",
+    "diff_3days",
+    "diff_4days",
+    "diff_5days",
+    "diff_6days",
+    "diff_7days",
+    "last_7_1day_deltas_mean",
+    "last_7_1day_deltas_min",
+    "last_7_1day_deltas_max",
+]
+
+
+# ============================================================
+# HELPERS (rolling export)
+# ============================================================
+
+def evaluate_fit_rolling(y_true, y_pred):
+    mae = mean_absolute_error(y_true, y_pred)
+    mape = mean_absolute_percentage_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    bias = np.mean(y_pred - y_true)
+    r2 = r2_score(y_true, y_pred)
+    return {
+        "MAE": float(mae),
+        "MAPE": float(mape),
+        "Bias": float(bias),
+        "R2": float(r2),
+        "RMSE": float(rmse),
+    }
+
+
+def build_pipeline() -> Pipeline:
+    return Pipeline(
+        steps=[
+            ("imputer", SimpleImputer()),
+            ("scaler", StandardScaler()),
+            (
+                "xgb",
+                xgb.XGBRegressor(
+                    objective="reg:squarederror",
+                    random_state=RANDOM_STATE,
+                    n_jobs=1,
+                ),
+            ),
+        ]
+    )
+
+
+def extract_best_params_from_model_or_payload(obj) -> dict:
+    """
+    Accepts either:
+    - fitted sklearn Pipeline with step 'xgb'
+    - bare fitted xgb.XGBRegressor
+    - dict payload containing 'best_params'
+    - dict payload containing 'fitted_model'
+    Returns params in sklearn Pipeline set_params format: xgb__...
+    """
+    if isinstance(obj, dict):
+        if "best_params" in obj and isinstance(obj["best_params"], dict):
+            best_params = obj["best_params"]
+            # handle either xgb__param style or bare param style
+            if all(k.startswith("xgb__") for k in best_params.keys()):
+                return best_params
+            return {f"xgb__{k}": v for k, v in best_params.items()}
+        if "fitted_model" in obj:
+            obj = obj["fitted_model"]
+        else:
+            raise ValueError(
+                "Dict payload does not contain 'best_params' or 'fitted_model'."
+            )
+
+    if hasattr(obj, "named_steps"):
+        if "xgb" not in obj.named_steps:
+            raise ValueError("Pipeline does not contain an 'xgb' step.")
+        model = obj.named_steps["xgb"]
+    else:
+        model = obj
+
+    if not isinstance(model, xgb.XGBRegressor):
+        raise ValueError("Loaded object is not an XGBRegressor or Pipeline containing one.")
+
+    param_names = [
+        "n_estimators",
+        "max_depth",
+        "learning_rate",
+        "subsample",
+        "colsample_bytree",
+        "gamma",
+        "min_child_weight",
+        "reg_alpha",
+        "reg_lambda",
+    ]
+
+    raw_params = model.get_params()
+    best_params = {}
+
+    for name in param_names:
+        if name in raw_params:
+            best_params[f"xgb__{name}"] = raw_params[name]
+
+    return best_params
+
+
+def get_prediction_year_frame(region_df: pd.DataFrame, prediction_year: int) -> pd.DataFrame:
+    start = pd.Timestamp(f"{prediction_year}-01-01")
+    end = pd.Timestamp(f"{prediction_year}-12-31")
+    return region_df.loc[
+        (region_df[DATE_COL] >= start) & (region_df[DATE_COL] <= end)
+    ].copy()
+
+
+def create_next_day_target_rolling(group: pd.DataFrame) -> pd.DataFrame:
+    g = group.copy().sort_values(DATE_COL)
+    g[TARGET_COL] = g["de_trend_seas"].shift(-1)
+    return g
+
+
+def load_data_rolling() -> tuple[pd.DataFrame, str]:
+    df = pd.read_csv(INPUT_CSV)
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL])
+
+    region_col = find_region_col(df)
+
+    required = {DATE_COL, region_col, "de_trend_seas", *FEATURE_COLS}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    df = df.sort_values([region_col, DATE_COL]).reset_index(drop=True)
+    return df, region_col
+
+
+# ============================================================
+# MAIN  (rolling export)
+# ============================================================
+
+def main_rolling():
+    feat_df, region_col = load_data_rolling()
+
+    # pandas 3.x drops the grouping column from groupby(col).apply(...) output;
+    # use a direct groupby-shift to keep the column.
+    feat_df = feat_df.sort_values([region_col, DATE_COL]).reset_index(drop=True)
+    feat_df[TARGET_COL] = feat_df.groupby(region_col)["de_trend_seas"].shift(-1)
+
+    export_rows = []
+    exported_models = {}
+
+    regions = feat_df[region_col].dropna().unique()
+
+    for region in regions:
+        print(f"\n=== REGION {region} ===")
+
+        source_pkl = SOURCE_DIR / f"best_mod_{region}_paper_xgboost.pkl"
+        if not source_pkl.exists():
+            print(f"Skipping {region}: tuned source file not found -> {source_pkl}")
+            continue
+
+        with open(source_pkl, "rb") as f:
+            loaded_obj = pickle.load(f)
+
+        try:
+            best_params = extract_best_params_from_model_or_payload(loaded_obj)
+        except Exception as e:
+            print(f"Skipping {region}: could not extract best params -> {e}")
+            continue
+
+        region_df = (
+            feat_df.loc[
+                feat_df[region_col] == region,
+                [DATE_COL, region_col] + FEATURE_COLS + [TARGET_COL]
+            ]
+            .copy()
+            .sort_values(DATE_COL)
+        )
+
+        region_df = region_df.dropna(axis=0, how="any").copy()
+
+        if region_df.empty:
+            print(f"Skipping {region}: no usable rows after dropping missing values")
+            continue
+
+        exported_models[int(region)] = {}
+
+        for calib_year in range(START_CALIB_YEAR, END_CALIB_YEAR + 1):
+            calibration_end = pd.Timestamp(f"{calib_year}-12-31")
+            prediction_year = calib_year + 1
+
+            calib_df = region_df.loc[region_df[DATE_COL] <= calibration_end].copy()
+            pred_year_df = get_prediction_year_frame(region_df, prediction_year)
+
+            if len(calib_df) < 365 * 6:
+                print(
+                    f"Skipping region {region}, calib {calib_year}: "
+                    f"too few calibration rows ({len(calib_df)})"
+                )
+                continue
+
+            if pred_year_df.empty:
+                print(
+                    f"Skipping region {region}, calib {calib_year}: "
+                    f"no rows for prediction year {prediction_year}"
+                )
+                continue
+
+            X_calib = calib_df[FEATURE_COLS]
+            y_calib = calib_df[TARGET_COL]
+
+            X_pred_year = pred_year_df[FEATURE_COLS]
+            y_pred_year_true = pred_year_df[TARGET_COL]
+
+            final_pipe = build_pipeline()
+            final_pipe.set_params(**best_params)
+            final_pipe.fit(X_calib, y_calib)
+
+            y_fit = final_pipe.predict(X_calib)
+            fit_metrics = evaluate_fit_rolling(y_calib, y_fit)
+
+            y_pred_year_hat = final_pipe.predict(X_pred_year)
+            pred_year_metrics = evaluate_fit_rolling(y_pred_year_true, y_pred_year_hat)
+
+            payload = {
+                "model_name": MODEL_NAME,
+                "region": int(region),
+                "calibration_year": int(calib_year),
+                "calibration_end": str(calibration_end.date()),
+                "prediction_year": int(prediction_year),
+                "target_col": TARGET_COL,
+                "feature_cols": FEATURE_COLS,
+                "best_params": best_params,
+                "fit_metrics": fit_metrics,
+                "prediction_year_metrics": pred_year_metrics,
+                "n_calibration_rows": int(len(calib_df)),
+                "n_prediction_rows": int(len(pred_year_df)),
+                "train_start": str(calib_df[DATE_COL].min().date()),
+                "train_end": str(calib_df[DATE_COL].max().date()),
+                "prediction_start": str(pred_year_df[DATE_COL].min().date()),
+                "prediction_end": str(pred_year_df[DATE_COL].max().date()),
+                "source_tuned_file": str(source_pkl),
+                "fitted_model": final_pipe,
+                "created_at": datetime.datetime.now().isoformat(),
+            }
+
+            out_path = (
+                EXPORT_DIR
+                / f"paper_xgboost_region_{region}_calib_{calib_year}_predict_{prediction_year}.pkl"
+            )
+            with open(out_path, "wb") as f:
+                pickle.dump(payload, f)
+
+            exported_models[int(region)][int(calib_year)] = payload
+
+            export_rows.append(
+                {
+                    "region": int(region),
+                    "calibration_year": int(calib_year),
+                    "calibration_end": str(calibration_end.date()),
+                    "prediction_year": int(prediction_year),
+                    "train_start": payload["train_start"],
+                    "train_end": payload["train_end"],
+                    "prediction_start": payload["prediction_start"],
+                    "prediction_end": payload["prediction_end"],
+                    "n_calibration_rows": payload["n_calibration_rows"],
+                    "n_prediction_rows": payload["n_prediction_rows"],
+                    "fit_MAE": fit_metrics["MAE"],
+                    "fit_MAPE": fit_metrics["MAPE"],
+                    "fit_Bias": fit_metrics["Bias"],
+                    "fit_R2": fit_metrics["R2"],
+                    "fit_RMSE": fit_metrics["RMSE"],
+                    "pred_year_MAE": pred_year_metrics["MAE"],
+                    "pred_year_MAPE": pred_year_metrics["MAPE"],
+                    "pred_year_Bias": pred_year_metrics["Bias"],
+                    "pred_year_R2": pred_year_metrics["R2"],
+                    "pred_year_RMSE": pred_year_metrics["RMSE"],
+                    "export_path": str(out_path),
+                }
+            )
+
+            print(f"Saved region {region} | calib {calib_year} -> predict {prediction_year}")
+
+    if export_rows:
+        export_df = pd.DataFrame(export_rows)
+        export_df.to_csv(
+            EXPORT_DIR / f"paper_xgboost_rolling_exports_{TODAY}.csv",
+            index=False,
+        )
+
+    with open(EXPORT_DIR / "all_regions_paper_xgboost_rolling_models.pkl", "wb") as f:
+        pickle.dump(exported_models, f)
+
+    print(f"\nSaved rolling calibrated model files to {EXPORT_DIR}")
+    print("Time taken:", datetime.datetime.now() - START)
+
+
+if __name__ == "__main__":
+    main()
+    main_rolling()

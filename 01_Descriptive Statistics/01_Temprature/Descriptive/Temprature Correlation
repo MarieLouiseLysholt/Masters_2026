@@ -1,0 +1,167 @@
+"""
+Table X.a: Correlation matrix of daily temperature – before seasonal removal
+Table X.b: Correlation matrix of daily temperature – after seasonal removal
+
+Seasonal mean follows the Alaton et al. (2002) linear approach (eq. 5.18 in
+Benth & Šaltytė Benth 2012):
+
+    S(t) = A + B*t + C*sin(2*pi*t/365 + phi)
+
+Equivalently estimated via OLS as:
+    S(t) = A + B*t + c1*sin(2*pi*t/365) + c2*cos(2*pi*t/365)
+
+Residuals from this fit form the detrended and deseasonalized series
+used for the after-removal correlation matrix.
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+from pathlib import Path
+
+mpl.rcParams['font.family'] = 'serif'
+
+# ── Config ────────────────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
+THESIS_GRAPH_DIR = ROOT / "04_Thesis Graphs"
+THESIS_GRAPH_DIR.mkdir(parents=True, exist_ok=True)
+DATA_PATH  = ROOT / "02_Data" / "01_Temprature" / "region_avg.csv"
+CSV_DIR    = SCRIPT_DIR
+
+REGION_NAMES = {
+    11: "Île-de-France",
+    24: "Centre-Val de Loire",
+    27: "Bourgogne-Franche-Comté",
+    28: "Normandie",
+    32: "Hauts-de-France",
+    44: "Grand Est",
+    52: "Pays de la Loire",
+    53: "Bretagne",
+}
+
+SHORT_NAMES = {
+    "Île-de-France":           "Île",
+    "Centre-Val de Loire":     "Centre",
+    "Bourgogne-Franche-Comté": "Bourgogne",
+    "Normandie":               "Normandie",
+    "Hauts-de-France":         "Hauts",
+    "Grand Est":               "Grand Est",
+    "Pays de la Loire":        "Pays",
+    "Bretagne":                "Bretagne",
+}
+
+# ── Load and pivot ────────────────────────────────────────────────────────────
+df = pd.read_csv(DATA_PATH, parse_dates=["date"])
+all_codes     = sorted(df["region_code"].unique())
+region_labels = {code: REGION_NAMES.get(code, f"Region {code}") for code in all_codes}
+
+pivot = (
+    df.pivot(index="date", columns="region_code", values="daily_avg_temperature")
+    .sort_index()
+    .rename(columns=region_labels)
+)
+
+# ── Fit Alaton seasonal model per region, extract residuals ───────────────────
+def build_design_matrix(n, period=365):
+    t = np.arange(n)
+    return np.column_stack([
+        np.ones(n),
+        t,
+        np.sin(2 * np.pi * t / period),
+        np.cos(2 * np.pi * t / period),
+    ])
+
+residuals = pd.DataFrame(index=pivot.index)
+
+for col in pivot.columns:
+    series = pivot[col].dropna()
+    X      = build_design_matrix(len(series))
+    coeffs, _, _, _ = np.linalg.lstsq(X, series.values, rcond=None)
+    residuals[col]  = pd.Series(series.values - X @ coeffs, index=series.index)
+
+# ── Correlation matrices ──────────────────────────────────────────────────────
+corr_before = pivot.corr()
+corr_after  = residuals.corr()
+
+# ── Print helper ──────────────────────────────────────────────────────────────
+def print_corr_table(corr_df):
+    cols  = list(corr_df.columns)
+    short = [c.split("-")[0].split(" ")[0] for c in cols]
+    col_w, name_w = 10, 28
+    print(" " * name_w + "".join(f"{s:>{col_w}}" for s in short))
+    print("-" * (name_w + col_w * len(cols)))
+    for region in cols:
+        row = f"{region:<{name_w}}"
+        for other in cols:
+            row += f"{corr_df.loc[region, other]:>{col_w}.3f}"
+        print(row)
+
+print("\nBefore removing seasonal component\n")
+print_corr_table(corr_before)
+print("\n\nAfter removing seasonal component (Alaton et al. 2002)\n")
+print_corr_table(corr_after)
+print(f"\nSample: {pivot.index.min().date()} to {pivot.index.max().date()}")
+
+# ── PNG helper ────────────────────────────────────────────────────────────────
+def save_corr_png(corr_df, out_path):
+    regions = list(corr_df.columns)
+    short   = [SHORT_NAMES[r] for r in regions]
+    n       = len(regions)
+
+    name_w = 1.9
+    cell_w = 0.88
+    fig_w  = name_w + cell_w * n
+    fig_h  = 0.30 * (n + 1) + 0.15
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.axis("off")
+
+    row_h = 1.0 / (n + 1.5)
+
+    col_widths = [name_w] + [cell_w] * n
+    col_xs = []
+    x = 0.0
+    for w in col_widths:
+        col_xs.append(x / fig_w)
+        x += w
+    col_xs.append(1.0)
+
+    def row_y(i):
+        return 1.0 - (i + 0.5) * row_h
+
+    # Three horizontal rules
+    ax.axhline(1.0 - 0.08 * row_h, color="black", linewidth=1.0)
+    ax.axhline(row_y(0) - 0.5 * row_h, color="black", linewidth=0.6)
+    ax.axhline(row_y(n) - 0.5 * row_h, color="black", linewidth=1.0)
+
+    # Header
+    ax.text(col_xs[0] + 0.01, row_y(0), "Region",
+            ha="left", va="center", fontsize=8.5, fontweight="bold",
+            transform=ax.transAxes)
+    for j, s in enumerate(short):
+        x_pos = (col_xs[j+1] + col_xs[j+2]) / 2
+        ax.text(x_pos, row_y(0), s, ha="center", va="center",
+                fontsize=8.5, fontweight="bold", transform=ax.transAxes)
+
+    # Data rows
+    for i, region in enumerate(regions):
+        ax.text(col_xs[0] + 0.01, row_y(i+1), region,
+                ha="left", va="center", fontsize=8.5, transform=ax.transAxes)
+        for j, other in enumerate(regions):
+            x_pos = (col_xs[j+1] + col_xs[j+2]) / 2
+            ax.text(x_pos, row_y(i+1), f"{corr_df.loc[region, other]:.3f}",
+                    ha="center", va="center", fontsize=8.5, transform=ax.transAxes)
+
+    plt.tight_layout(pad=0.1)
+    plt.savefig(out_path, dpi=220, bbox_inches="tight", facecolor="white")
+    plt.close()
+    print(f"Saved PNG to: {out_path}")
+
+# ── Save CSVs and PNGs ────────────────────────────────────────────────────────
+corr_before.round(3).to_csv(CSV_DIR / "corr_before_seasonal.csv")
+corr_after.round(3).to_csv(CSV_DIR / "corr_after_seasonal.csv")
+save_corr_png(corr_before, THESIS_GRAPH_DIR / "corr_before_seasonal.png")
+save_corr_png(corr_after,  THESIS_GRAPH_DIR / "corr_after_seasonal.png")
+print(f"Saved CSVs to: {CSV_DIR}")
