@@ -1,5 +1,5 @@
 # Large local/generated data
-02_Data/01_Temprature/region_temp_extended.csv
+#02_Data/01_Temprature/region_temp_extended.csv
 03_Models/01_PKL Files/
 04_Analysis/02_Bootstrap Paths/bootstrap_paths/
 *.pkl
