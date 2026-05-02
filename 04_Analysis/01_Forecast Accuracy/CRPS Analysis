@@ -1,0 +1,333 @@
+"""
+CRPS Analysis
+=============
+Continuous Ranked Probability Score (CRPS) on the model-specific bootstrap
+predictive distributions used elsewhere in pricing and hedging.
+
+CRPS is a strictly proper scoring rule that jointly rewards point accuracy
+AND probabilistic calibration. Lower = better. Same units as the underlying
+index (degC for AvgT, degC-days for HDD / CDD / CAT).
+
+For each (model, region, OOS year, month, index type):
+  1. Slice the model's 10,000 bootstrap paths to the calendar month.
+  2. Aggregate each path to the monthly index value -> empirical predictive
+     distribution of the monthly index.
+  3. Compute CRPS of that empirical distribution against the realised
+     monthly index from region_avg.csv.
+
+Output (booktabs B&W tables, matching Forecast Accuracy_v2 styling):
+  99_Thesis Graphs/03_Results/01_Forecast Accuracy/
+    csv_crps_raw.csv         — per (model, region, year, month, index)
+    csv_crps_by_model.csv    — per (model, index) summary
+    T05_crps_AvgT.png        — models x [Mean CRPS, RMSE-equivalent], AvgT
+    T05_crps_HDD.png         — same, HDD
+    T05_crps_CDD.png         — same, CDD
+    T05_crps_CAT.png         — same, CAT
+
+Method note
+-----------
+For an empirical distribution {x_1, ..., x_n} (sorted ascending) and a
+single observation y:
+
+    CRPS = E|X - y| - (1/2) E|X - X'|
+
+The pairwise term has a closed form for sorted samples:
+
+    (1/2) E|X - X'| = (1/n^2) sum_i (2i - n - 1) * x_(i)
+
+Implementation is O(n log n) per cell via a single sort.
+
+Reference: Gneiting & Raftery (2007).
+"""
+
+import sys
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, OSError):
+    pass
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from pathlib import Path
+import warnings
+
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT       = Path(__file__).resolve().parents[2]
+PATHS_DIR  = ROOT / "04_Analysis" / "02_Bootstrap Paths" / "bootstrap_paths"
+TEMP_CSV   = ROOT / "02_Data" / "01_Temprature" / "region_avg.csv"
+OUTPUT_DIR = ROOT / "99_Thesis Graphs" / "03_Results" / "01_Forecast Accuracy"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+MODEL_ORDER = [
+    "HBA", "Alaton", "Benth", "ARMA",
+    "XGB", "LSTM", "FeedForwardNN", "KNN", "SVM",
+]
+
+LABELS = {
+    "HBA":           "HBA",
+    "Alaton":        "Alaton",
+    "Benth":         "Benth",
+    "ARMA":          "ARMA",
+    "XGB":           "XGBoost",
+    "LSTM":          "LSTM",
+    "FeedForwardNN": "Feed Forward NN",
+    "KNN":           "KNN",
+    "SVM":           "SVM",
+}
+
+REGIONS     = [11, 24, 27, 28, 32, 44, 52, 53]
+OOS_YEARS   = list(range(2015, 2025))   # bootstrap-path coverage
+T_REF       = 10.0
+INDEX_TYPES = ["AvgT", "HDD", "CDD", "CAT"]
+DPI         = 260
+
+plt.rcParams.update({
+    "font.family":       "serif",
+    "font.serif":        ["Times New Roman", "Times", "DejaVu Serif"],
+    "font.size":         9,
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+    "axes.grid":         False,
+    "figure.facecolor":  "white",
+    "axes.facecolor":    "white",
+})
+
+
+# =============================================================================
+# CRPS  (empirical, sorted-samples closed form)
+# =============================================================================
+
+def crps_empirical(samples: np.ndarray, y: float) -> float:
+    """O(n log n) empirical CRPS for a single observation y."""
+    s = np.asarray(samples, dtype=float)
+    s = s[np.isfinite(s)]
+    n = s.size
+    if n == 0 or not np.isfinite(y):
+        return np.nan
+    sorted_s = np.sort(s)
+    i = np.arange(1, n + 1, dtype=float)
+    term1 = float(np.mean(np.abs(s - y)))                # E|X - y|
+    term2 = float(np.sum((2.0 * i - n - 1.0) * sorted_s) / (n * n))  # (1/2) E|X - X'|
+    return term1 - term2
+
+
+# =============================================================================
+# DATA HELPERS
+# =============================================================================
+
+def aggregate_index(daily_temps: np.ndarray, index_type: str) -> np.ndarray:
+    """daily_temps shape (..., n_days). Returns aggregate along last axis."""
+    if index_type == "AvgT":
+        return np.mean(daily_temps, axis=-1)
+    if index_type == "HDD":
+        return np.sum(np.maximum(0.0, T_REF - daily_temps), axis=-1)
+    if index_type == "CDD":
+        return np.sum(np.maximum(0.0, daily_temps - T_REF), axis=-1)
+    if index_type == "CAT":
+        return np.sum(daily_temps, axis=-1)
+    raise ValueError(f"Unknown index_type: {index_type}")
+
+
+def load_temp(region: int) -> pd.DataFrame:
+    raw = pd.read_csv(TEMP_CSV, parse_dates=["date"])
+    raw.columns = raw.columns.str.lower().str.strip()
+    raw = raw[raw["region_code"] == region][["date", "daily_avg_temperature"]].copy()
+    raw = raw.rename(columns={"daily_avg_temperature": "T"})
+    raw = raw[~((raw["date"].dt.month == 2) & (raw["date"].dt.day == 29))].copy()
+    raw["year"]  = raw["date"].dt.year
+    raw["month"] = raw["date"].dt.month
+    return raw.sort_values("date").reset_index(drop=True)
+
+
+def load_paths(region: int, year: int, model: str):
+    stem = PATHS_DIR / f"paths_region{region}_{year}_{model}"
+    npy  = stem.with_suffix(".npy")
+    csv  = Path(str(stem) + "_dates.csv")
+    if not (npy.exists() and csv.exists()):
+        return None
+    paths = np.load(npy)
+    dates = pd.DatetimeIndex(pd.read_csv(csv, parse_dates=["date"])["date"])
+    if paths.shape[1] != len(dates):
+        return None
+    # Strip Feb 29 from both
+    keep = ~((dates.month == 2) & (dates.day == 29))
+    return paths[:, keep], dates[keep]
+
+
+# =============================================================================
+# COMPUTE CRPS PER (MODEL, REGION, YEAR, MONTH, INDEX)
+# =============================================================================
+
+def compute_all_crps() -> pd.DataFrame:
+    rows = []
+    total = len(MODEL_ORDER) * len(REGIONS) * len(OOS_YEARS)
+    done  = 0
+    for model in MODEL_ORDER:
+        for region in REGIONS:
+            temp = load_temp(region)
+            for year in OOS_YEARS:
+                done += 1
+                loaded = load_paths(region, year, model)
+                if loaded is None:
+                    continue
+                paths, dates = loaded
+                actual_year = temp[temp["year"] == year]
+                if actual_year.empty:
+                    continue
+                month_arr = dates.month.to_numpy()
+                for month in range(1, 13):
+                    month_mask = month_arr == month
+                    if not month_mask.any():
+                        continue
+                    paths_m = paths[:, month_mask]                    # (10000, n_days)
+                    actual_m = actual_year[actual_year["month"] == month]["T"].values
+                    if len(actual_m) == 0:
+                        continue
+                    for idx in INDEX_TYPES:
+                        sim_idx = aggregate_index(paths_m, idx)        # (10000,)
+                        act_idx = float(aggregate_index(actual_m, idx))
+                        crps = crps_empirical(sim_idx, act_idx)
+                        rows.append({
+                            "model":  model,
+                            "region": region,
+                            "year":   year,
+                            "month":  month,
+                            "index":  idx,
+                            "actual": act_idx,
+                            "crps":   crps,
+                        })
+            print(f"  [{done:>3}/{total}] {model} R{region} done", flush=True)
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
+# RENDERING (booktabs B&W, matches Forecast Accuracy_v2)
+# =============================================================================
+
+def _fmt(v, dec=3):
+    try:
+        if pd.isna(v) or not np.isfinite(float(v)):
+            return "—"
+        return f"{float(v):.{dec}f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _draw_econ_table(ax, cell_text, col_labels, row_labels,
+                     fontsize=9, col_width_scale=1.0, row_height_scale=1.5):
+    ax.axis("off")
+    n_rows = len(cell_text)
+    tbl = ax.table(cellText=cell_text, colLabels=col_labels,
+                   rowLabels=row_labels, loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(fontsize)
+    tbl.scale(col_width_scale, row_height_scale)
+    for (row, col), cell in tbl.get_celld().items():
+        cell.set_facecolor("white")
+        cell.set_edgecolor("black")
+        cell.set_linewidth(0.8)
+        cell.visible_edges = ""
+        if row == 0:
+            cell.visible_edges = "TB"
+            cell.set_text_props(fontweight="normal",
+                                ha="left" if col == -1 else "center",
+                                fontfamily="Times New Roman")
+        else:
+            if row == n_rows:
+                cell.visible_edges = "B"
+            ha = "left" if col == -1 else "right"
+            cell.set_text_props(ha=ha, fontweight="normal",
+                                fontfamily="Times New Roman")
+    return tbl
+
+
+def _save_fig(fig, stem):
+    p = OUTPUT_DIR / f"{stem}.png"
+    fig.savefig(p, dpi=DPI, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"  -> {p.name}")
+
+
+def render_crps_per_index(df: pd.DataFrame, idx: str) -> None:
+    sub = df[df["index"] == idx]
+    models = [m for m in MODEL_ORDER if m in sub["model"].unique()]
+
+    cell_text  = []
+    for m in models:
+        crps_vals = sub[sub["model"] == m]["crps"].dropna().values
+        if len(crps_vals) == 0:
+            cell_text.append(["—", "—", "—", "—"])
+            continue
+        cell_text.append([
+            str(int(len(crps_vals))),
+            _fmt(np.mean(crps_vals), 3),
+            _fmt(np.median(crps_vals), 3),
+            _fmt(np.std(crps_vals, ddof=1), 3),
+        ])
+
+    col_labels = ["N", "Mean CRPS", "Median CRPS", "Std CRPS"]
+    row_labels = [LABELS.get(m, m) for m in models]
+
+    fig, ax = plt.subplots(figsize=(7, 0.45 + 0.32 * len(models)))
+    _draw_econ_table(ax, cell_text, col_labels, row_labels, fontsize=9)
+    _save_fig(fig, f"T05_crps_{idx}")
+
+
+def write_summary_csv(df: pd.DataFrame) -> None:
+    summary = (df.groupby(["model", "index"])["crps"]
+                 .agg(["count", "mean", "median", "std"])
+                 .reset_index()
+                 .rename(columns={"count": "N",
+                                  "mean":  "mean_crps",
+                                  "median": "median_crps",
+                                  "std":   "std_crps"}))
+    summary.to_csv(OUTPUT_DIR / "csv_crps_by_model.csv", index=False)
+    print(f"  -> csv_crps_by_model.csv")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    print("=" * 60)
+    print("  CRPS Analysis — Forecast Probabilistic Accuracy")
+    print("=" * 60)
+    print(f"  Models : {MODEL_ORDER}")
+    print(f"  Regions: {REGIONS}")
+    print(f"  Years  : {OOS_YEARS[0]}-{OOS_YEARS[-1]}")
+    print(f"  Indices: {INDEX_TYPES}")
+    print(f"  Source : {PATHS_DIR}")
+    print()
+
+    print("Computing CRPS per (model, region, year, month, index) ...")
+    df = compute_all_crps()
+    print(f"\n  Computed {len(df):,} CRPS values "
+          f"({len(df) // len(INDEX_TYPES):,} cells x {len(INDEX_TYPES)} indices).")
+
+    raw_path = OUTPUT_DIR / "csv_crps_raw.csv"
+    df.to_csv(raw_path, index=False)
+    print(f"  -> {raw_path.name}")
+
+    print("\nWriting per-model summary CSV ...")
+    write_summary_csv(df)
+
+    print("\nRendering per-index CRPS tables ...")
+    for idx in INDEX_TYPES:
+        render_crps_per_index(df, idx)
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
