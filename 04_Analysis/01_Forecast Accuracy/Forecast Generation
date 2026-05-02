@@ -19,7 +19,7 @@ import pandas as pd
 import datetime
 from pathlib import Path
 from sklearn.base import BaseEstimator, TransformerMixin
-import pickle, io, warnings
+import pickle, warnings
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
@@ -38,7 +38,7 @@ ALATON_DIR       = PKL_ROOT / "02_Alaton"
 BENTH_DIR        = PKL_ROOT / "03_Benth"
 FEEDFORWARD_DIR  = PKL_ROOT / "04_FFNN"
 LSTM_DIR         = PKL_ROOT / "05_LSTM"
-WAVELET_FNN_DIR  = PKL_ROOT / "06_WaveletFNN"
+PAPER_RF_DIR     = PKL_ROOT / "06_RF"
 PAPER_XGB_DIR    = PKL_ROOT / "07_XGBoost"
 PAPER_KNN_DIR    = PKL_ROOT / "08_KNN" / "KNN_rolling_exports"
 PAPER_SVM_DIR    = PKL_ROOT / "09_SVM" / "SVM_rolling_exports"
@@ -53,10 +53,6 @@ OOS_START, OOS_END = 2011, 2024
 TEST_YEARS  = list(range(OOS_START, OOS_END + 1))
 N_HARMONICS = 3
 MODEL_ORDER = ["HBA", "Alaton", "Benth", "ARMA", "XGB", "WaveletFNN", "LSTM", "FeedForwardNN", "KNN", "SVM"]
-
-# When True: skip all other models, only re-run ARMA forecasts and update
-# bk_forecasts.csv in place (existing non-ARMA rows are preserved).
-ARMA_ONLY = True
 FEATURE_COLS = [
     "dayofyear", "pdtn_doy", "de_trend_seas", "dts_doyavge", "dts_doyvar",
     "yday", "IIdays_ago", "IIIdays_ago", "IVdays_ago",
@@ -109,32 +105,6 @@ def _compat_load(path):
 # ===========================================================================
 # WAVELET TRANSFORMER (unchanged)
 # ===========================================================================
-
-class WaveletFeatureTransformer(BaseEstimator, TransformerMixin):
-    def __init__(self, n_wavelets=3, wavelet="mexican_hat", include_original=True):
-        self.n_wavelets = n_wavelets; self.wavelet = wavelet; self.include_original = include_original
-    def fit(self, X, y=None):
-        X = self._to_numpy(X); self.n_features_in_ = X.shape[1]; return self
-    def transform(self, X):
-        X = self._to_numpy(X); n_samples, n_features = X.shape
-        t = np.linspace(-1.0, 1.0, n_samples); features = []
-        if self.include_original: features.append(X)
-        for j in range(n_features):
-            x = X[:, j]
-            for i in range(self.n_wavelets):
-                shift = 0.0 if self.n_wavelets == 1 else -0.75 + i * (1.5 / (self.n_wavelets - 1))
-                scale = 0.25 + 0.20 * i; tau = (t - shift) / scale
-                if self.wavelet == "mexican_hat":   psi = (1.0 - tau**2) * np.exp(-0.5 * tau**2)
-                elif self.wavelet == "morlet":       psi = np.cos(5.0 * tau) * np.exp(-0.5 * tau**2)
-                else: raise ValueError(f"Unknown wavelet: {self.wavelet}")
-                features.append((x * psi).reshape(-1, 1))
-        X_out = np.hstack(features).astype(float)
-        if not np.isfinite(X_out).all(): raise ValueError("WaveletFeatureTransformer produced NaN/inf.")
-        return X_out
-    @staticmethod
-    def _to_numpy(X):
-        if isinstance(X, pd.DataFrame): X = X.to_numpy()
-        return np.asarray(X, dtype=float)
 
 # ===========================================================================
 # SECTION 1 — DATA LOADING  (verbatim)
@@ -250,7 +220,7 @@ def compute_calib_context(df_train):
             "fourier_coefs": fourier_coefs, "n_harmonics": N_HARMONICS,
             "n_calib_days": len(df), "working_df": working_df}
 
-def compute_wavelet_calib_context(region, calib_year, df_train_raw):
+def compute_extended_calib_context(region, calib_year, df_train_raw):
     ext = pd.read_csv(EXTENDED_CSV); ext["date"] = pd.to_datetime(ext["date"])
     region_col = next((c for c in ["region_code","name"] if c in ext.columns), None)
     if region_col is None: raise ValueError("Cannot find region column in region_temp_extended.csv")
@@ -327,13 +297,23 @@ def load_paper_svm(region, calib_year):
     pkl_path = PAPER_SVM_DIR / f"paper_svm_region_{region}_calib_{calib_year}_predict_{calib_year + 1}.pkl"
     return _compat_load(pkl_path)
 
+def load_paper_rf(region, calib_year):
+    candidates = [
+        PAPER_RF_DIR / f"paper_rf_region_{region}_calib_{calib_year}_predict_{calib_year + 1}.pkl",
+        PAPER_RF_DIR / f"paper_rf_region_{region}_calib_{calib_year}_predict_{calib_year + 1} 2.pkl",
+    ]
+    for pkl_path in candidates:
+        if pkl_path.exists():
+            with open(pkl_path, "rb") as f: return pickle.load(f)
+    raise FileNotFoundError(f"No RF PKL found for region={region}, calib_year={calib_year}")
+
 def load_arma(region, calib_year):
     pkl_path = ARMA_DIR / f"arimaf_model_{region}_calib_{calib_year}.pkl"
     return _compat_load(pkl_path)
 
 def load_wavelet_fnn(region, calib_year):
     pkl_path = WAVELET_FNN_DIR / f"wavelet_fnn_region_{region}_calib_{calib_year}_predict_{calib_year + 1}.pkl"
-    return _compat_load(pkl_path)
+    with open(pkl_path, "rb") as f: return pickle.load(f)
 
 def load_lstm(region, calib_year):
     for p in [LSTM_DIR / f"lstm_region_{region}_calib_{calib_year}.pkl",
@@ -595,18 +575,6 @@ def forecast_paper_xgb(payload, test_dates, calib_ctx):
     return _recursive_forecast(predict_fn, working_df, test_dates, trend_int, trend_slope, fourier_coefs,
                                n_harmonics, n_calib_days, feature_cols)
 
-def forecast_wavelet_fnn(payload, test_dates, calib_ctx):
-    pipeline = payload["fitted_model"]
-    trend_int     = calib_ctx["trend_intercept"]; trend_slope  = calib_ctx["trend_slope"]
-    fourier_coefs = calib_ctx["fourier_coefs"];   n_harmonics  = calib_ctx["n_harmonics"]
-    n_calib_days  = calib_ctx["n_calib_days"];    working_df   = calib_ctx["working_df"]
-
-    def predict_fn(X):
-        return float(pipeline.predict(X)[0])
-
-    return _recursive_forecast(predict_fn, working_df, test_dates, trend_int, trend_slope, fourier_coefs,
-                               n_harmonics, n_calib_days, FEATURE_COLS, clip_sigma=10.0)
-
 def forecast_lstm(payload, test_dates, calib_ctx=None):
     n = len(test_dates)
     if not isinstance(payload, dict): return np.full(n, np.nan)
@@ -786,8 +754,8 @@ def main():
         df = region_data_cache[region]
         _loaded_calib = None
         hba_params = alaton_params = benth_params = xgb_payload = None
-        wavelet_payload = lstm_payload = ffnn_payload = None
-        knn_payload = svm_payload = arma_payload = None
+        lstm_payload = ffnn_payload = None
+        knn_payload = svm_payload = rf_payload = arma_payload = None
         calib_ctx = extended_calib_ctx = ffnn_calib_ctx = None
         print("\n" + "-"*60 + f"\n  Region {region}\n" + "-"*60)
 
@@ -811,21 +779,20 @@ def main():
                 alaton_params   = _safe_load("Alaton",        load_alaton,         region, calib_year)
                 benth_params    = _safe_load("Benth",         load_benth,          region, calib_year)
                 xgb_payload     = _safe_load("XGB",           load_paper_xgb,      region, calib_year)
-                wavelet_payload = _safe_load("WaveletFNN",    load_wavelet_fnn,    region, calib_year)
                 lstm_payload    = _safe_load("LSTM",          load_lstm,           region, calib_year)
                 ffnn_payload    = _safe_load("FeedForwardNN", load_feedforward_nn, region, calib_year)
                 knn_payload     = _safe_load("KNN",           load_paper_knn,      region, calib_year)
                 svm_payload     = _safe_load("SVM",           load_paper_svm,      region, calib_year)
+                rf_payload      = _safe_load("RF",            load_paper_rf,       region, calib_year)
                 arma_payload    = _safe_load("ARMA",          load_arma,           region, calib_year)
                 calib_ctx          = compute_calib_context(df_train)
-                extended_calib_ctx = compute_wavelet_calib_context(region, calib_year, df_train)
+                extended_calib_ctx = compute_extended_calib_context(region, calib_year, df_train)
                 ffnn_calib_ctx     = compute_ffnn_calib_context(region, calib_year)
                 print(f"loaded: hba={hba_params is not None}, alaton={alaton_params is not None}, "
                       f"benth={benth_params is not None}, arma={arma_payload is not None}, "
-                      f"xgb={xgb_payload is not None}, "
-                      f"wavelet={wavelet_payload is not None}, lstm={lstm_payload is not None}, "
+                      f"xgb={xgb_payload is not None}, lstm={lstm_payload is not None}, "
                       f"ffnn={ffnn_payload is not None}, knn={knn_payload is not None}, "
-                      f"svm={svm_payload is not None}")
+                      f"svm={svm_payload is not None}, rf={rf_payload is not None}")
                 _loaded_calib = calib_year
             else:
                 print(f"  [{test_year}]", end="  ", flush=True)
@@ -845,14 +812,15 @@ def main():
                 f_wavelet = _safe_forecast("WaveletFNN", lambda: forecast_wavelet_fnn(wavelet_payload, test_dates, extended_calib_ctx))
             else:
                 f_wavelet = np.full(365, np.nan)
-            f_lstm = _safe_forecast("LSTM",          lambda: forecast_lstm(lstm_payload, test_dates, calib_ctx))                if lstm_payload else np.full(365, np.nan)
+            f_lstm = _safe_forecast("LSTM",          lambda: forecast_lstm(lstm_payload, test_dates, calib_ctx))           if lstm_payload else np.full(365, np.nan)
             f_ffnn = _safe_forecast("FeedForwardNN", lambda: forecast_feedforward_nn(ffnn_payload, test_dates, ffnn_calib_ctx)) if ffnn_payload else np.full(365, np.nan)
             f_knn  = _safe_forecast("KNN", lambda: forecast_paper_xgb(knn_payload, test_dates, extended_calib_ctx)) if (knn_payload and extended_calib_ctx) else np.full(365, np.nan)
             f_svm  = _safe_forecast("SVM", lambda: forecast_paper_xgb(svm_payload, test_dates, extended_calib_ctx)) if (svm_payload and extended_calib_ctx) else np.full(365, np.nan)
+            f_rf   = _safe_forecast("RF",  lambda: forecast_paper_xgb(rf_payload, test_dates, extended_calib_ctx))  if (rf_payload and extended_calib_ctx) else np.full(365, np.nan)
 
             forecasts = {"HBA": f_hba, "Alaton": f_alaton, "Benth": f_benth, "ARMA": f_arma,
-                         "XGB": f_xgb, "WaveletFNN": f_wavelet, "LSTM": f_lstm,
-                         "FeedForwardNN": f_ffnn, "KNN": f_knn, "SVM": f_svm}
+                         "XGB": f_xgb, "LSTM": f_lstm, "FeedForwardNN": f_ffnn,
+                         "KNN": f_knn, "SVM": f_svm, "RF": f_rf}
 
             finite_counts = ", ".join(f"{m}={int(np.isfinite(v).sum())}/365" for m, v in forecasts.items())
             print(f"    finite forecasts: {finite_counts}")
