@@ -101,6 +101,7 @@ MIN_CALIB_OBS    = 1000
 FORECAST_HORIZON = 365
 MAX_P            = 2
 MAX_Q            = 2
+TRAINING_START   = pd.Timestamp('1980-01-01')
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -189,7 +190,7 @@ FITTERS = {
 # ---------------------------------------------------------------------------
 # Load raw data
 # ---------------------------------------------------------------------------
-raw = pd.read_csv(TEMP_DIR / "region_avg.csv", parse_dates=['date'])
+raw = pd.read_csv(TEMP_DIR / "region_temp_extended.csv", parse_dates=['date'])
 
 # summary containers — one per model type
 summary_rows = {name: [] for name in FITTERS}
@@ -205,13 +206,18 @@ for region in REGIONS:
 
     subset_data = (raw[raw['region_code'] == region]
                    .set_index('date')
-                   .rename(columns={'daily_avg_temperature': 'TAVG_imptd'})
                    [['TAVG_imptd']]
                    .dropna()
                    .sort_index())
 
     if subset_data.empty:
         print(f'  No data for region {region}, skipping.')
+        continue
+
+    subset_data = subset_data.loc[TRAINING_START:].copy()
+
+    if subset_data.empty:
+        print(f'  No data from {TRAINING_START.date()} forward for region {region}, skipping.')
         continue
 
     # Feb 29 RETAINED — per Barnor et al. Section 3.1.1 for AR models.

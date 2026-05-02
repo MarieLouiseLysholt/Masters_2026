@@ -7,9 +7,9 @@ Goal:
     01_PKL Files/03_Benth/ou_levy_model_{region}_calib_{year}.pkl
 
 Expected input file:
-    EDA/region_avg.csv
+    02_Data/01_Temprature/region_temp_extended.csv
 with columns:
-    date, region_code, daily_avg_temperature
+    date, region_code, TAVG_imptd
 
 Notes on closeness to the original example:
 - keeps the original helper names:
@@ -75,6 +75,7 @@ REGIONS = [11, 24, 27, 28, 32, 44, 52, 53]
 CALIB_YEARS = range(2010, 2024)
 MIN_CALIB_OBS = 1000
 MAX_LAG = 60
+ROLLING_START = pd.Timestamp('1980-01-01')
 
 
 # define functions
@@ -118,7 +119,7 @@ def remove_feb29(df):
 
 
 # import raw data
-raw = pd.read_csv(TEMP_DIR / "region_avg.csv", parse_dates=['date'])
+raw = pd.read_csv(TEMP_DIR / "region_temp_extended.csv", parse_dates=['date'])
 
 summary_rows = []
 all_param_df = pd.DataFrame()
@@ -135,7 +136,6 @@ for region in REGIONS:
 
     subset_data = (raw[raw['region_code'] == region]
                    .set_index('date')
-                   .rename(columns={'daily_avg_temperature': 'TAVG_imptd'})
                    [['TAVG_imptd']]
                    .dropna()
                    .sort_index())
@@ -145,6 +145,13 @@ for region in REGIONS:
         continue
 
     subset_data = remove_feb29(subset_data)
+
+    subset_data = subset_data.loc[ROLLING_START:].copy()
+
+    if subset_data.empty:
+        print(f'No data from {ROLLING_START.date()} forward for region {region}, skipping.')
+        continue
+
     subset_data['dayofyear'] = subset_data.index.dayofyear
     subset_data['month'] = subset_data.index.month
     subset_data['name'] = region
