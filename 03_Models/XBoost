@@ -44,6 +44,7 @@ N_JOBS = -1
 HORIZON = 1
 TUNING_END_YEAR = 2010
 TUNING_END_DATE = pd.Timestamp(f"{TUNING_END_YEAR}-12-31")
+TRAINING_START = pd.Timestamp("1980-01-01")
 
 DATE_COL = "date"
 REGION_CANDIDATES = ["name", "region_code"]
@@ -128,6 +129,7 @@ def find_region_col(df: pd.DataFrame) -> str:
 def load_data() -> tuple[pd.DataFrame, str]:
     df = pd.read_csv(INPUT_CSV)
     df[DATE_COL] = pd.to_datetime(df[DATE_COL])
+    df = df.loc[df[DATE_COL] >= TRAINING_START].copy()
 
     region_col = find_region_col(df)
 
@@ -481,6 +483,7 @@ def create_next_day_target_rolling(group: pd.DataFrame) -> pd.DataFrame:
 def load_data_rolling() -> tuple[pd.DataFrame, str]:
     df = pd.read_csv(INPUT_CSV)
     df[DATE_COL] = pd.to_datetime(df[DATE_COL])
+    df = df.loc[df[DATE_COL] >= TRAINING_START].copy()
 
     region_col = find_region_col(df)
 

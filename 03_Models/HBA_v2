@@ -60,6 +60,8 @@ PKL_FOLDER  = PKL_ROOT / "01_HBA"
 PKL_FOLDER.mkdir(parents=True, exist_ok=True)
 
 T_REF = 18.0
+TRAINING_START = pd.Timestamp("1980-01-01")
+TEMP_COL = "TAVG_imptd"
 
 # Contracts match Table 3 of the paper exactly.
 CONTRACTS = [
@@ -82,7 +84,7 @@ plt.rcParams.update({"font.size": 8,
                      "axes.spines.top": False,
                      "axes.spines.right": False})
 
-raw = pd.read_csv(TEMP_DIR / "region_avg.csv", parse_dates=["date"])
+raw = pd.read_csv(TEMP_DIR / "region_temp_extended.csv", parse_dates=["date"])
 
 
 # --------------------------------------------------------------------------- #
@@ -100,7 +102,7 @@ def get_period_temps(df, contract, year):
     start    = pd.Timestamp(year=year, month=sm, day=sd)
     end_year = year + 1 if sm > em else year
     end      = pd.Timestamp(year=end_year, month=em, day=ed)
-    return df.loc[(df.index >= start) & (df.index <= end), "T"]
+    return df.loc[(df.index >= start) & (df.index <= end), TEMP_COL]
 
 
 def fit_hba(Y):
@@ -203,16 +205,16 @@ for region in REGIONS:
     df_raw = (
         raw[raw["region_code"] == region]
         .set_index("date")
-        .rename(columns={"daily_avg_temperature": "T"})
-        [["T"]]
+        [[TEMP_COL]]
         .dropna()
         .sort_index()
     )
+    df_raw = df_raw.loc[TRAINING_START:].copy()
 
-    print(f"Full: N={len(df_raw):,}")
+    print(f"Full from {TRAINING_START.date()}: N={len(df_raw):,}")
 
     if len(df_raw) < 1000:
-        print("  WARNING: insufficient full-series data, skipping region.")
+        print("  WARNING: insufficient 1980+ data, skipping region.")
         continue
 
     for calib_year in CALIB_YEARS:

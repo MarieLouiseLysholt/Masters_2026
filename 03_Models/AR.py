@@ -10,7 +10,7 @@ where U_t ~ ARMA(p, q), d = 0 throughout.
 Design
 ───────
 Phase 1 — Specification selection  (once per region, pre-OOS)
-    Selection training : 1970 – 2008-12-31
+    Selection training : 1980-01-01 – 2008-12-31
     Validation         : 2009-01-01 – 2009-12-31
     Joint grid         : p,q ∈ 0..3, K ∈ 1..10 → 150 SARIMAX fits
                          (p=0, q=0 excluded)
@@ -54,6 +54,8 @@ PKL_DIR.mkdir(parents=True, exist_ok=True)
 SEL_TRAIN_END = pd.Timestamp("2008-12-31")
 VAL_START     = pd.Timestamp("2009-01-01")
 VAL_END       = pd.Timestamp("2009-12-31")
+TRAINING_START = pd.Timestamp("1980-01-01")
+TEMP_COL = "TAVG_imptd"
 
 # ── Phase 2: rolling OOS ──────────────────────────────────────────────────────
 CALIB_YEARS      = range(2010, 2024)
@@ -155,9 +157,9 @@ def select_spec(region: int, subset: pd.DataFrame) -> dict | None:
         print(f"  [SELECT|{region}] insufficient data")
         return None
 
-    train_y   = df_sel_train["T"].values.astype(float)
+    train_y   = df_sel_train[TEMP_COL].values.astype(float)
     train_doy = df_sel_train.index.dayofyear.values.astype(float)
-    val_y     = df_val["T"].values.astype(float)
+    val_y     = df_val[TEMP_COL].values.astype(float)
     val_doy   = df_val.index.dayofyear.values.astype(float)
 
     best_rmse = np.inf
@@ -218,11 +220,11 @@ def refit_and_forecast(region: int, calib_year: int,
     calib_end = pd.Timestamp(f"{calib_year}-12-31")
     df_calib  = subset.loc[:calib_end].copy()
 
-    if len(df_calib) < 365 or df_calib["T"].isna().any():
+    if len(df_calib) < 365 or df_calib[TEMP_COL].isna().any():
         return None
 
     t0        = datetime.datetime.now()
-    calib_y   = df_calib["T"].values.astype(float)
+    calib_y   = df_calib[TEMP_COL].values.astype(float)
     calib_doy = df_calib.index.dayofyear.values.astype(float)
     X_calib   = make_fourier(calib_doy, K)
 
@@ -307,24 +309,31 @@ def refit_and_forecast(region: int, calib_year: int,
 def main():
     overall_start = datetime.datetime.now()
 
-    raw = pd.read_csv(TEMP_DIR / "region_avg.csv", parse_dates=["date"])
+    raw = pd.read_csv(TEMP_DIR / "region_temp_extended.csv",
+                      parse_dates=["date"])
 
     region_data = {}
     for region in REGIONS:
         sub = (
             raw[raw["region_code"] == region]
-            .set_index("date")[["daily_avg_temperature"]]
+            .set_index("date")[[TEMP_COL]]
             .sort_index()
-            .rename(columns={"daily_avg_temperature": "T"})
         )
         if sub.empty:
             continue
+
+        sub = sub.loc[TRAINING_START:].copy()
+        if sub.empty:
+            print(f"  [DATA|{region}] no data from "
+                  f"{TRAINING_START.date()} forward")
+            continue
+
         full_idx = pd.date_range(
             sub.index.min(), sub.index.max(), freq="D"
         )
         sub = sub.reindex(full_idx)
         sub.index.name = "date"
-        sub["T"] = sub["T"].bfill()
+        sub[TEMP_COL] = sub[TEMP_COL].bfill()
         region_data[region] = sub
 
     n_candidates = MAX_K * ((MAX_P + 1) * (MAX_Q + 1) - 1)
@@ -332,7 +341,8 @@ def main():
     print("=" * 65)
     print("ARIMAF — Murat et al. (2018) exact joint grid")
     print("=" * 65)
-    print(f"Phase 1 sel. training : start – {SEL_TRAIN_END.date()}")
+    print(f"Phase 1 sel. training : "
+          f"{TRAINING_START.date()} – {SEL_TRAIN_END.date()}")
     print(f"Phase 1 validation    : "
           f"{VAL_START.date()} – {VAL_END.date()}")
     print(f"Joint grid            : p,q ∈ 0..{MAX_P}, K ∈ 1..{MAX_K}  "
