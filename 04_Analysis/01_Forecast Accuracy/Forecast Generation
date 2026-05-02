@@ -3,12 +3,22 @@ generate_bk_forecasts.py
 Generates bk_forecasts.csv from scratch from PKL files.
 Sections 1-4 of the original replication script are copied verbatim.
 Metrics (5), statistical tests (6), and results output (8) are removed.
+
+Fixes applied vs. original:
+  [F1] _CompatUnpickler  — handles pandas StringDtype pickle incompatibility
+       across pandas versions (affects HBA, Alaton, and potentially others).
+  [F2] load_arma / ARMA_DIR — points to 13_ARIMAF folder and arimaf_model_*
+       filename pattern used by AR.py (ARMA + Fourier exog regressors).
+  [F3] forecast_arma — ARIMAF PKL stores absolute-temperature forecasts in
+       'forecast_temp_365' (not de-trended residuals), so no trend/seasonal
+       reconstruction is performed; date-keyed lookup handles Feb-29 mismatch.
 """
 
 import numpy as np
 import pandas as pd
 import datetime
 from pathlib import Path
+from sklearn.base import BaseEstimator, TransformerMixin
 import pickle, warnings
 
 warnings.filterwarnings("ignore")
@@ -32,7 +42,7 @@ PAPER_RF_DIR     = PKL_ROOT / "06_RF"
 PAPER_XGB_DIR    = PKL_ROOT / "07_XGBoost"
 PAPER_KNN_DIR    = PKL_ROOT / "08_KNN" / "KNN_rolling_exports"
 PAPER_SVM_DIR    = PKL_ROOT / "09_SVM" / "SVM_rolling_exports"
-ARMA_DIR         = PKL_ROOT / "10_ARMA"
+ARMA_DIR         = PKL_ROOT / "13_ARIMAF"
 
 OUTPUT_CSV = Path(
     r"C:\\Users\\U434016\\Downloads\\Masters_2026"
@@ -42,7 +52,7 @@ OUTPUT_CSV = Path(
 OOS_START, OOS_END = 2011, 2024
 TEST_YEARS  = list(range(OOS_START, OOS_END + 1))
 N_HARMONICS = 3
-MODEL_ORDER = ["HBA", "Alaton", "Benth", "ARMA", "XGB", "LSTM", "FeedForwardNN", "KNN", "SVM", "RF"]
+MODEL_ORDER = ["HBA", "Alaton", "Benth", "ARMA", "XGB", "WaveletFNN", "LSTM", "FeedForwardNN", "KNN", "SVM"]
 FEATURE_COLS = [
     "dayofyear", "pdtn_doy", "de_trend_seas", "dts_doyavge", "dts_doyvar",
     "yday", "IIdays_ago", "IIIdays_ago", "IVdays_ago",
@@ -60,6 +70,41 @@ FEATURE_COLS = [
     "diff_5days", "diff_6days", "diff_7days",
     "last_7_1day_deltas_mean", "last_7_1day_deltas_min", "last_7_1day_deltas_max",
 ]
+
+# ===========================================================================
+# [F1] COMPAT UNPICKLER — fixes pandas StringDtype across pandas versions
+# ===========================================================================
+
+class _CompatUnpickler(pickle.Unpickler):
+    """
+    Handles pandas StringDtype pickle incompatibility that surfaces as:
+        NotImplementedError: (<StringDtype(storage='python', na_value=nan)>, ...)
+    This occurs when a PKL was saved with pandas 1.x or early 2.x and is
+    loaded under a newer pandas release that changed the StringDtype internals.
+    The unpickler intercepts the StringDtype constructor call and falls back
+    to the default (no-arg) form when the saved kwargs are rejected.
+    """
+    def find_class(self, module, name):
+        if module == "pandas.core.arrays.string_" and name == "StringDtype":
+            import pandas as pd
+            def _make_string_dtype(*args, **kwargs):
+                try:
+                    return pd.StringDtype(*args, **kwargs)
+                except (TypeError, NotImplementedError):
+                    return pd.StringDtype()
+            return _make_string_dtype
+        return super().find_class(module, name)
+
+
+def _compat_load(path):
+    """Drop-in replacement for pickle.load() with pandas version compatibility."""
+    with open(path, "rb") as f:
+        return _CompatUnpickler(f).load()
+
+
+# ===========================================================================
+# WAVELET TRANSFORMER (unchanged)
+# ===========================================================================
 
 # ===========================================================================
 # SECTION 1 — DATA LOADING  (verbatim)
@@ -219,17 +264,19 @@ def compute_extended_calib_context(region, calib_year, df_train_raw):
             "n_calib_days": len(merged), "working_df": working_df}
 
 # ===========================================================================
-# SECTION 3 — PKL LOADERS AND FORECASTERS  (verbatim)
+# SECTION 3 — PKL LOADERS AND FORECASTERS
 # ===========================================================================
 
 def load_hba(region, calib_year):
-    with open(HBA_DIR / f"hba_model_{region}_calib_{calib_year}.pkl", "rb") as f: return pickle.load(f)
+    # [F1] _compat_load instead of pickle.load
+    return _compat_load(HBA_DIR / f"hba_model_{region}_calib_{calib_year}.pkl")
 
 def load_alaton(region, calib_year):
-    with open(ALATON_DIR / f"alaton_model_{region}_calib_{calib_year}.pkl", "rb") as f: return pickle.load(f)
+    # [F1] _compat_load instead of pickle.load
+    return _compat_load(ALATON_DIR / f"alaton_model_{region}_calib_{calib_year}.pkl")
 
 def load_benth(region, calib_year):
-    with open(BENTH_DIR / f"ou_levy_model_{region}_calib_{calib_year}.pkl", "rb") as f: return pickle.load(f)
+    return _compat_load(BENTH_DIR / f"ou_levy_model_{region}_calib_{calib_year}.pkl")
 
 def load_paper_xgb(region, calib_year):
     candidates = [
@@ -239,16 +286,16 @@ def load_paper_xgb(region, calib_year):
     ]
     for pkl_path in candidates:
         if pkl_path.exists():
-            with open(pkl_path, "rb") as f: return pickle.load(f)
+            return _compat_load(pkl_path)
     raise FileNotFoundError(f"No XGB PKL found for region={region}, calib_year={calib_year}")
 
 def load_paper_knn(region, calib_year):
     pkl_path = PAPER_KNN_DIR / f"paper_knn_region_{region}_calib_{calib_year}_predict_{calib_year + 1}.pkl"
-    with open(pkl_path, "rb") as f: return pickle.load(f)
+    return _compat_load(pkl_path)
 
 def load_paper_svm(region, calib_year):
     pkl_path = PAPER_SVM_DIR / f"paper_svm_region_{region}_calib_{calib_year}_predict_{calib_year + 1}.pkl"
-    with open(pkl_path, "rb") as f: return pickle.load(f)
+    return _compat_load(pkl_path)
 
 def load_paper_rf(region, calib_year):
     candidates = [
@@ -261,7 +308,11 @@ def load_paper_rf(region, calib_year):
     raise FileNotFoundError(f"No RF PKL found for region={region}, calib_year={calib_year}")
 
 def load_arma(region, calib_year):
-    pkl_path = ARMA_DIR / f"arma_model_{region}_calib_{calib_year}.pkl"
+    pkl_path = ARMA_DIR / f"arimaf_model_{region}_calib_{calib_year}.pkl"
+    return _compat_load(pkl_path)
+
+def load_wavelet_fnn(region, calib_year):
+    pkl_path = WAVELET_FNN_DIR / f"wavelet_fnn_region_{region}_calib_{calib_year}_predict_{calib_year + 1}.pkl"
     with open(pkl_path, "rb") as f: return pickle.load(f)
 
 def load_lstm(region, calib_year):
@@ -269,7 +320,7 @@ def load_lstm(region, calib_year):
               LSTM_DIR / f"lstm_model_region_{region}_calib_{calib_year}.pkl",
               LSTM_DIR / f"lstm_region_{region}_calib_{calib_year}_predict_{calib_year+1}.pkl"]:
         if p.exists():
-            with open(p, "rb") as f: return pickle.load(f)
+            return _compat_load(p)
     raise FileNotFoundError(f"No LSTM PKL found for region={region}, calib_year={calib_year}")
 
 def load_feedforward_nn(region, calib_year):
@@ -284,7 +335,7 @@ def load_feedforward_nn(region, calib_year):
         FEEDFORWARD_DIR / f"ffnn_region_{region}_calib_{calib_year}_predict_{pred_year}.pkl",
     ]:
         if p.exists():
-            with open(p, "rb") as f: return pickle.load(f)
+            return _compat_load(p)
     raise FileNotFoundError(f"No FeedForwardNN PKL found for region={region}, calib_year={calib_year}")
 
 def _safe_load(model_label, load_fn, region, calib_year):
@@ -355,43 +406,40 @@ def forecast_alaton(alaton_params, df_train, test_dates):
 
 def forecast_arma(arma_params, test_dates):
     """
-    ARMA forecast in absolute temperature space.
+    ARMA forecast — absolute temperature space.
 
-    The PKL stores a pure ARMA(p, 0, q) sktime model fit on the calibration
-    de_trend_seas series, plus the trend + Fourier coefficients used to build
-    that series. Recover absolute T by lifting the precomputed dts forecast
-    back through the same trend/seasonal backbone.
+    The ARMA PKL stores 'forecast_temp_365': a 365-element array of
+    absolute temperature forecasts. NO trend/seasonal reconstruction is
+    needed — the model already operates in T space.
+
+    Date-keyed lookup via 'forecast_dates' handles the Feb-29 mismatch
+    between PKL dates (Feb-29 retained) and test_dates (Feb-29 stripped).
     """
     n = len(test_dates)
+
+    forecast_temp = arma_params.get("forecast_temp_365")
+    if forecast_temp is None:
+        print(f"    !! ARMA: 'forecast_temp_365' not found. "
+              f"Available keys: {list(arma_params.keys())}")
+        return np.full(n, np.nan)
+
+    forecast_temp  = np.asarray(forecast_temp, dtype=float).reshape(-1)
     forecast_dates = arma_params.get("forecast_dates", None)
-    forecast_dts   = np.asarray(arma_params["forecast_dts_365"], dtype=float).reshape(-1)
-    trend_int      = float(arma_params["trend_intercept"])
-    trend_slope    = float(arma_params["trend_slope"])
-    fourier_coefs  = arma_params["fourier_coefs"]
-    n_harmonics    = int(arma_params["n_harmonics"])
-    n_calib_days   = int(arma_params["n_calib_days"])
 
     if forecast_dates is not None:
-        date_to_dts = dict(zip(pd.DatetimeIndex(forecast_dates), forecast_dts))
-    else:
-        date_to_dts = {}
-
-    out = np.full(n, np.nan, dtype=float)
-    for i, d in enumerate(test_dates):
-        d_ts = pd.Timestamp(d)
-        if d_ts in date_to_dts:
-            dts_pred = float(date_to_dts[d_ts])
-        elif i < len(forecast_dts):
-            dts_pred = float(forecast_dts[i])
-        else:
-            continue
-        t_idx = float(n_calib_days + i)
-        doy   = _doy_noleap(d_ts)
-        out[i] = dts_pred + _compute_trend_seasonal_single(
-            t_idx, doy, trend_int, trend_slope, fourier_coefs, n_harmonics
+        # Date-keyed lookup: immune to Feb-29 calendar mismatch
+        date_to_T = dict(zip(pd.DatetimeIndex(forecast_dates), forecast_temp))
+        out = np.array(
+            [float(date_to_T.get(pd.Timestamp(d), np.nan)) for d in test_dates],
+            dtype=float
         )
-    return out
+    else:
+        # Positional fallback (no forecast_dates stored)
+        out = np.full(n, np.nan, dtype=float)
+        for i in range(min(n, len(forecast_temp))):
+            out[i] = forecast_temp[i]
 
+    return out
 
 def forecast_benth(benth_params, df_train, test_dates):
     if all(k in benth_params for k in ["a0","a1","t0","slope","intercept"]):
@@ -611,7 +659,81 @@ def _write_checkpoint(rows, path):
 # MAIN
 # ===========================================================================
 
+def _run_arma_only_update():
+    """
+    Re-generate ARMA forecasts only and update bk_forecasts.csv in place.
+    Preserves rows for all other models. Drops + replaces all ARMA rows.
+    """
+    OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+    print("=" * 70)
+    print("  generate_bk_forecasts.py — ARMA-ONLY UPDATE")
+    print(f"  PKL dir: {ARMA_DIR}")
+    print(f"  OOS    : {OOS_START}-{OOS_END}  ({len(TEST_YEARS)} yrs x {len(REGIONS)} regions)")
+    print(f"  Output : {OUTPUT_CSV}")
+    print("=" * 70)
+
+    if OUTPUT_CSV.exists():
+        existing = pd.read_csv(OUTPUT_CSV, parse_dates=["date"])
+        kept = existing[existing["model"] != "ARMA"].copy()
+        print(f"  Loaded existing CSV: {len(existing):,} rows total, "
+              f"keeping {len(kept):,} non-ARMA rows.")
+    else:
+        kept = pd.DataFrame(columns=["region","year","date","actual","model","forecast"])
+        print("  No existing CSV — starting fresh (ARMA only).")
+
+    new_rows = []
+    for region in REGIONS:
+        print(f"\n  -- Region {region}")
+        df = load_region(region)
+        for test_year in TEST_YEARS:
+            calib_year = test_year - 1
+            df_train, df_test = get_train_test_for_year(df, test_year)
+            if len(df_train) < 365 or len(df_test) == 0:
+                print(f"    [{test_year}] insufficient data, skipping")
+                continue
+
+            test_dates = df_test["date"].tolist()
+            T_actual   = df_test["T"].values.astype(float)
+            if len(T_actual) < 365:
+                T_actual = np.pad(T_actual, (0, 365 - len(T_actual)),
+                                  constant_values=np.nan)
+                test_dates += [test_dates[-1] + pd.Timedelta(days=i+1)
+                               for i in range(365 - len(test_dates))]
+            else:
+                T_actual = T_actual[:365]; test_dates = test_dates[:365]
+
+            arma_payload = _safe_load("ARMA", load_arma, region, calib_year)
+            if arma_payload is None:
+                f_arma = np.full(365, np.nan)
+            else:
+                try:
+                    f_arma = forecast_arma(arma_payload, test_dates)
+                except Exception as e:
+                    print(f"    [{test_year}] forecast error: "
+                          f"{type(e).__name__}: {e}")
+                    f_arma = np.full(365, np.nan)
+
+            n_finite = int(np.isfinite(f_arma).sum())
+            print(f"    [{test_year}] calib={calib_year}  finite={n_finite}/365")
+
+            for d, T_hat, T_act in zip(test_dates, f_arma, T_actual):
+                new_rows.append([region, test_year, d, T_act, "ARMA", T_hat])
+
+    new_df = pd.DataFrame(new_rows,
+                          columns=["region","year","date","actual","model","forecast"])
+    out = pd.concat([kept, new_df], ignore_index=True)
+    out.to_csv(OUTPUT_CSV, index=False)
+    print("\n" + "=" * 70)
+    print(f"  Done. {len(new_rows):,} new ARMA rows added.")
+    print(f"  Final CSV: {len(out):,} rows total -> {OUTPUT_CSV}")
+    print("=" * 70)
+
+
 def main():
+    if ARMA_ONLY:
+        _run_arma_only_update()
+        return
+
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     print("=" * 70)
     print("  generate_bk_forecasts.py")
@@ -681,11 +803,15 @@ def main():
                     print(f"    !! {label} FORECAST ERROR (region={region} year={test_year}): {type(e).__name__}: {e}")
                     return np.full(365, np.nan)
 
-            f_hba    = _safe_forecast("HBA",    lambda: forecast_hba(hba_params, test_dates))           if hba_params    else np.full(365, np.nan)
+            f_hba    = _safe_forecast("HBA",    lambda: forecast_hba(hba_params, test_dates))                if hba_params    else np.full(365, np.nan)
             f_alaton = _safe_forecast("Alaton", lambda: forecast_alaton(alaton_params, df_train, test_dates)) if alaton_params else np.full(365, np.nan)
             f_benth  = _safe_forecast("Benth",  lambda: forecast_benth(benth_params, df_train, test_dates))  if benth_params  else np.full(365, np.nan)
-            f_arma   = _safe_forecast("ARMA",   lambda: forecast_arma(arma_payload, test_dates))            if arma_payload  else np.full(365, np.nan)
+            f_arma   = _safe_forecast("ARMA",   lambda: forecast_arma(arma_payload, test_dates))             if arma_payload  else np.full(365, np.nan)
             f_xgb    = _safe_forecast("XGB",    lambda: forecast_paper_xgb(xgb_payload, test_dates, extended_calib_ctx)) if (xgb_payload and extended_calib_ctx) else np.full(365, np.nan)
+            if wavelet_payload and extended_calib_ctx:
+                f_wavelet = _safe_forecast("WaveletFNN", lambda: forecast_wavelet_fnn(wavelet_payload, test_dates, extended_calib_ctx))
+            else:
+                f_wavelet = np.full(365, np.nan)
             f_lstm = _safe_forecast("LSTM",          lambda: forecast_lstm(lstm_payload, test_dates, calib_ctx))           if lstm_payload else np.full(365, np.nan)
             f_ffnn = _safe_forecast("FeedForwardNN", lambda: forecast_feedforward_nn(ffnn_payload, test_dates, ffnn_calib_ctx)) if ffnn_payload else np.full(365, np.nan)
             f_knn  = _safe_forecast("KNN", lambda: forecast_paper_xgb(knn_payload, test_dates, extended_calib_ctx)) if (knn_payload and extended_calib_ctx) else np.full(365, np.nan)

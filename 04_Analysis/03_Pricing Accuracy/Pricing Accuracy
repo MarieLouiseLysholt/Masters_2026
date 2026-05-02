@@ -50,7 +50,20 @@ OOS_YEARS = list(range(2015, 2025))
 ROOT      = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-MODELS = ["HBA", "Alaton", "Benth", "ARMA", "XGB", "WaveletFNN", "LSTM", "FeedForwardNN"]
+MODELS = ["HBA", "Alaton", "Benth", "ARMA", "XGB", "WaveletFNN", "LSTM", "FeedForwardNN", "KNN", "SVM"]
+
+LABELS = {
+    "HBA":           "Burn Analysis",
+    "Alaton":        "Alaton (2002)",
+    "Benth":         "Benth (2007)",
+    "ARMA":          "ARMA",
+    "XGB":           "XGBoost",
+    "WaveletFNN":    "Wavelet FNN",
+    "LSTM":          "LSTM",
+    "FeedForwardNN": "Feed Forward NN",
+    "KNN":           "KNN",
+    "SVM":           "SVM (SVR)",
+}
 
 T_REF     = 10.0    # degC
 TICK      = 20      # EUR per index unit
@@ -66,9 +79,10 @@ CONTRACT_TYPES = ["call", "put"]           # both priced for every index type
 
 STRIKE_HISTORY_START = 1970               # expanding: 1970 to oos_year-1
 
-PATHS_DIR  = ROOT / "04_Analysis" / "01_Bootstrap Paths" / "bootstrap_paths"
+PATHS_DIR  = ROOT / "04_Analysis" / "02_Bootstrap Paths" / "bootstrap_paths"
 TEMP_CSV   = ROOT / "02_Data" / "01_Temprature" / "region_avg.csv"
 OUTPUT_CSV = SCRIPT_DIR / "pricing_results.csv"
+PNG_DIR    = ROOT / "99_Thesis Graphs" / "03_Results" / "03_Pricing Accuracy"
 
 
 # =============================================================================
@@ -214,6 +228,313 @@ def realised_payoff(temp_df, region, horizon_window, index_type,
 
 
 # =============================================================================
+# ACCURACY ANALYSIS — DM TEST, METRICS TABLES, PUBLICATION PNGs
+# =============================================================================
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy.stats import norm as _scipy_norm
+
+plt.rcParams.update({
+    "font.family":       "serif",
+    "font.serif":        ["Times New Roman", "Times", "DejaVu Serif"],
+    "font.size":         9,
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+    "axes.grid":         False,
+    "figure.facecolor":  "white",
+    "axes.facecolor":    "white",
+})
+
+_HDR_BG, _ALT_BG, _ROWLB_BG = "#c8c8c8", "#f0f0f0", "#e4e4e4"
+_DPI = 260
+
+
+def _fmt_num(v, decimals=3):
+    try:
+        if pd.isna(v) or not np.isfinite(float(v)):
+            return "—"
+        return f"{float(v):.{decimals}f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _stars(p):
+    if pd.isna(p) or not np.isfinite(p):
+        return ""
+    if p < 0.001: return "***"
+    if p < 0.01:  return "**"
+    if p < 0.05:  return "*"
+    return ""
+
+
+def _bh_correct(p_values):
+    p = np.asarray(p_values, dtype=float)
+    finite = np.isfinite(p)
+    p_fin  = p[finite]
+    m = len(p_fin)
+    if m == 0:
+        return p.copy()
+    order    = np.argsort(p_fin)
+    sorted_p = p_fin[order]
+    adj      = sorted_p * m / np.arange(1, m + 1)
+    for i in range(m - 2, -1, -1):
+        adj[i] = min(adj[i], adj[i + 1])
+    adj = np.minimum(adj, 1.0)
+    out_fin        = np.empty(m)
+    out_fin[order] = adj
+    out            = p.copy()
+    out[finite]    = out_fin
+    return out
+
+
+def _dm_stat(e1, e2, h=1):
+    """
+    Diebold-Mariano (1995) on squared-error loss with HLN (1997) small-sample
+    correction. h = forecast horizon (no autocov terms when h=1).
+    Returns (dm, two-sided p-value).
+    """
+    d = e1 ** 2 - e2 ** 2
+    n = len(d)
+    if n < 10:
+        return np.nan, np.nan
+    d_bar  = float(d.mean())
+    gamma0 = float(np.var(d, ddof=0))
+    gamma_sum = 0.0
+    for lag in range(1, h):
+        if n > lag:
+            gamma_sum += float(np.mean((d[lag:] - d_bar) * (d[:-lag] - d_bar)))
+    V_d = (gamma0 + 2.0 * gamma_sum) / n
+    if V_d <= 0:
+        return np.nan, np.nan
+    correction = np.sqrt((n + 1 - 2 * h + h * (h - 1) / n) / n)
+    dm = (d_bar / np.sqrt(V_d)) * correction
+    p  = float(2.0 * (1.0 - _scipy_norm.cdf(abs(dm))))
+    return float(dm), p
+
+
+def _draw_bw_table(ax, cell_text, col_labels, row_labels,
+                   bold_rows=None, fontsize=8, footnote=None,
+                   col_width_scale=1.05, row_height_scale=1.80):
+    ax.axis("off")
+    bold_rows = bold_rows or set()
+    tbl = ax.table(cellText=cell_text, colLabels=col_labels,
+                   rowLabels=row_labels, loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(fontsize)
+    tbl.scale(col_width_scale, row_height_scale)
+    for (row, col), cell in tbl.get_celld().items():
+        cell.set_linewidth(0)
+        if row == 0:
+            cell.set_facecolor(_HDR_BG)
+            cell.set_text_props(fontweight="bold", ha="center",
+                                fontfamily="Times New Roman")
+        elif col == -1:
+            cell.set_facecolor(_ROWLB_BG)
+            cell.set_text_props(ha="left", fontfamily="Times New Roman")
+        else:
+            cell.set_facecolor(_ALT_BG if row % 2 == 0 else "white")
+            fw = "bold" if (row - 1) in bold_rows else "normal"
+            cell.set_text_props(ha="right", fontweight=fw,
+                                fontfamily="Times New Roman")
+    if footnote:
+        ax.text(0.0, -0.01, footnote, transform=ax.transAxes,
+                fontsize=6.5, style="italic",
+                fontfamily="Times New Roman", va="top", ha="left")
+    return tbl
+
+
+def _save_fig(fig, stem):
+    PNG_DIR.mkdir(parents=True, exist_ok=True)
+    p = PNG_DIR / f"{stem}.png"
+    fig.savefig(p, dpi=_DPI, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"  -> {p.name}")
+
+
+def _active_models(df):
+    present = set(df["model"].unique())
+    return [m for m in MODELS if m in present]
+
+
+def _metrics(errors):
+    errors = np.asarray(errors, dtype=float)
+    errors = errors[np.isfinite(errors)]
+    if len(errors) == 0:
+        return dict(N=0, Bias=np.nan, MAE=np.nan, RMSE=np.nan)
+    return dict(N=len(errors),
+                Bias=float(errors.mean()),
+                MAE=float(np.abs(errors).mean()),
+                RMSE=float(np.sqrt((errors ** 2).mean())))
+
+
+def render_metrics_pngs(df, models):
+    """One PNG per horizon. Each PNG = 3×2 grid (index × contract)."""
+    for h_name in HORIZONS:
+        fig, axes = plt.subplots(len(INDEX_TYPES), len(CONTRACT_TYPES),
+                                 figsize=(13, 11))
+        for r, idx in enumerate(INDEX_TYPES):
+            for c, ct in enumerate(CONTRACT_TYPES):
+                ax = axes[r][c]
+                rows, bold = [], set()
+                rmse_vals = {}
+                for m in models:
+                    sub = df[(df["model"] == m) & (df["index"] == idx)
+                             & (df["contract"] == ct) & (df["horizon"] == h_name)]
+                    met = _metrics(sub["pricing_error"].values)
+                    rows.append((m, met))
+                    if np.isfinite(met["RMSE"]):
+                        rmse_vals[m] = met["RMSE"]
+                best = min(rmse_vals, key=rmse_vals.get) if rmse_vals else None
+                cell_text  = []
+                row_labels = []
+                for i, (m, met) in enumerate(rows):
+                    row_labels.append(LABELS[m])
+                    cell_text.append([
+                        str(met["N"]) if met["N"] else "—",
+                        _fmt_num(met["Bias"], 3),
+                        _fmt_num(met["MAE"],  3),
+                        _fmt_num(met["RMSE"], 3),
+                    ])
+                    if m == best:
+                        bold.add(i)
+                _draw_bw_table(ax, cell_text,
+                               col_labels=["N", "Bias", "MAE", "RMSE"],
+                               row_labels=row_labels,
+                               bold_rows=bold, fontsize=8,
+                               footnote="Bold = lowest RMSE.")
+                ax.set_title(f"{idx} — {ct.capitalize()}", fontsize=10,
+                             fontweight="bold", fontfamily="Times New Roman",
+                             pad=6)
+        h_lo, h_hi = HORIZONS[h_name]
+        fig.suptitle(
+            f"Pricing Accuracy — Horizon {h_name}  (DOY {h_lo}–{h_hi})\n"
+            "Bias = mean(model price − realised payoff).  "
+            "MAE / RMSE on EUR pricing error.  "
+            "Aggregated across all NUTS-2 regions and OOS years.",
+            fontsize=10, fontweight="bold", fontfamily="Times New Roman",
+        )
+        fig.tight_layout(rect=[0, 0, 1, 0.94])
+        _save_fig(fig, f"P01_pricing_metrics_{h_name}")
+
+
+def _dm_pair_pivot(df, idx, ct, h_name):
+    sub = df[(df["index"] == idx) & (df["contract"] == ct)
+             & (df["horizon"] == h_name)].copy()
+    sub = sub.dropna(subset=["pricing_error"])
+    return sub.pivot_table(index=["region", "year"], columns="model",
+                           values="pricing_error", aggfunc="first")
+
+
+def render_dm_pngs(df, models):
+    """One PNG per horizon. Each PNG = 3×2 grid of (index × contract) DM matrices."""
+    n_mod = len(models)
+    fw = max(15, 1.5 * n_mod)
+    for h_name in HORIZONS:
+        fig, axes = plt.subplots(len(INDEX_TYPES), len(CONTRACT_TYPES),
+                                 figsize=(fw, fw * 0.60))
+        for r, idx in enumerate(INDEX_TYPES):
+            for c, ct in enumerate(CONTRACT_TYPES):
+                ax = axes[r][c]
+                pivot = _dm_pair_pivot(df, idx, ct, h_name)
+                dm_mat = pd.DataFrame(np.nan, index=models, columns=models)
+                p_raw  = pd.DataFrame(np.nan, index=models, columns=models)
+                pairs, plist = [], []
+                for mi in models:
+                    for mj in models:
+                        if mi == mj:
+                            continue
+                        if mi not in pivot.columns or mj not in pivot.columns:
+                            continue
+                        matched = pivot[[mi, mj]].dropna()
+                        if len(matched) < 10:
+                            continue
+                        dm, p = _dm_stat(matched[mi].values,
+                                         matched[mj].values, h=1)
+                        dm_mat.loc[mi, mj] = dm
+                        p_raw.loc[mi, mj]  = p
+                        pairs.append((mi, mj))
+                        plist.append(p)
+                adj_p = pd.DataFrame(np.nan, index=models, columns=models)
+                if plist:
+                    corr = _bh_correct(np.array(plist))
+                    for (mi, mj), pc in zip(pairs, corr):
+                        adj_p.loc[mi, mj] = float(pc)
+
+                cell_text, bold = [], set()
+                for i, mi in enumerate(models):
+                    row, n_beats = [], 0
+                    for mj in models:
+                        if mi == mj:
+                            row.append("—"); continue
+                        dm = dm_mat.loc[mi, mj]
+                        pa = adj_p.loc[mi, mj]
+                        if pd.isna(dm) or not np.isfinite(dm):
+                            row.append("n/a")
+                        else:
+                            row.append(f"{dm:+.2f}{_stars(pa)}")
+                            if not pd.isna(pa) and pa < 0.05 and dm < 0:
+                                n_beats += 1
+                    cell_text.append(row)
+                    if n_beats >= (n_mod - 1) / 2:
+                        bold.add(i)
+
+                row_labels = [LABELS[m] for m in models]
+                col_labels = [LABELS[m] for m in models]
+                fs = max(5, 8 - max(0, n_mod - 6))
+                _draw_bw_table(
+                    ax, cell_text, col_labels, row_labels,
+                    bold_rows=bold, fontsize=fs,
+                    footnote=("DM on squared pricing error.  "
+                              "Positive = row higher loss (col more accurate).  "
+                              "Stars: BH-adj p.  * <.05  ** <.01  *** <.001.  "
+                              "Bold = beats ≥ half of peers."),
+                    col_width_scale=1.05, row_height_scale=1.70,
+                )
+                ax.set_title(f"{idx} — {ct.capitalize()}", fontsize=10,
+                             fontweight="bold", fontfamily="Times New Roman",
+                             pad=6)
+        h_lo, h_hi = HORIZONS[h_name]
+        fig.suptitle(
+            f"Diebold-Mariano Pairwise Pricing Accuracy — Horizon {h_name}  "
+            f"(DOY {h_lo}–{h_hi})\n"
+            "Loss: squared pricing error.  HLN (1997) correction.  "
+            "Matched on (region × year).  BH FDR within each panel.",
+            fontsize=10, fontweight="bold", fontfamily="Times New Roman",
+        )
+        fig.tight_layout(rect=[0, 0, 1, 0.93])
+        _save_fig(fig, f"P02_dm_test_{h_name}")
+
+
+def export_dm_csvs(df, models):
+    """Per-(index, contract, horizon) BH-adjusted DM p-value matrices."""
+    for h_name in HORIZONS:
+        for idx in INDEX_TYPES:
+            for ct in CONTRACT_TYPES:
+                pivot = _dm_pair_pivot(df, idx, ct, h_name)
+                adj_p = pd.DataFrame(np.nan, index=models, columns=models)
+                pairs, plist = [], []
+                for mi in models:
+                    for mj in models:
+                        if mi == mj or mi not in pivot.columns or mj not in pivot.columns:
+                            continue
+                        matched = pivot[[mi, mj]].dropna()
+                        if len(matched) < 10:
+                            continue
+                        _, p = _dm_stat(matched[mi].values, matched[mj].values, h=1)
+                        pairs.append((mi, mj)); plist.append(p)
+                if plist:
+                    corr = _bh_correct(np.array(plist))
+                    for (mi, mj), pc in zip(pairs, corr):
+                        adj_p.loc[mi, mj] = float(pc)
+                adj_p.index   = [LABELS[m] for m in models]
+                adj_p.columns = [LABELS[m] for m in models]
+                adj_p.to_csv(PNG_DIR / f"csv_dm_adj_p_{idx}_{ct}_{h_name}.csv")
+    print("  DM p-value CSVs written.")
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -345,6 +666,17 @@ def main():
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUTPUT_CSV, index=False)
     print(f"\n[SAVE] {OUTPUT_CSV}")
+
+    print("\nRendering publication tables ...")
+    models_present = _active_models(df)
+    if not models_present:
+        print("  No models with priced contracts — skipping figures.")
+    else:
+        print(f"  Models present : {models_present}")
+        render_metrics_pngs(df, models_present)
+        render_dm_pngs(df, models_present)
+        export_dm_csvs(df, models_present)
+        print(f"\n[SAVE] PNGs and CSVs in {PNG_DIR}")
 
     return df
 

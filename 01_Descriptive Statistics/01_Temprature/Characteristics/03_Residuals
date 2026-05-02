@@ -1,0 +1,219 @@
+"""
+Breusch-Pagan + Breusch-Godfrey on OOS Forecast Residuals
+===========================================================
+Wooldridge (2013) heteroscedasticity and autocorrelation diagnostics
+applied to the actual out-of-sample residuals from bk_forecasts.csv.
+
+residual(t) = actual(t) - forecast(t)
+
+Test 1 — Breusch-Pagan (heteroscedasticity)
+    Auxiliary regression: ε²(t) ~ fitted values from OLS(ε ~ 1 + t)
+    H₀: homoscedastic residuals
+    Statistic: LM ~ χ²(1)
+
+Test 2 — Breusch-Godfrey (serial correlation, order 10)
+    H₀: no serial correlation up to lag 10
+    Statistic: (n-p)·R² ~ χ²(10)
+
+Output:
+    - Console table: region × model, both tests
+    - PNG: heatmap of p-values (regions × models) for each test
+    - CSV: full results
+"""
+
+import sys, warnings
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+from statsmodels.regression.linear_model import OLS
+from statsmodels.tools import add_constant
+from statsmodels.stats.diagnostic import het_breuschpagan, acorr_breusch_godfrey
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, OSError):
+    pass
+warnings.filterwarnings("ignore")
+
+matplotlib.rcParams.update({
+    "font.family":       "serif",
+    "font.serif":        ["Times New Roman", "Times", "DejaVu Serif"],
+    "font.size":         9,
+    "figure.dpi":        300,
+    "savefig.dpi":       300,
+    "savefig.bbox":      "tight",
+    "text.usetex":       False,
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+})
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+def _find_root(start, target="02_Data"):
+    c = Path(start).resolve()
+    for _ in range(12):
+        if (c / target).exists():
+            return c
+        c = c.parent
+    raise FileNotFoundError
+
+ROOT      = _find_root(Path(__file__).resolve().parent)
+FORECASTS = ROOT / "04_Analysis" / "01_Forecast Accuracy" / "bk_forecasts.csv"
+OUT_DIR   = ROOT / "99_Thesis Graphs" / "04_Data Tests"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+REGION_NAMES = {
+    11: "Île-de-France",           24: "Centre-Val de Loire",
+    27: "Bourgogne-Franche-Comté", 28: "Normandie",
+    32: "Hauts-de-France",         44: "Grand Est",
+    52: "Pays de la Loire",        53: "Bretagne",
+}
+
+ALPHA  = 0.05
+BG_LAG = 10
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+fc = pd.read_csv(FORECASTS, parse_dates=["date"])
+fc["residual"] = fc["actual"] - fc["forecast"]
+
+models  = sorted(fc["model"].unique())
+regions = sorted(fc["region"].unique())
+
+rows = []
+for region in regions:
+    name = REGION_NAMES[region]
+    for model in models:
+        sub = (fc[(fc["model"] == model) & (fc["region"] == region)]
+               .dropna(subset=["residual"])
+               .sort_values("date"))
+        e = sub["residual"].values.astype(float)
+
+        if len(e) < BG_LAG + 5:
+            continue
+
+        n = len(e)
+        t = np.arange(n)
+
+        # Fit intercept-only OLS on residuals to get fitted values for BP
+        X   = add_constant(t)
+        res = OLS(e, X).fit()
+
+        # BP test
+        bp_stat, bp_pval, _, _ = het_breuschpagan(res.resid, res.model.exog)
+
+        # BG test
+        bg_stat, bg_pval, _, _ = acorr_breusch_godfrey(res, nlags=BG_LAG)
+
+        rows.append({
+            "region":      region,
+            "region_name": name,
+            "model":       model,
+            "n":           n,
+            "BP_stat":     bp_stat,
+            "BP_pval":     bp_pval,
+            "BP_rej":      bp_pval < ALPHA,
+            "BG_stat":     bg_stat,
+            "BG_pval":     bg_pval,
+            "BG_rej":      bg_pval < ALPHA,
+        })
+
+df = pd.DataFrame(rows)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONSOLE
+# ══════════════════════════════════════════════════════════════════════════════
+W = 115
+print("=" * W)
+print("RESIDUAL DIAGNOSTICS — Breusch-Pagan + Breusch-Godfrey")
+print(f"Applied to OOS forecast residuals: ε(t) = actual(t) − forecast(t)")
+print(f"H₀ (BP): homoscedastic  |  H₀ (BG): no serial correlation (lags={BG_LAG})")
+print("=" * W)
+print(f"  {'Region':<30} {'Model':<14} {'N':>5}  "
+      f"{'BP stat':>9} {'BP p':>9} {'BP':>7}  "
+      f"{'BG stat':>9} {'BG p':>9} {'BG'}")
+print("-" * W)
+
+for region in regions:
+    for model in models:
+        r = df[(df["region"] == region) & (df["model"] == model)]
+        if r.empty:
+            continue
+        r = r.iloc[0]
+        bp_f = "REJECT" if r["BP_rej"] else "accept"
+        bg_f = "REJECT" if r["BG_rej"] else "accept"
+        print(f"  {r['region_name']:<30} {model:<14} {int(r['n']):>5}  "
+              f"{r['BP_stat']:>9.4f} {r['BP_pval']:>9.6f} [{bp_f:>6}]  "
+              f"{r['BG_stat']:>9.4f} {r['BG_pval']:>9.6f} [{bg_f}]")
+    print()
+
+print("-" * W)
+print(f"  BP rejections: {df['BP_rej'].sum()} / {len(df)} (region × model combinations)")
+print(f"  BG rejections: {df['BG_rej'].sum()} / {len(df)}")
+print("=" * W)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIGURE — p-value heatmap: regions × models, one panel per test
+# ══════════════════════════════════════════════════════════════════════════════
+region_labels = [REGION_NAMES[r] for r in regions]
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+for ax, pval_col, rej_col, title, h0 in [
+    (axes[0], "BP_pval", "BP_rej",
+     "Breusch-Pagan\nHeteroscedasticity",
+     "H₀: homoscedastic residuals"),
+    (axes[1], "BG_pval", "BG_rej",
+     f"Breusch-Godfrey\nSerial Correlation (lags={BG_LAG})",
+     "H₀: no serial correlation"),
+]:
+    pivot = (df.pivot(index="model", columns="region_name", values=pval_col)
+               .reindex(columns=region_labels))
+
+    vals = pivot.values.astype(float)
+    im   = ax.imshow(vals, aspect="auto", cmap="RdYlGn",
+                     vmin=0, vmax=0.15, interpolation="nearest")
+
+    ax.set_xticks(range(len(region_labels)))
+    ax.set_xticklabels([r[:14] for r in region_labels],
+                       rotation=35, ha="right", fontsize=7.5)
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels(pivot.index, fontsize=8.5)
+    ax.set_title(f"{title}\n{h0}", fontsize=9, fontweight="bold")
+
+    # Annotate cells
+    for i in range(vals.shape[0]):
+        for j in range(vals.shape[1]):
+            v = vals[i, j]
+            if np.isnan(v):
+                txt, col = "—", "black"
+            elif v < ALPHA:
+                txt, col = f"{v:.3f}*", "white"
+            else:
+                txt, col = f"{v:.3f}", "black"
+            ax.text(j, i, txt, ha="center", va="center",
+                    fontsize=6.5, color=col)
+
+    plt.colorbar(im, ax=ax, fraction=0.03, label="p-value")
+
+fig.suptitle(
+    "Breusch-Pagan & Breusch-Godfrey — OOS Forecast Residuals\n"
+    "ε(t) = actual(t) − forecast(t)  |  * = reject H₀ at 5%  "
+    "|  Wooldridge (2013)",
+    fontsize=9.5, fontweight="bold"
+)
+fig.tight_layout(rect=[0, 0, 1, 0.91])
+fig.savefig(OUT_DIR / "bp_bg_forecast_residuals.png", facecolor="white")
+plt.close(fig)
+
+# ── CSV ────────────────────────────────────────────────────────────────────────
+df.to_csv(OUT_DIR / "bp_bg_forecast_residuals.csv", index=False)
+
+print(f"\nSaved: {OUT_DIR / 'bp_bg_forecast_residuals.png'}")
+print(f"Saved: {OUT_DIR / 'bp_bg_forecast_residuals.csv'}")
+print("\nDone.")

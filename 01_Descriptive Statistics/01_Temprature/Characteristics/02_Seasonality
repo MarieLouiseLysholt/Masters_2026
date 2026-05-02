@@ -1,0 +1,136 @@
+"""
+Residual Statistics — OOS Forecast Residuals from bk_forecasts.csv
+ε(t) = actual(t) − forecast(t) per model per region.
+Mean ≈ 0 confirms unbiased forecasts / successful deseasonalisation.
+"""
+
+import sys
+import warnings
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from scipy import stats
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, OSError):
+    pass
+warnings.filterwarnings("ignore")
+
+def _find_root(start, target="02_Data"):
+    c = Path(start).resolve()
+    for _ in range(12):
+        if (c / target).exists():
+            return c
+        c = c.parent
+    raise FileNotFoundError
+
+ROOT      = _find_root(Path(__file__).resolve().parent)
+FORECASTS = ROOT / "04_Analysis" / "01_Forecast Accuracy" / "bk_forecasts.csv"
+OUT_DIR   = ROOT / "99_Thesis Graphs" / "04_Data Tests"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+REGION_NAMES = {
+    11: "Île-de-France",           24: "Centre-Val de Loire",
+    27: "Bourgogne-Franche-Comté", 28: "Normandie",
+    32: "Hauts-de-France",         44: "Grand Est",
+    52: "Pays de la Loire",        53: "Bretagne",
+}
+
+matplotlib.rcParams.update({
+    "font.family": "serif",
+    "font.serif":  ["Times New Roman", "Times", "DejaVu Serif"],
+})
+
+fc = pd.read_csv(FORECASTS, parse_dates=["date"])
+fc["residual"] = fc["actual"] - fc["forecast"]
+
+models  = sorted(fc["model"].unique())
+regions = sorted(fc["region"].unique())
+
+# ── One table per model ────────────────────────────────────────────────────────
+headers = ["Region", "Mean", "Std. dev.", "Min", "Max", "Skewness", "Kurtosis", "RMSE", "t stat", "p-value"]
+col_x   = [0.00, 0.24, 0.34, 0.43, 0.52, 0.61, 0.71, 0.80, 0.89, 0.94]
+
+BLACK = "#000000"
+
+def hline(ax, y, lw, fig_h):
+    ax.add_line(Line2D([0, 1], [y / fig_h, y / fig_h], lw=lw, color=BLACK,
+                       solid_capstyle="butt", transform=ax.transAxes))
+
+def txt(ax, fx, y, fig_h, text, bold=False, fontsize=8.5):
+    ax.text(fx + 0.005, y / fig_h, text, fontsize=fontsize,
+            fontweight="bold" if bold else "normal",
+            ha="left", va="center", color=BLACK,
+            transform=ax.transAxes)
+
+for model in models:
+    rows = []
+    for region in regions:
+        sub = (fc[(fc["model"] == model) & (fc["region"] == region)]
+               .dropna(subset=["residual"]))
+        if sub.empty:
+            continue
+        e = sub["residual"].values.astype(float)
+        def sig(p):
+            if p < 0.001: return "***"
+            if p < 0.01:  return "**"
+            if p < 0.05:  return "*"
+            return ""
+
+        t_stat, t_p = stats.ttest_1samp(e, popmean=0)
+        rows.append([
+            REGION_NAMES[region],
+            f"{e.mean():.4f}",
+            f"{e.std(ddof=1):.4f}",
+            f"{e.min():.4f}",
+            f"{e.max():.4f}",
+            f"{stats.skew(e):.4f}",
+            f"{stats.kurtosis(e, fisher=False):.4f}",
+            f"{np.sqrt(np.mean(e**2)):.4f}",
+            f"{t_stat:.4f}",
+            (f"< 0.0001{sig(t_p)}" if t_p < 0.0001 else f"{t_p:.4f}{sig(t_p)}"),
+        ])
+
+    n_data = len(rows)
+    row_h  = 0.28
+    hdr_h  = 0.32
+    foot_h = 0.28
+    fig_w  = 11.0
+    fig_h  = hdr_h + row_h * n_data + foot_h + 0.05
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, fig_h)
+    ax.axis("off")
+
+    hline(ax, fig_h, 1.2, fig_h)
+
+    y_hdr = fig_h - hdr_h
+    for label, fx in zip(headers, col_x):
+        txt(ax, fx, y_hdr + hdr_h * 0.5, fig_h, label, bold=True)
+
+    hline(ax, y_hdr, 0.7, fig_h)
+
+    for i, row in enumerate(rows):
+        y_row = y_hdr - row_h * (i + 1)
+        y_mid = y_row + row_h * 0.5
+        for val, fx in zip(row, col_x):
+            txt(ax, fx, y_mid, fig_h, val)
+
+    y_foot = row_h * 0.15
+    hline(ax, y_foot + foot_h * 0.92, 0.5, fig_h)
+    txt(ax, 0.00, y_foot + foot_h * 0.45, fig_h,
+        f"Model: {model}  |  Residuals: ε(t) = actual(t) − forecast(t)  |  "
+        "t-test H₀: mean = 0 (two-sided).  * p<0.05  ** p<0.01  *** p<0.001",
+        fontsize=7.5)
+    hline(ax, y_foot - 0.01, 1.2, fig_h)
+
+    fig.tight_layout(pad=0.1)
+    out = OUT_DIR / f"Table_Residuals_{model}.png"
+    plt.savefig(out, dpi=300, facecolor="white", bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {out}")

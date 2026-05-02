@@ -1,0 +1,722 @@
+"""
+Forecast Yield Predictability
+=============================
+Per-region (index_type, window) selected on OBSERVED temperatures over
+2000-2015. Forecast engines are evaluated out-of-sample on 2016-2024.
+
+  Calibration  : 2000-2015  (observed T + yield)
+  Holdout      : 2016-2024  (9 years × 9 models)
+
+  Stage 1 — Pre-OOS, on observed data only:
+    * Detrend yield over years ≤ 2015 (linear OLS in year).
+    * Search 3 index types × 15 contiguous March-July month-block windows
+      = 45 candidates. Pick the (itype, window) whose observed accumulated
+      index correlates most strongly (max |Pearson r|) with detrended yield.
+    * Fit yield form (linear / quadratic-only / linear+quadratic) by BIC
+      with a parsimony tie-break on the chosen (itype, window).
+    Forecast engines play no role in selection.
+
+  Stage 2 — Holdout, per forecast engine:
+    For each (model, region, year) in 2017-2024, accumulate the model's
+    daily point forecasts (bk_forecasts.csv) through the frozen
+    (itype, window) to give I_hat, plug into the frozen form -> Y_hat.
+    Compare to detrended actual yield. Report RMSE / MAE / ME / MAPE /
+    RMSE % R̄ on revenue (EUR/ha) at 160 EUR/t wheat price.
+
+Outputs (in 99_Thesis Graphs/03_Results/04_Hedging Effectiveness/):
+  P01_yield_model_per_region_BIC.png     selection table (structural ceiling)
+  P02_forecast_accuracy_per_model.png    aggregate per-model accuracy
+  P03_forecast_rmse_matrix.png           model × region RMSE matrix
+  P04_revenue_predictions_over_years.png actual vs predicted revenue per region
+  P06_forecast_rmse_matrix_year.png      model × year RMSE matrix
+"""
+
+import sys
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, OSError):
+    pass
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from scipy.stats import pearsonr
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import warnings
+
+warnings.filterwarnings("ignore", message="An input array is constant")
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+np.random.seed(42)
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+ROOT         = Path(__file__).resolve().parents[2]
+TEMP_CSV     = ROOT / "02_Data" / "01_Temprature" / "region_avg.csv"
+YIELD_CSV    = ROOT / "02_Data" / "02_Wheat" / "ble_tendre_hiver_yield_2000_2024_regions_mainland.csv"
+FORECAST_CSV = ROOT / "04_Analysis" / "01_Forecast Accuracy" / "bk_forecasts.csv"
+OUT_DIR      = ROOT / "99_Thesis Graphs" / "03_Results" / "04_Hedging Effectiveness"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+MODELS = ["HBA", "Alaton", "Benth", "ARMA",
+          "XGB", "LSTM", "FeedForwardNN", "KNN", "SVM"]
+
+REGIONS        = [11, 24, 27, 28, 32, 44, 52, 53]
+HOLDOUT_YEARS  = list(range(2016, 2025))
+TREND_END_YEAR = 2015
+BASE_TEMP      = 10.0
+YIELD_T0       = 2000
+WHEAT_PRICE    = 160.0
+MIN_CALIB_N    = 6
+
+INDEX_TYPES   = ["CDD", "HDD", "CAT"]
+MONTH_WINDOWS = {"Mar": (60, 90),  "Apr": (91, 120), "May": (121, 151),
+                 "Jun": (152, 181), "Jul": (182, 212)}
+MONTH_ORDER   = ["Mar", "Apr", "May", "Jun", "Jul"]
+
+REGION_NAMES = {
+    11: "Île-de-France", 24: "Centre-Val de Loire",
+    27: "Bourgogne-Franche-Comté", 28: "Normandie",
+    32: "Hauts-de-France", 44: "Grand Est",
+    52: "Pays de la Loire", 53: "Bretagne",
+}
+LABELS = {
+    "HBA": "HBA", "Alaton": "Alaton", "Benth": "Benth", "ARMA": "ARMA",
+    "XGB": "XGBoost", "LSTM": "LSTM",
+    "FeedForwardNN": "Feed Forward NN", "KNN": "KNN", "SVM": "SVM",
+}
+
+FORMS = ["linear", "quad_only", "lin_quad"]
+FORM_LABELS = {
+    "linear":    "Linear",
+    "quad_only": "Quadratic only",
+    "lin_quad":  "Linear + Quadratic",
+}
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def _doy_noleap(ts):
+    doy = ts.timetuple().tm_yday
+    if ts.is_leap_year and ts.month > 2:
+        doy -= 1
+    return doy
+
+
+def load_yield(region):
+    raw = pd.read_csv(YIELD_CSV)
+    raw.columns = [c.strip().lower() for c in raw.columns]
+    rcol = next(c for c in ["reg", "region_code", "region"] if c in raw.columns)
+    ycol = next(c for c in ["yield", "yield_t_ha", "rendement"] if c in raw.columns)
+    tcol = next(c for c in ["year", "annee"] if c in raw.columns)
+    df = raw[raw[rcol] == region][[tcol, ycol]].copy()
+    df.columns = ["year", "yield_t_ha"]
+    df["year"]       = df["year"].astype(int)
+    df["yield_t_ha"] = df["yield_t_ha"].astype(float)
+    if df["yield_t_ha"].median() > 20:
+        df["yield_t_ha"] /= 10.0
+    return df.sort_values("year").reset_index(drop=True)
+
+
+def load_temperature(region):
+    raw = pd.read_csv(TEMP_CSV, parse_dates=["date"])
+    raw.columns = raw.columns.str.lower().str.strip()
+    rcol = next(c for c in ["region_code", "region", "reg"] if c in raw.columns)
+    tcol = next(c for c in ["daily_avg_temperature", "temp", "temperature"]
+                if c in raw.columns)
+    df = raw[raw[rcol] == region][["date", tcol]].copy().rename(columns={tcol: "T"})
+    df = df[~((df["date"].dt.month == 2) & (df["date"].dt.day == 29))].copy()
+    df["doy"]  = df["date"].apply(lambda d: _doy_noleap(pd.Timestamp(d)))
+    df["year"] = df["date"].dt.year
+    return df.sort_values("date").reset_index(drop=True)
+
+
+def load_forecasts():
+    df = pd.read_csv(FORECAST_CSV, parse_dates=["date"])
+    df = df[df["model"].isin(MODELS)].copy()
+    df = df[~((df["date"].dt.month == 2) & (df["date"].dt.day == 29))].copy()
+    df["doy"]    = df["date"].apply(lambda d: _doy_noleap(pd.Timestamp(d)))
+    df["year"]   = df["date"].dt.year.astype(int)
+    df["region"] = df["region"].astype(int)
+    return df
+
+
+def index_obs_by_window(temp_df, s, e, idx_type):
+    win = temp_df[(temp_df["doy"] >= s) & (temp_df["doy"] <= e)].copy()
+    T = win["T"].values
+    if   idx_type == "CDD": win["v"] = np.maximum(T - BASE_TEMP, 0.0)
+    elif idx_type == "HDD": win["v"] = np.maximum(BASE_TEMP - T, 0.0)
+    else:                    win["v"] = T
+    return win.groupby("year")["v"].sum().rename("idx").reset_index()
+
+
+def index_from_forecast(fc_slice, s, e, idx_type):
+    win = fc_slice[(fc_slice["doy"] >= s) & (fc_slice["doy"] <= e)]
+    if win.empty:
+        return None
+    T = win["forecast"].values.astype(float)
+    if   idx_type == "CDD": return float(np.maximum(T - BASE_TEMP, 0.0).sum())
+    elif idx_type == "HDD": return float(np.maximum(BASE_TEMP - T, 0.0).sum())
+    else:                    return float(T.sum())
+
+
+def detrend_calib(yield_df, end_year):
+    df = yield_df[(yield_df["yield_t_ha"] > 0) &
+                  (yield_df["year"] <= end_year)].dropna(subset=["yield_t_ha"])
+    if len(df) < 6:
+        return None
+    y = df["yield_t_ha"].values
+    t = (df["year"].values - YIELD_T0).astype(float)
+    X = np.column_stack([np.ones(len(y)), t])
+    coefs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    y_bar = float(np.mean(y))
+    out = df[["year"]].copy()
+    out["yield_detrended"] = y - X @ coefs + y_bar
+    return out.reset_index(drop=True), coefs, y_bar
+
+
+def apply_trend(y_actual, year, coefs, y_bar):
+    t = float(year - YIELD_T0)
+    return float(y_actual - (coefs[0] + coefs[1] * t) + y_bar)
+
+
+# =============================================================================
+# YIELD FORM FIT / SELECT  (BIC; parsimony tie-break)
+# =============================================================================
+
+def _design(x, form):
+    x = np.asarray(x, dtype=float)
+    if form == "linear":    return np.column_stack([np.ones(len(x)), x])
+    if form == "quad_only": return np.column_stack([np.ones(len(x)), x ** 2])
+    if form == "lin_quad":  return np.column_stack([np.ones(len(x)), x, x ** 2])
+    raise ValueError(form)
+
+
+def predict_form(coefs, x, form):
+    return _design(x, form) @ coefs
+
+
+def fit_form(y, x, form):
+    X = _design(x, form)
+    coefs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    y_hat  = X @ coefs
+    ss_res = float(np.sum((y - y_hat) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2     = (1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else np.nan
+    n, k   = int(len(y)), X.shape[1]
+    nll2   = n * np.log(max(ss_res, 1e-12) / n)
+    bic    = nll2 + k * np.log(n)
+    if (n - k) > 0 and not np.isnan(r2):
+        adj_r2 = 1.0 - (1.0 - r2) * (n - 1) / (n - k)
+    else:
+        adj_r2 = np.nan
+    return {"coefs": coefs, "r2": r2, "adj_r2": float(adj_r2),
+            "bic": float(bic), "k": int(k)}
+
+
+def select_form_bic(y, x, slack=2.0):
+    results = {f: fit_form(y, x, f) for f in FORMS}
+    best_form, best = None, None
+    for form in FORMS:
+        bic, k = results[form]["bic"], results[form]["k"]
+        if best is None:
+            best_form, best = form, (bic, k); continue
+        if bic < best[0] - slack:
+            best_form, best = form, (bic, k)
+        elif abs(bic - best[0]) <= slack and k < best[1]:
+            best_form, best = form, (bic, k)
+    return best_form, results
+
+
+# =============================================================================
+# RUN
+# =============================================================================
+
+print("=" * 72)
+print("  Forecast Yield Predictability")
+print(f"  Selection on OBSERVED T (yield 2000-{TREND_END_YEAR})    "
+      f"Holdout: {HOLDOUT_YEARS[0]}-{HOLDOUT_YEARS[-1]}")
+print("=" * 72)
+
+print("\n  Loading temperature ...", end=" ", flush=True)
+temp_cache  = {r: load_temperature(r) for r in REGIONS}
+print("done")
+print("  Loading yield ...", end=" ", flush=True)
+yield_cache = {r: load_yield(r) for r in REGIONS}
+print("done")
+print("  Loading forecasts ...", end=" ", flush=True)
+fc_all = load_forecasts()
+fc_grouped = {k: g for k, g in fc_all.groupby(["model", "region", "year"], sort=False)}
+print(f"done  ({len(fc_all):,} rows)\n")
+
+
+# Pre-compute month-block windows.
+WINDOWS = []
+for i, ms in enumerate(MONTH_ORDER):
+    for me in MONTH_ORDER[i:]:
+        s, e = MONTH_WINDOWS[ms][0], MONTH_WINDOWS[me][1]
+        lab  = f"{ms}-{me}" if ms != me else ms
+        WINDOWS.append((ms, me, s, e, lab))
+print(f"  Grid: {len(INDEX_TYPES)} indices x {len(WINDOWS)} windows = "
+      f"{len(INDEX_TYPES) * len(WINDOWS)} candidates per region "
+      f"(observed T, no model dimension)")
+
+
+sel_rows, holdout_rows = [], []
+frozen = {}
+
+for region in REGIONS:
+    yield_df = yield_cache[region]
+    temp_df  = temp_cache[region]
+
+    det_calib = detrend_calib(yield_df, TREND_END_YEAR)
+    if det_calib is None:
+        print(f"  [SKIP] R{region}: insufficient calib yield")
+        continue
+    det_calib_df, trend_coefs, y_bar = det_calib
+    det_series = det_calib_df.set_index("year")["yield_detrended"]
+
+    # Grid search on observed temperatures.
+    best = None  # (abs_rho, rho, itype, label, s, e)
+    for itype in INDEX_TYPES:
+        idx_obs_full = index_obs_by_window(temp_df, None, None, itype) \
+            if False else None  # placeholder — recomputed per window below
+        for (_, _, s, e, lab) in WINDOWS:
+            idx_obs = index_obs_by_window(temp_df, s, e, itype)
+            idx_obs = idx_obs[idx_obs["year"] <= TREND_END_YEAR]
+            merged  = pd.merge(det_calib_df, idx_obs, on="year", how="inner").dropna()
+            if len(merged) < MIN_CALIB_N:
+                continue
+            xs = merged["idx"].values
+            ys = merged["yield_detrended"].values
+            if np.std(xs) < 1e-12 or np.std(ys) < 1e-12:
+                continue
+            rho, _ = pearsonr(ys, xs)
+            if np.isnan(rho):
+                continue
+            if best is None or abs(rho) > best[0]:
+                best = (abs(rho), float(rho), itype, lab, s, e)
+
+    if best is None:
+        print(f"  [SKIP] R{region}: no valid grid candidate")
+        continue
+    _, rho_sel, itype_sel, lab_sel, s_sel, e_sel = best
+
+    # Fit yield form on observed I over calib for the chosen (itype, window).
+    obs_idx_calib = index_obs_by_window(temp_df, s_sel, e_sel, itype_sel)
+    obs_idx_calib = obs_idx_calib[obs_idx_calib["year"] <= TREND_END_YEAR]
+    fit_df = pd.merge(det_calib_df, obs_idx_calib, on="year", how="inner").dropna()
+    y_fit  = fit_df["yield_detrended"].values
+    x_fit  = fit_df["idx"].values
+    form_sel, form_res = select_form_bic(y_fit, x_fit)
+    fr = form_res[form_sel]
+
+    frozen[region] = {
+        "trend_coefs": trend_coefs, "y_bar": y_bar,
+        "itype": itype_sel, "s": s_sel, "e": e_sel, "label": lab_sel,
+        "form": form_sel, "coefs": fr["coefs"],
+        "rho_select": rho_sel, "r2": fr["r2"], "adj_r2": fr["adj_r2"],
+    }
+    sel_rows.append({
+        "region":      region,
+        "itype":       itype_sel,
+        "window":      lab_sel,
+        "rho_calib":   round(rho_sel, 4),
+        "n_calib":     int(len(fit_df)),
+        "form":        form_sel,
+        "r2_form":     round(fr["r2"], 4),
+        "adj_r2_form": round(fr["adj_r2"], 4),
+        "R2_linear":     round(form_res["linear"]["r2"], 4),
+        "R2_quad_only":  round(form_res["quad_only"]["r2"], 4),
+        "R2_lin_quad":   round(form_res["lin_quad"]["r2"], 4),
+        "AdjR2_linear":     round(form_res["linear"]["adj_r2"], 4),
+        "AdjR2_quad_only":  round(form_res["quad_only"]["adj_r2"], 4),
+        "AdjR2_lin_quad":   round(form_res["lin_quad"]["adj_r2"], 4),
+        "bic_form":         round(fr["bic"], 2),
+    })
+    print(f"  R{region}: {itype_sel} {lab_sel:<7s}  rho={rho_sel:+.3f}  "
+          f"form={form_sel:<9s} R²={fr['r2']:.3f} (adj {fr['adj_r2']:.3f})  "
+          f"n_calib={len(fit_df)}")
+
+# Summary of variance explained by the selected per-region yield models.
+adj_vals = np.array([fz["adj_r2"] for fz in frozen.values()], dtype=float)
+r2_vals  = np.array([fz["r2"]     for fz in frozen.values()], dtype=float)
+print("\n  Variance explained by selected (index, window, form) per region:")
+print(f"    R²       — median {np.median(r2_vals):.3f}, "
+      f"min {r2_vals.min():.3f}, max {r2_vals.max():.3f}, "
+      f"mean {r2_vals.mean():.3f}")
+print(f"    Adj R²   — median {np.median(adj_vals):.3f}, "
+      f"min {adj_vals.min():.3f}, max {adj_vals.max():.3f}, "
+      f"mean {adj_vals.mean():.3f}")
+
+# Holdout: each forecast engine evaluated on the frozen (itype, window, form).
+print("\n  Evaluating holdout per (model, region, year) ...")
+for model in MODELS:
+    for region in REGIONS:
+        if region not in frozen:
+            continue
+        fz       = frozen[region]
+        yield_df = yield_cache[region]
+        for hy in HOLDOUT_YEARS:
+            fc = fc_grouped.get((model, region, hy))
+            if fc is None or fc.empty:
+                continue
+            I_hat = index_from_forecast(fc, fz["s"], fz["e"], fz["itype"])
+            if I_hat is None:
+                continue
+            Y_hat = float(predict_form(fz["coefs"], np.array([I_hat]), fz["form"])[0])
+
+            act_row = yield_df[yield_df["year"] == hy]
+            if act_row.empty:
+                continue
+            Y_act = apply_trend(float(act_row["yield_t_ha"].values[0]),
+                                hy, fz["trend_coefs"], fz["y_bar"])
+            R_hat = Y_hat * WHEAT_PRICE
+            R_act = Y_act * WHEAT_PRICE
+            holdout_rows.append({
+                "model":    model,
+                "region":   region,
+                "year":     hy,
+                "I_hat":    round(I_hat, 4),
+                "Y_hat":    round(Y_hat, 5),
+                "Y_act":    round(Y_act, 5),
+                "R_hat":    round(R_hat, 2),
+                "R_act":    round(R_act, 2),
+                "err_rev":  round(R_hat - R_act, 2),
+                "abs_err_rev": round(abs(R_hat - R_act), 2),
+                "y_bar":    round(fz["y_bar"], 5),
+                "r_bar":    round(fz["y_bar"] * WHEAT_PRICE, 2),
+            })
+
+if not sel_rows:
+    print("\nNo selections — abort.")
+    sys.exit(1)
+
+sel_df  = pd.DataFrame(sel_rows)
+hold_df = pd.DataFrame(holdout_rows)
+
+
+def _acc(sub):
+    err   = sub["R_hat"].values - sub["R_act"].values
+    abs_e = np.abs(err)
+    r_act = sub["R_act"].values
+    r_bar = float(sub["r_bar"].mean()) if len(sub) else np.nan
+    rmse  = float(np.sqrt(np.mean(err ** 2))) if len(err) else np.nan
+    mae   = float(np.mean(abs_e)) if len(abs_e) else np.nan
+    me    = float(np.mean(err)) if len(err) else np.nan
+    mape  = (float(np.mean(np.abs(err / r_act)) * 100.0)
+             if np.all(np.abs(r_act) > 1e-9) and len(err) else np.nan)
+    rmse_pct = (100.0 * rmse / r_bar) if r_bar and r_bar > 1e-9 else np.nan
+    return {"n": int(len(err)), "RMSE": rmse, "MAE": mae, "ME": me,
+            "MAPE_pct": mape, "RMSE_pct_rbar": rmse_pct}
+
+
+# Per (model, region) accuracy.
+mr_rows = []
+for model in MODELS:
+    for region in REGIONS:
+        sub = hold_df[(hold_df["model"] == model) & (hold_df["region"] == region)]
+        if sub.empty:
+            continue
+        d = _acc(sub); d.update({"model": model, "region": region})
+        mr_rows.append(d)
+mr = pd.DataFrame(mr_rows)
+
+# Per-model summary (avg across regions).
+model_rows = []
+for model in MODELS:
+    sub = mr[mr["model"] == model]
+    if sub.empty:
+        continue
+    model_rows.append({
+        "model":     model,
+        "n_regions": int(len(sub)),
+        "RMSE":          float(np.mean(sub["RMSE"])),
+        "MAE":           float(np.mean(sub["MAE"])),
+        "ME":            float(np.mean(sub["ME"])),
+        "MAPE_pct":      float(np.mean(sub["MAPE_pct"])),
+        "RMSE_pct_rbar": float(np.mean(sub["RMSE_pct_rbar"])),
+    })
+model_df = pd.DataFrame(model_rows)
+
+
+# =============================================================================
+# RENDER
+# =============================================================================
+
+DPI = 260
+plt.rcParams.update({
+    "font.family":       "serif",
+    "font.serif":        ["Times New Roman", "Times", "DejaVu Serif"],
+    "font.size":         9,
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+    "axes.grid":         False,
+    "figure.facecolor":  "white",
+    "axes.facecolor":    "white",
+})
+
+
+def _fmt(v, dec=3):
+    try:
+        if pd.isna(v) or not np.isfinite(float(v)):
+            return "—"
+        return f"{float(v):.{dec}f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _draw_table(ax, cell_text, col_labels, row_labels,
+                fontsize=9, col_width=1.0, row_height=1.5,
+                data_align="right"):
+    ax.axis("off")
+    n_rows = len(cell_text)
+    tbl = ax.table(cellText=cell_text, colLabels=col_labels,
+                   rowLabels=row_labels, loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(fontsize)
+    tbl.scale(col_width, row_height)
+    for (row, col), cell in tbl.get_celld().items():
+        cell.set_facecolor("white")
+        cell.set_edgecolor("black")
+        cell.set_linewidth(0.8)
+        cell.visible_edges = ""
+        if row == 0:
+            cell.visible_edges = "TB"
+            cell.set_text_props(fontweight="normal",
+                                ha="left" if col == -1 else "center",
+                                fontfamily="Times New Roman")
+        else:
+            if row == n_rows:
+                cell.visible_edges = "B"
+            ha = "left" if col == -1 else data_align
+            cell.set_text_props(ha=ha, fontfamily="Times New Roman")
+    return tbl
+
+
+def _save(fig, stem):
+    p = OUT_DIR / f"{stem}.png"
+    fig.savefig(p, dpi=DPI, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"  -> {p.name}")
+
+
+def render_selection(sel_df):
+    cell = []
+    for _, r in sel_df.iterrows():
+        cell.append([
+            r["itype"],
+            r["window"],
+            FORM_LABELS.get(r["form"], r["form"]),
+            _fmt(r["bic_form"], 2),
+            _fmt(r["adj_r2_form"], 3),
+        ])
+    col_labels = ["Index", "Window", "Best form", "BIC", "Adj R²"]
+    row_labels = [REGION_NAMES.get(int(r["region"]), str(r["region"]))
+                  for _, r in sel_df.iterrows()]
+    fig, ax = plt.subplots(figsize=(10, 0.5 + 0.32 * len(cell)))
+    _draw_table(ax, cell, col_labels, row_labels, fontsize=9)
+    _save(fig, "P01_yield_model_per_region_BIC")
+
+
+def render_per_model(model_df):
+    cell = []
+    for _, r in model_df.iterrows():
+        cell.append([
+            _fmt(r["RMSE"],          1),
+            _fmt(r["MAE"],           1),
+            _fmt(r["ME"],            1),
+            _fmt(r["MAPE_pct"],      1),
+            _fmt(r["RMSE_pct_rbar"], 1),
+        ])
+    col_labels = ["RMSE (EUR/ha)", "MAE (EUR/ha)", "ME (EUR/ha)",
+                  "MAPE (%)", "RMSE (% R̄)"]
+    row_labels = [LABELS.get(r["model"], r["model"]) for _, r in model_df.iterrows()]
+    fig, ax = plt.subplots(figsize=(10, 0.5 + 0.32 * len(cell)))
+    _draw_table(ax, cell, col_labels, row_labels, fontsize=9)
+    _save(fig, "P02_forecast_accuracy_per_model")
+
+
+def render_rmse_matrix(mr):
+    models  = [m for m in MODELS if m in mr["model"].unique()]
+    regions = sorted(mr["region"].unique())
+    cell = []
+    for m in models:
+        row = []
+        for r in regions:
+            v = mr[(mr["model"] == m) & (mr["region"] == r)]["RMSE"].values
+            row.append(_fmt(v[0], 1) if len(v) else "—")
+        cell.append(row)
+    row_labels = [LABELS.get(m, m) for m in models]
+    # Wrap long region names onto two lines so column headers don't overlap.
+    region_label_wrap = {
+        11: "Île-de-France",
+        24: "Centre-Val\nde Loire",
+        27: "Bourgogne-\nFranche-Comté",
+        28: "Normandie",
+        32: "Hauts-de-\nFrance",
+        44: "Grand Est",
+        52: "Pays de\nla Loire",
+        53: "Bretagne",
+    }
+    col_labels = [region_label_wrap.get(int(r),
+                                        REGION_NAMES.get(int(r), str(r)))
+                  for r in regions]
+    fig, ax = plt.subplots(figsize=(1.8 + 1.35 * len(regions),
+                                    0.85 + 0.32 * len(row_labels)))
+    _draw_table(ax, cell, col_labels, row_labels, fontsize=8.5,
+                data_align="center")
+    _save(fig, "P03_forecast_rmse_matrix")
+
+
+def render_rmse_matrix_year(cells):
+    """
+    Model × year RMSE matrix. Each cell is the RMSE of revenue across the
+    8 regions for that (model, year) — i.e., sqrt(mean((R_hat - R_act)^2))
+    over regions in that holdout year for that model.
+    """
+    models = [m for m in MODELS if m in cells["model"].unique()]
+    years  = sorted(cells["year"].unique())
+    cell = []
+    for m in models:
+        row = []
+        for y in years:
+            sub = cells[(cells["model"] == m) & (cells["year"] == y)]
+            if sub.empty:
+                row.append("—")
+            else:
+                err = sub["R_hat"].values - sub["R_act"].values
+                rmse = float(np.sqrt(np.mean(err ** 2)))
+                row.append(_fmt(rmse, 1))
+        cell.append(row)
+    row_labels = [LABELS.get(m, m) for m in models]
+    col_labels = [str(int(y)) for y in years]
+    fig, ax = plt.subplots(figsize=(1.6 + 0.85 * len(years),
+                                    0.55 + 0.32 * len(row_labels)))
+    _draw_table(ax, cell, col_labels, row_labels, fontsize=8.5,
+                data_align="center")
+    _save(fig, "P06_forecast_rmse_matrix_year")
+
+
+# ---------------- P04 — actual vs predicted revenue across years ------------
+
+def render_revenue_predictions(cells):
+    """
+    Per-region subplots; black bold = actual revenue, coloured = each model's
+    predicted revenue across the holdout years.
+    """
+    regions = sorted(cells["region"].unique())
+    n_reg   = len(regions)
+    ncols   = 4
+    nrows   = int(np.ceil(n_reg / ncols))
+
+    cmap_models = plt.get_cmap("tab10")
+    model_list  = [m for m in MODELS if m in cells["model"].unique()]
+    colours     = {m: cmap_models(i % 10) for i, m in enumerate(model_list)}
+
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(4.0 * ncols, 2.8 * nrows),
+                             sharex=True)
+    axes = np.array(axes).reshape(-1)
+
+    for ax, region in zip(axes, regions):
+        sub = cells[cells["region"] == region]
+        act = (sub.drop_duplicates(subset=["year"])
+                  .sort_values("year"))
+        ax.plot(act["year"].values, act["R_act"].values,
+                color="black", lw=2.0, marker="o", ms=4.5,
+                zorder=10, label="Actual")
+        for m in model_list:
+            sm = sub[sub["model"] == m].sort_values("year")
+            if sm.empty:
+                continue
+            ax.plot(sm["year"].values, sm["R_hat"].values,
+                    color=colours[m], lw=1.0, alpha=0.85,
+                    marker="x", ms=3.5,
+                    label=LABELS.get(m, m))
+        ax.set_title(REGION_NAMES.get(int(region), str(region)),
+                     fontsize=9, fontfamily="Times New Roman")
+        ax.tick_params(axis="both", which="both", direction="out",
+                       length=3, width=0.7, labelsize=8)
+        ax.grid(axis="y", alpha=0.20, lw=0.5)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+        for sp in ("bottom", "left"):
+            ax.spines[sp].set_linewidth(0.7)
+
+    for ax in axes[n_reg:]:
+        ax.axis("off")
+
+    fig.supxlabel("Holdout year", fontsize=10, fontfamily="Times New Roman")
+    fig.supylabel("Revenue (EUR/ha)", fontsize=10,
+                  fontfamily="Times New Roman")
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center",
+               ncol=min(len(labels), 5), frameon=True, fontsize=8.5,
+               bbox_to_anchor=(0.5, -0.02), edgecolor="black")
+
+    plt.tight_layout(rect=[0.02, 0.05, 1.0, 1.0])
+    _save(fig, "P04_revenue_predictions_over_years")
+
+
+# ---------------- P05 — per-region table of actual + predicted revenue ------
+
+def _slug(name):
+    keep = []
+    for ch in name:
+        if ch.isalnum():
+            keep.append(ch)
+        elif ch in (" ", "-", "_"):
+            keep.append("_")
+    return "".join(keep).strip("_")
+
+
+def render_revenue_tables_per_region(cells):
+    regions    = sorted(cells["region"].unique())
+    model_list = [m for m in MODELS if m in cells["model"].unique()]
+
+    for region in regions:
+        sub = cells[cells["region"] == region]
+        years = sorted(sub["year"].unique())
+
+        act = (sub.drop_duplicates(subset=["year"])
+                  .set_index("year")["R_act"])
+
+        cell_text  = []
+        for y in years:
+            row = [_fmt(float(act.loc[y]), 0)]
+            for m in model_list:
+                v = sub[(sub["model"] == m) & (sub["year"] == y)]["R_hat"].values
+                row.append(_fmt(float(v[0]), 0) if len(v) else "—")
+            cell_text.append(row)
+
+        col_labels = ["Actual"] + [LABELS.get(m, m) for m in model_list]
+        row_labels = [str(int(y)) for y in years]
+
+        fig_w = max(11, 1.5 + 0.95 * len(col_labels))
+        fig, ax = plt.subplots(figsize=(fig_w, 0.55 + 0.32 * len(years)))
+        _draw_table(ax, cell_text, col_labels, row_labels, fontsize=9)
+        rname = REGION_NAMES.get(int(region), str(region))
+        fz    = frozen[region]
+        title = (f"{rname}  —  Index: {fz['itype']} {fz['label']}   "
+                 f"Form: {FORM_LABELS.get(fz['form'], fz['form'])}   "
+                 f"In-sample R²: {fz['r2']:.3f}")
+        _ = title  # title text retained for caption use; not drawn on figure
+        slug  = _slug(rname)
+        _save(fig, f"P05_revenue_table_R{int(region)}_{slug}")
+
+
+print("\nRendering ...")
+render_selection(sel_df)              # P01
+render_per_model(model_df)            # P02
+render_rmse_matrix(mr)                # P03
+render_revenue_predictions(hold_df)   # P04
+render_rmse_matrix_year(hold_df)      # P06
+# render_revenue_tables_per_region(hold_df)   # P05 — per-region detail (uncomment if needed for appendix)
+print("\nDone.")

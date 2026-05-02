@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-Process python -ErrorAction SilentlyContinue | Format-Table Id, CPU, StartTime; Write-Output \"---bm7jgeucc output---\"; $f = \"C:\\\\Users\\\\U434016\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-U434016-Downloads-Masters-2026\\\\e60cb998-fad1-453e-b7a7-c9294c7a5b4c\\\\tasks\\\\bm7jgeucc.output\"; if \\(Test-Path $f\\) { \\(Get-Item $f\\).Length; Get-Content $f -Tail 30 })"
+    ]
+  }
+}

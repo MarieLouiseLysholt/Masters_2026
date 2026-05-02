@@ -1,28 +1,43 @@
-""""
-bk_forecast_accuracy.py  [v3]
+"""
+bk_forecast_accuracy.py  [v4]
 ==============================
-Reads bk_forecasts.csv.  Produces five publication-ready outputs
-(black-and-white, Times New Roman) and a full set of result CSVs.
+Reads bk_forecasts.csv and produces four publication-ready tables
+(black-and-white, Times New Roman).
 
 Outputs (all written to OUTPUT_DIR)
--------------------------------------
-  bk_forecasts.csv              raw daily forecasts (region/year/date/actual/model/forecast)
-  T01_accuracy_metrics.png      RMSE / MSE / UAPE per model × index type
-  T02_murphy_decomposition.png  Murphy (1988) MSE components as % of MSE + RMSE
-  T03_model_comparison.png      Theil U vs baseline + paired Wilcoxon p (BH-adj)
-  F01_uape_by_month.png         UAPE by calendar month, B&W line styles
-  T04_rmse_region_year.png      RMSE broken down by region and by OOS year
+--------------------------------------
+  T01_accuracy_metrics.png     ME / MAE / RMSE / MAPE — per model
+  T02_dm_test.png              Diebold-Mariano pairwise test matrix
+  T03_metrics_by_region.png    ME / MAE / RMSE / MAPE — per NUTS-2 region
+  T04_metrics_by_year.png      ME / MAE / RMSE / MAPE — per OOS year
+
+Each output is produced for all four index types (AvgT, HDD, CDD, CAT)
+as a 2×2 panel figure.
 
 Methodology notes
 -----------------
-- RMSE / MSE: full monthly sample; no MIN_INDEX filter.
-- UAPE: MIN_INDEX filter applied for HDD and CDD only (avoids 0/0).
-- Significance: paired Wilcoxon signed-rank on d_i = |err_A| - |err_B|
-  per matched (region, year, month).  Not Mann-Whitney (data are paired).
-- Multiple-testing: Benjamini-Hochberg FDR within each index type.
-- Murphy decomposition uses population sigma (ddof=0) so components
-  sum exactly to MSE: Bias² + Conditional-Bias² + Unpredictable Variance.
-- HBA is labelled as the burn-analysis climatological baseline.
+Metrics
+  ME   = mean(forecast − actual)            [signed bias; +ve = over-forecast]
+  MAE  = mean(|forecast − actual|)
+  RMSE = sqrt(mean((forecast − actual)²))
+  MAPE = mean(|error| / |actual|) × 100
+         HDD/CDD: months with actual < MIN_INDEX excluded from MAPE.
+         AvgT/CAT: months with |actual| < 0.5 excluded from MAPE.
+
+Metrics are computed on monthly aggregated index values.
+
+Diebold-Mariano test
+  Loss:      squared error  L(e) = e²
+  d_{i}:     L(e_model_i) − L(e_model_j) per matched (region, year, month)
+  Variance:  Newey-West HAC (h = 1 lag) with Harvey-Leybourne-Newbold
+             small-sample correction factor √((n+1−2h+h(h−1)/n)/n)
+  H0:        equal predictive accuracy (two-sided)
+  Positive DM stat => row model has higher loss (column model is more accurate)
+  Multiple testing: Benjamini-Hochberg FDR within each index type
+
+T03 / T04
+  Metrics aggregated across ALL models.  Purpose: reveal how forecast
+  difficulty varies by region and by OOS year, not model ranking.
 """
 
 import warnings
@@ -36,66 +51,60 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.lines as mlines
 from pathlib import Path
-from scipy.stats import wilcoxon as scipy_wilcoxon
+from scipy.stats import norm as scipy_norm
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-FORECAST_CSV = Path(
-    r"C:\Users\U434016\Downloads\Masters_2026"
-    r"\04_Analysis\01_Forecast Accuracy\bk_forecasts.csv"
-)
-OUTPUT_DIR = Path(
-    r"C:\Users\U434016\Downloads\Masters_2026"
-    r"\99_Thesis Graphs\03_Results\01_Forecast Accuracy"
-)
+ROOT         = Path(__file__).resolve().parents[2]
+FORECAST_CSV = Path(__file__).resolve().parent / "bk_forecasts.csv"
+OUTPUT_DIR   = ROOT / "99_Thesis Graphs" / "03_Results" / "01_Forecast Accuracy"
 
 T_REF     = 10.0   # degree-day threshold (°C)
-MIN_INDEX = 1.0    # min monthly HDD / CDD for UAPE only
+MIN_INDEX = 1.0    # min actual HDD / CDD for MAPE denominator
+MAPE_AVGT_MIN = 0.5  # min |actual AvgT| and |actual CAT/n| for MAPE denom
 DPI       = 260
 
-MODEL_ORDER = ["HBA", "Alaton", "Benth", "ARMA", "XGB", "WaveletFNN", "LSTM", "FeedForwardNN", "KNN", "SVM"]
-BASELINE    = "HBA"
+# Full candidate model list — script filters to those present in the CSV
+MODEL_ORDER = [
+    "HBA", "Alaton", "Benth", "ARMA",
+    "XGB", "LSTM", "FeedForwardNN",
+    "KNN", "SVM",
+]
+
+BASELINE = "HBA"
 
 LABELS = {
-    "HBA":           "Burn Analysis",
-    "Alaton":        "Alaton (2002)",
-    "Benth":         "Benth (2007)",
+    "HBA":           "HBA",
+    "Alaton":        "Alaton",
+    "Benth":         "Benth",
     "ARMA":          "ARMA",
     "XGB":           "XGBoost",
-    "WaveletFNN":    "Wavelet FNN",
     "LSTM":          "LSTM",
     "FeedForwardNN": "Feed Forward NN",
     "KNN":           "KNN",
-    "SVM":           "SVM (SVR)",
+    "SVM":           "SVM",
 }
 
-INDEX_TYPES  = ["HDD", "CDD", "CAT", "AvgT"]
+REGION_NAMES = {
+    11: "Île-de-France",
+    24: "Centre-Val de Loire",
+    27: "Bourgogne-Franche-Comté",
+    28: "Normandie",
+    32: "Hauts-de-France",
+    44: "Grand Est",
+    52: "Pays de la Loire",
+    53: "Bretagne",
+}
+
+INDEX_TYPES = ["AvgT", "HDD", "CDD", "CAT"]
 INDEX_LABELS = {
+    "AvgT": "Average Temperature (°C / month)",
     "HDD":  r"HDD  (T$_{ref}$ = 10 °C)",
     "CDD":  r"CDD  (T$_{ref}$ = 10 °C)",
-    "CAT":  "CAT  (°C·days)",
-    "AvgT": "Avg. Temperature (°C)",
-}
-
-MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun",
-               "Jul","Aug","Sep","Oct","Nov","Dec"]
-
-# B&W line styles
-PLOT_STYLES = {
-    "HBA":           dict(ls="-",   marker="o", color="black", lw=1.5, ms=4),
-    "Alaton":        dict(ls="--",  marker="s", color="black", lw=1.5, ms=4),
-    "Benth":         dict(ls="-.", marker="^", color="black", lw=1.5, ms=4),
-    "ARMA":          dict(ls="-",   marker="h", color="0.20",  lw=1.4, ms=4),
-    "XGB":           dict(ls=":",   marker="D", color="black", lw=2.0, ms=4),
-    "WaveletFNN":    dict(ls="-",   marker="v", color="0.50",  lw=1.2, ms=4),
-    "LSTM":          dict(ls="--",  marker="P", color="0.50",  lw=1.2, ms=4),
-    "FeedForwardNN": dict(ls="-.", marker="X", color="0.50",  lw=1.2, ms=4),
-    "KNN":           dict(ls=":",   marker="*", color="0.50",  lw=1.2, ms=5),
-    "SVM":           dict(ls="-",   marker="p", color="0.35",  lw=1.2, ms=4),
+    "CAT":  "CAT  (°C · days)",
 }
 
 # ── global rcParams ──────────────────────────────────────────────────────────
@@ -110,15 +119,6 @@ plt.rcParams.update({
     "axes.facecolor":    "white",
 })
 
-_HDR   = "#c8c8c8"   # header cell background
-_ALT   = "#f0f0f0"   # alternating data row background
-_ROWLB = "#e4e4e4"   # row-label column background
-
-
-# ============================================================================
-# UTILITY
-# ============================================================================
-
 def save_fig(fig, stem: str) -> None:
     p = OUTPUT_DIR / f"{stem}.png"
     fig.savefig(p, dpi=DPI, bbox_inches="tight", facecolor="white")
@@ -127,11 +127,18 @@ def save_fig(fig, stem: str) -> None:
 
 
 def _fmt(v, decimals=3):
-    return f"{v:.{decimals}f}" if pd.notna(v) and np.isfinite(float(v)) else "—"
+    """Format float; return em-dash for NaN / Inf."""
+    try:
+        if pd.isna(v) or not np.isfinite(float(v)):
+            return "—"
+        return f"{float(v):.{decimals}f}"
+    except (TypeError, ValueError):
+        return "—"
 
 
 def _stars(p: float) -> str:
-    if np.isnan(p):
+    """Significance stars from p-value."""
+    if pd.isna(p) or not np.isfinite(p):
         return ""
     if p < 0.001:
         return "***"
@@ -139,43 +146,39 @@ def _stars(p: float) -> str:
         return "**"
     if p < 0.05:
         return "*"
-    return "ns"
+    return ""
 
 
 def _bh_correct(p_values: np.ndarray) -> np.ndarray:
-    """
-    Benjamini-Hochberg FDR correction.
-    NaN inputs pass through as NaN.  Finite p-values corrected jointly.
-    """
+    """Benjamini-Hochberg FDR correction.  NaN pass through."""
     p = np.asarray(p_values, dtype=float)
     finite = np.isfinite(p)
     p_fin  = p[finite]
-    m      = len(p_fin)
+    m = len(p_fin)
     if m == 0:
         return p.copy()
-    order     = np.argsort(p_fin)           # ascending sort
-    sorted_p  = p_fin[order]
-    adj       = sorted_p * m / np.arange(1, m + 1)
-    # enforce monotonicity (cumulative min from right)
+    order    = np.argsort(p_fin)
+    sorted_p = p_fin[order]
+    adj      = sorted_p * m / np.arange(1, m + 1)
     for i in range(m - 2, -1, -1):
         adj[i] = min(adj[i], adj[i + 1])
     adj = np.minimum(adj, 1.0)
-    result         = np.empty(m)
-    result[order]  = adj                    # put back in original order
-    out            = p.copy()
-    out[finite]    = result
+    result        = np.empty(m)
+    result[order] = adj
+    out           = p.copy()
+    out[finite]   = result
     return out
 
 
-def _draw_bw_table(ax, cell_text, col_labels, row_labels,
-                   bold_rows=None, fontsize=8, footnote=None):
+def _draw_econ_table(ax, cell_text, col_labels, row_labels,
+                     fontsize=9,
+                     col_width_scale=1.0, row_height_scale=1.5):
     """
-    Render a clean black-and-white academic table on *ax*.
-
-    bold_rows : set of 0-based data-row indices whose cells are rendered bold.
+    Plain econometric-literature B&W table: top rule, mid rule under header,
+    bottom rule. No shading, no bold, no titles, no footnotes.
     """
     ax.axis("off")
-    bold_rows = bold_rows or set()
+    n_rows = len(cell_text)
 
     tbl = ax.table(
         cellText  = cell_text,
@@ -186,37 +189,26 @@ def _draw_bw_table(ax, cell_text, col_labels, row_labels,
     )
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(fontsize)
-    tbl.scale(1.05, 1.80)
-
-    n_data = len(row_labels)
+    tbl.scale(col_width_scale, row_height_scale)
 
     for (row, col), cell in tbl.get_celld().items():
-        cell.set_linewidth(0)           # remove all individual borders
+        cell.set_facecolor("white")
+        cell.set_edgecolor("black")
+        cell.set_linewidth(0.8)
+        cell.visible_edges = ""
 
-        if row == 0:                    # header
-            cell.set_facecolor(_HDR)
-            cell.set_text_props(fontweight="bold", ha="center",
-                               fontfamily="Times New Roman")
-        elif col == -1:                 # row-label column
-            cell.set_facecolor(_ROWLB)
-            cell.set_text_props(ha="left", fontfamily="Times New Roman")
-        else:                           # data cell
-            cell.set_facecolor(_ALT if row % 2 == 0 else "white")
-            fw = "bold" if (row - 1) in bold_rows else "normal"
-            cell.set_text_props(ha="right", fontweight=fw,
-                               fontfamily="Times New Roman")
-
-    if footnote:
-        ax.text(0.0, -0.01, footnote, transform=ax.transAxes,
-               fontsize=6.5, style="italic",
-               fontfamily="Times New Roman", va="top", ha="left")
+        if row == 0:                       # header row
+            cell.visible_edges = "TB"      # top rule + mid rule
+            cell.set_text_props(fontweight="normal",
+                                ha="left" if col == -1 else "center",
+                                fontfamily="Times New Roman")
+        else:
+            if row == n_rows:              # last data row → bottom rule
+                cell.visible_edges = "B"
+            ha = "left" if col == -1 else "right"
+            cell.set_text_props(ha=ha, fontweight="normal",
+                                fontfamily="Times New Roman")
     return tbl
-
-
-def _panel_label(ax, letter, x=-0.06, y=1.02):
-    ax.text(x, y, f"({letter})", transform=ax.transAxes,
-            fontsize=10, fontweight="bold", va="bottom",
-            fontfamily="Times New Roman")
 
 
 # ============================================================================
@@ -226,9 +218,17 @@ def _panel_label(ax, letter, x=-0.06, y=1.02):
 def load_forecasts(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, parse_dates=["date"])
     df = df.dropna(subset=["actual", "forecast"])
-    df = df[df["model"].isin(MODEL_ORDER)].copy()
+    # Filter to models that are actually present
+    present = [m for m in MODEL_ORDER if m in df["model"].unique()]
+    df = df[df["model"].isin(present)].copy()
     df["month"] = df["date"].dt.month
     return df
+
+
+def active_models(df: pd.DataFrame) -> list:
+    """Return MODEL_ORDER subset actually present in the data."""
+    present = set(df["model"].unique())
+    return [m for m in MODEL_ORDER if m in present]
 
 
 # ============================================================================
@@ -236,6 +236,7 @@ def load_forecasts(path: Path) -> pd.DataFrame:
 # ============================================================================
 
 def build_monthly(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate daily temps to monthly HDD, CDD, CAT, AvgT per model."""
 
     def _agg(grp):
         a = grp["actual"].values.astype(float)
@@ -254,370 +255,304 @@ def build_monthly(df: pd.DataFrame) -> pd.DataFrame:
 
     mon = (
         df.groupby(["region", "year", "month", "model"])
-        .apply(_agg)
+        .apply(_agg, include_groups=False)
         .reset_index()
     )
 
     for idx in INDEX_TYPES:
         e = mon[f"{idx}_forecast"] - mon[f"{idx}_actual"]
-        mon[f"{idx}_error"]     = e
+        mon[f"{idx}_error"]    = e
+        mon[f"{idx}_sq_error"] = e ** 2
         mon[f"{idx}_abs_error"] = e.abs()
-        mon[f"{idx}_sq_error"]  = e ** 2
-        denom = (mon[f"{idx}_actual"].abs() + mon[f"{idx}_forecast"].abs()) / 2
-        mon[f"{idx}_uape"] = np.where(denom > 1e-8,
-                                       mon[f"{idx}_abs_error"] / denom, np.nan)
+
     return mon
 
 
 # ============================================================================
-# METRICS
+# METRICS  (ME, MAE, RMSE, MAPE)
 # ============================================================================
 
-def compute_metrics(df_m: pd.DataFrame, idx: str) -> pd.DataFrame:
-    """
-    RMSE / MSE  : full monthly sample — no MIN_INDEX filter.
-    UAPE        : MIN_INDEX filter for HDD / CDD only.
-    """
+def _mape_mask(actual: np.ndarray, idx: str) -> np.ndarray:
+    """Boolean mask selecting rows safe to include in MAPE."""
+    if idx in ("HDD", "CDD"):
+        return np.abs(actual) >= MIN_INDEX
+    else:  # AvgT, CAT
+        return np.abs(actual) >= MAPE_AVGT_MIN
+
+
+def _metrics_from_arrays(errors: np.ndarray, actual: np.ndarray,
+                          idx: str) -> dict:
+    """Compute ME, MAE, RMSE, MAPE from aligned arrays."""
+    if len(errors) == 0:
+        return dict(ME=np.nan, MAE=np.nan, RMSE=np.nan, MAPE=np.nan)
+    me   = float(np.mean(errors))
+    mae  = float(np.mean(np.abs(errors)))
+    rmse = float(np.sqrt(np.mean(errors ** 2)))
+    mask = _mape_mask(actual, idx)
+    mape = (float(np.mean(np.abs(errors[mask]) / np.abs(actual[mask])) * 100)
+            if mask.sum() > 0 else np.nan)
+    return dict(ME=me, MAE=mae, RMSE=rmse, MAPE=mape)
+
+
+def compute_metrics_by_model(df_m: pd.DataFrame, idx: str,
+                              models: list) -> pd.DataFrame:
+    """ME, MAE, RMSE, MAPE per model (rows) for a given index type."""
     rows = []
-    for model in MODEL_ORDER:
-        m = df_m[df_m["model"] == model]
-        if len(m) == 0:
-            rows.append(dict(model=model, RMSE=np.nan, MSE=np.nan, UAPE=np.nan, N=0))
-            continue
-        mse = float(m[f"{idx}_sq_error"].mean())
-        if idx in ("HDD", "CDD"):
-            m_u = m[m[f"{idx}_actual"] >= MIN_INDEX]
-        else:
-            m_u = m
-        uape = float(m_u[f"{idx}_uape"].mean(skipna=True)) if len(m_u) else np.nan
-        rows.append(dict(model=model, RMSE=float(np.sqrt(mse)), MSE=mse, UAPE=uape,
-                         N=len(m)))
-    return pd.DataFrame(rows).set_index("model")
-
-
-# ============================================================================
-# MURPHY (1988) DECOMPOSITION
-# ============================================================================
-
-def _murphy_cell(a: np.ndarray, f: np.ndarray):
-    """Return (bias_sq, cond_bias_sq, unpred_var) or (nan, nan, nan)."""
-    if len(a) < 3:
-        return np.nan, np.nan, np.nan
-    sa  = a.std(ddof=0);  sf = f.std(ddof=0)
-    rho = 0.0 if (sa < 1e-10 or sf < 1e-10) else float(np.corrcoef(a, f)[0, 1])
-    return ((f.mean() - a.mean()) ** 2,
-            (sf - rho * sa) ** 2,
-            (1 - rho ** 2) * sa ** 2)
-
-
-def murphy_decompose(df_m: pd.DataFrame, idx: str) -> pd.DataFrame:
-    rows = []
-    for model in MODEL_ORDER:
+    for model in models:
         sub = df_m[df_m["model"] == model]
-        bs, cb, uv = _murphy_cell(sub[f"{idx}_actual"].values,
-                                   sub[f"{idx}_forecast"].values)
-        total = float(sub[f"{idx}_sq_error"].mean()) if len(sub) else np.nan
-        rows.append(dict(model=model, bias_sq=bs, cond_bias_sq=cb,
-                         unpred_var=uv, total_mse=total))
+        if len(sub) == 0:
+            rows.append(dict(model=model, ME=np.nan, MAE=np.nan,
+                             RMSE=np.nan, MAPE=np.nan, N=0))
+            continue
+        m = _metrics_from_arrays(sub[f"{idx}_error"].values,
+                                  sub[f"{idx}_actual"].values, idx)
+        m["model"] = model
+        m["N"]     = len(sub)
+        rows.append(m)
     return pd.DataFrame(rows).set_index("model")
 
 
-# ============================================================================
-# THEIL U  &  PAIRED WILCOXON + BH
-# ============================================================================
-
-def theil_u_vs_baseline(df_m: pd.DataFrame, idx: str) -> pd.Series:
-    """Theil U_i = RMSE_i / RMSE_baseline."""
-    rmses = {m: float(np.sqrt(df_m[df_m["model"] == m][f"{idx}_sq_error"].mean()))
-             for m in MODEL_ORDER}
-    rb = rmses[BASELINE]
-    return pd.Series({m: rmses[m] / rb if np.isfinite(rb) and rb > 0 else np.nan
-                      for m in MODEL_ORDER})
-
-
-def pairwise_wilcoxon_bh(df_m: pd.DataFrame, idx: str):
+def compute_metrics_by_group(df_m: pd.DataFrame, idx: str,
+                              group_col: str) -> pd.DataFrame:
     """
-    d_i = |err_A_i| − |err_B_i| per matched (region, year, month).
-    Wilcoxon signed-rank (two-sided).  Returns (raw_p_df, adj_p_df).
+    ME, MAE, RMSE, MAPE per region or per year, aggregating across ALL models.
     """
+    groups = sorted(df_m[group_col].unique())
+    rows = []
+    for g in groups:
+        sub = df_m[df_m[group_col] == g]
+        m = _metrics_from_arrays(sub[f"{idx}_error"].values,
+                                  sub[f"{idx}_actual"].values, idx)
+        m[group_col] = g
+        rows.append(m)
+    return pd.DataFrame(rows).set_index(group_col)
+
+
+# ============================================================================
+# DIEBOLD-MARIANO TEST
+# ============================================================================
+
+def _dm_stat(e1: np.ndarray, e2: np.ndarray, h: int = 1) -> tuple:
+    """
+    Diebold-Mariano (1995) test, squared-error loss.
+    Harvey, Leybourne & Newbold (1997) small-sample correction applied.
+
+    Parameters
+    ----------
+    e1, e2  : forecast error arrays for model 1 and model 2 (matched pairs)
+    h       : forecast horizon (set to 1 for monthly indices)
+
+    Returns
+    -------
+    (dm_stat, two-sided p-value)
+    Positive dm_stat => model 1 has higher squared loss (model 2 is more accurate).
+    """
+    d = e1 ** 2 - e2 ** 2          # loss differential
+    n = len(d)
+    if n < 10:
+        return np.nan, np.nan
+
+    d_bar = d.mean()
+
+    # Newey-West HAC variance with h−1 autocovariance lags
+    gamma0 = float(np.var(d, ddof=0))
+    gamma_sum = 0.0
+    for lag in range(1, h):
+        if n > lag:
+            gamma_sum += float(
+                np.mean((d[lag:] - d_bar) * (d[:-lag] - d_bar))
+            )
+    V_d = (gamma0 + 2.0 * gamma_sum) / n
+    if V_d <= 0:
+        return np.nan, np.nan
+
+    # HLN small-sample correction
+    correction = np.sqrt((n + 1 - 2 * h + h * (h - 1) / n) / n)
+    dm = (d_bar / np.sqrt(V_d)) * correction
+
+    p = float(2.0 * (1.0 - scipy_norm.cdf(abs(dm))))
+    return float(dm), p
+
+
+def compute_dm_matrices(df_m: pd.DataFrame, idx: str,
+                        models: list) -> tuple:
+    """
+    Compute pairwise DM test for all model pairs.
+
+    Returns
+    -------
+    dm_stat_df : DataFrame of DM statistics (row vs col)
+    adj_p_df   : DataFrame of BH-adjusted p-values
+    """
+    # Pivot to matched pairs on (region, year, month)
     pivot = df_m.pivot_table(
         index=["region", "year", "month"],
         columns="model",
-        values=f"{idx}_abs_error",
+        values=f"{idx}_error",
         aggfunc="first",
     )
 
-    raw = pd.DataFrame(np.nan, index=MODEL_ORDER, columns=MODEL_ORDER, dtype=float)
+    dm_mat  = pd.DataFrame(np.nan, index=models, columns=models)
+    p_raw   = pd.DataFrame(np.nan, index=models, columns=models)
+
     pairs, plist = [], []
 
-    for mi in MODEL_ORDER:
-        for mj in MODEL_ORDER:
-            if mi == mj or mi not in pivot.columns or mj not in pivot.columns:
+    for mi in models:
+        for mj in models:
+            if mi == mj:
                 continue
-            d = (pivot[mi] - pivot[mj]).dropna().values
-            if len(d) < 5 or np.all(d == 0):
+            if mi not in pivot.columns or mj not in pivot.columns:
                 continue
-            try:
-                _, p = scipy_wilcoxon(d, alternative="two-sided")
-                raw.loc[mi, mj] = float(p)
-                pairs.append((mi, mj));  plist.append(float(p))
-            except Exception:
-                pass
+            matched = pivot[[mi, mj]].dropna()
+            if len(matched) < 10:
+                continue
+            dm, p = _dm_stat(matched[mi].values, matched[mj].values, h=1)
+            dm_mat.loc[mi, mj] = dm
+            p_raw.loc[mi, mj]  = p
+            pairs.append((mi, mj))
+            plist.append(p)
 
-    adj = pd.DataFrame(np.nan, index=MODEL_ORDER, columns=MODEL_ORDER, dtype=float)
+    # BH correction across all pairs for this index type
+    adj_p = pd.DataFrame(np.nan, index=models, columns=models)
     if plist:
         corr = _bh_correct(np.array(plist))
         for (mi, mj), pc in zip(pairs, corr):
-            adj.loc[mi, mj] = float(pc)
+            adj_p.loc[mi, mj] = float(pc)
 
-    return raw, adj
+    return dm_mat, adj_p
 
 
 # ============================================================================
-# FIGURE / TABLE RENDERING FUNCTIONS
+# FIGURE / TABLE RENDERING
 # ============================================================================
 
-# ── T01 — Accuracy metrics ───────────────────────────────────────────────────
+# ── T01 — Accuracy metrics per model (one PNG per index) ───────────────────
 
-def fig_accuracy_metrics(monthly: pd.DataFrame) -> None:
-    fig, axes = plt.subplots(2, 2, figsize=(15, 9))
-    axes = axes.flatten()
+def fig_metrics_by_model_for_index(monthly: pd.DataFrame, models: list,
+                                   idx: str) -> None:
+    met = compute_metrics_by_model(monthly, idx, models)
 
-    for ax, idx in zip(axes, INDEX_TYPES):
-        met = compute_metrics(monthly, idx)
-        row_labels = [LABELS[m] for m in MODEL_ORDER]
-        col_labels = ["RMSE", "MSE", "UAPE\u2020"]
-        cell_text  = []
-        best_rmse  = met["RMSE"].dropna().idxmin() if not met["RMSE"].dropna().empty else None
+    row_labels = [LABELS[m] for m in models]
+    col_labels = ["ME", "MAE", "RMSE", "MAPE (%)"]
+    cell_text  = []
 
-        bold_rows = set()
-        for i, model in enumerate(MODEL_ORDER):
-            r = met.loc[model]
-            cell_text.append([_fmt(r["RMSE"]), _fmt(r["MSE"]),
-                               _fmt(r["UAPE"], 4)])
-            if model == best_rmse:
-                bold_rows.add(i)
+    for model in models:
+        r = met.loc[model]
+        cell_text.append([
+            _fmt(r["ME"],   3),
+            _fmt(r["MAE"],  3),
+            _fmt(r["RMSE"], 3),
+            _fmt(r["MAPE"], 2),
+        ])
 
-        fn = (f"\u2020UAPE for {idx}: months with actual < {MIN_INDEX} \u00b0C\u00b7day excluded"
-              if idx in ("HDD", "CDD") else None)
-        _draw_bw_table(ax, cell_text, col_labels, row_labels,
-                       bold_rows=bold_rows, footnote=fn)
-        ax.set_title(INDEX_LABELS[idx], fontsize=10, fontweight="bold",
-                     fontfamily="Times New Roman", pad=6)
-
-    fig.suptitle("Table 1.  Forecast Accuracy — All Regions \u00d7 All OOS Years\n"
-                 "Bold = lowest RMSE.  RMSE and MSE computed on full monthly sample.",
-                 fontsize=10, fontweight="bold", fontfamily="Times New Roman")
-    fig.tight_layout(rect=[0, 0, 1, 0.93])
-    save_fig(fig, "T01_accuracy_metrics")
+    fig, ax = plt.subplots(figsize=(7, 0.45 + 0.32 * len(models)))
+    _draw_econ_table(ax, cell_text, col_labels, row_labels, fontsize=9)
+    save_fig(fig, f"T01_metrics_{idx}")
 
 
-# ── T02 — Murphy decomposition ───────────────────────────────────────────────
+# ── T02 — Diebold-Mariano pairwise test ─────────────────────────────────────
 
-def fig_murphy(monthly: pd.DataFrame) -> None:
-    fig, axes = plt.subplots(2, 2, figsize=(15, 9))
-    axes = axes.flatten()
+def fig_dm_for_index(monthly: pd.DataFrame, models: list, idx: str) -> None:
+    n_mod = len(models)
+    dm_mat, adj_p = compute_dm_matrices(monthly, idx, models)
 
-    for ax, idx in zip(axes, INDEX_TYPES):
-        dc = murphy_decompose(monthly, idx)
-        row_labels = [LABELS[m] for m in MODEL_ORDER]
-        col_labels = ["Bias\u00b2 (%)", "Cond.Bias\u00b2 (%)", "Unpred. (%)", "RMSE"]
-        cell_text  = []
+    row_labels = [LABELS[m] for m in models]
+    col_labels = [LABELS[m] for m in models]
+    cell_text  = []
 
-        for model in MODEL_ORDER:
-            r   = dc.loc[model]
-            tot = r["total_mse"]
-            def pct(v):
-                return f"{v / tot * 100:.1f}" if (pd.notna(v) and pd.notna(tot)
-                                                   and tot > 0) else "—"
-            cell_text.append([pct(r["bias_sq"]), pct(r["cond_bias_sq"]),
-                               pct(r["unpred_var"]),
-                               _fmt(np.sqrt(tot) if pd.notna(tot) else np.nan)])
-
-        _draw_bw_table(ax, cell_text, col_labels, row_labels, fontsize=8)
-        ax.set_title(INDEX_LABELS[idx], fontsize=10, fontweight="bold",
-                     fontfamily="Times New Roman", pad=6)
-
-    fig.suptitle("Table 2.  Murphy (1988) MSE Decomposition\n"
-                 r"MSE = Bias$^2$ + Conditional-Bias$^2$ + Unpredictable Variance"
-                 "  (population \u03c3; components sum to MSE).",
-                 fontsize=10, fontweight="bold", fontfamily="Times New Roman")
-    fig.tight_layout(rect=[0, 0, 1, 0.93])
-    save_fig(fig, "T02_murphy_decomposition")
-
-
-# ── T03 — Theil U + Wilcoxon vs baseline ─────────────────────────────────────
-
-def fig_model_comparison(monthly: pd.DataFrame) -> None:
-    """
-    For each index type: one table with columns
-        RMSE | Theil U | p_raw | p_adj | Sig.
-    Only the comparison against the burn-analysis baseline is shown here.
-    Full pairwise matrices are exported to CSV.
-    """
-    fig, axes = plt.subplots(2, 2, figsize=(15, 9))
-    axes = axes.flatten()
-
-    for ax, idx in zip(axes, INDEX_TYPES):
-        raw_p, adj_p = pairwise_wilcoxon_bh(monthly, idx)
-        theil        = theil_u_vs_baseline(monthly, idx)
-        met          = compute_metrics(monthly, idx)
-
-        row_labels = [LABELS[m] for m in MODEL_ORDER]
-        col_labels = ["RMSE", "Theil U", "p (raw)", "p (BH-adj)", "Sig."]
-        cell_text  = []
-        bold_rows  = set()
-
-        for i, model in enumerate(MODEL_ORDER):
-            rmse = met.loc[model, "RMSE"]
-            u    = theil.loc[model]
-            # comparison: model (row) vs baseline (col)
-            pr   = raw_p.loc[model, BASELINE]
-            pa   = adj_p.loc[model, BASELINE]
-
-            if model == BASELINE:
-                cell_text.append([_fmt(rmse), "1.000", "—", "—", "ref."])
+    for mi in models:
+        row = []
+        for mj in models:
+            if mi == mj:
+                row.append("—"); continue
+            dm = dm_mat.loc[mi, mj]
+            pa = adj_p.loc[mi, mj]
+            if pd.isna(dm) or not np.isfinite(dm):
+                row.append("n/a")
             else:
-                row = [_fmt(rmse), _fmt(u), _fmt(pr, 4), _fmt(pa, 4),
-                       _stars(pa if pd.notna(pa) else np.nan)]
-                cell_text.append(row)
-                if pd.notna(u) and u < 1.0:
-                    bold_rows.add(i)
+                row.append(f"{dm:+.2f}{_stars(pa)}")
+        cell_text.append(row)
 
-        fn = ("Theil U = RMSE_model / RMSE_baseline.  "
-              "Wilcoxon: d_i = |err_model| \u2212 |err_baseline| per "
-              "(region \u00d7 year \u00d7 month).  p BH-adjusted within index type.")
-        _draw_bw_table(ax, cell_text, col_labels, row_labels,
-                       bold_rows=bold_rows, fontsize=7.5, footnote=fn)
-        ax.set_title(INDEX_LABELS[idx], fontsize=10, fontweight="bold",
-                     fontfamily="Times New Roman", pad=6)
-
-    fig.suptitle("Table 3.  Model Comparison vs Burn Analysis Baseline\n"
-                 "Bold = Theil U < 1 (outperforms baseline).  "
-                 "* p\u2080 < 0.05  ** p\u2080 < 0.01  *** p\u2080 < 0.001.",
-                 fontsize=10, fontweight="bold", fontfamily="Times New Roman")
-    fig.tight_layout(rect=[0, 0, 1, 0.93])
-    save_fig(fig, "T03_model_comparison")
+    fs = max(5, 8 - max(0, n_mod - 6))
+    fig, ax = plt.subplots(figsize=(max(8, 0.9 * n_mod),
+                                     0.4 + 0.22 * n_mod))
+    _draw_econ_table(ax, cell_text, col_labels, row_labels, fontsize=fs,
+                     col_width_scale=0.85, row_height_scale=1.05)
+    save_fig(fig, f"T02_dm_{idx}")
 
 
-# ── F01 — UAPE by month (B&W line plot) ──────────────────────────────────────
+# ── T03 — Accuracy by region ─────────────────────────────────────────────────
 
-def fig_uape_by_month(monthly: pd.DataFrame) -> None:
-    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-    axes = axes.flatten()
-
-    for ax, idx in zip(axes, INDEX_TYPES):
-        for model in MODEL_ORDER:
-            uapes = []
-            for m in range(1, 13):
-                sub = monthly[(monthly["model"] == model) & (monthly["month"] == m)]
-                if idx in ("HDD", "CDD"):
-                    sub = sub[sub[f"{idx}_actual"] >= MIN_INDEX]
-                uapes.append(float(sub[f"{idx}_uape"].mean(skipna=True))
-                             if len(sub) else np.nan)
-            st = PLOT_STYLES[model]
-            ax.plot(range(1, 13), uapes,
-                    ls=st["ls"], marker=st["marker"],
-                    color=st["color"], lw=st["lw"], ms=st["ms"],
-                    label=LABELS[model])
-
-        ax.set_xticks(range(1, 13))
-        ax.set_xticklabels(MONTH_NAMES, fontsize=8, fontfamily="Times New Roman")
-        ax.set_ylabel("UAPE", fontsize=9, fontfamily="Times New Roman")
-        ax.set_title(INDEX_LABELS[idx], fontsize=10, fontweight="bold",
-                     fontfamily="Times New Roman")
-        ax.tick_params(labelsize=8)
-        for spine in ax.spines.values():
-            spine.set_color("black")
-            spine.set_linewidth(0.7)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-
-        if idx in ("HDD", "CDD"):
-            ax.set_xlabel(f"Months with actual < {MIN_INDEX} °C·day excluded",
-                          fontsize=7, style="italic", fontfamily="Times New Roman")
-
-    # shared legend below all panels
-    handles = [
-        mlines.Line2D([], [],
-                      ls=PLOT_STYLES[m]["ls"],
-                      marker=PLOT_STYLES[m]["marker"],
-                      color=PLOT_STYLES[m]["color"],
-                      lw=PLOT_STYLES[m]["lw"],
-                      ms=PLOT_STYLES[m]["ms"],
-                      label=LABELS[m])
-        for m in MODEL_ORDER
-    ]
-    fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=8,
-               frameon=True, edgecolor="black",
-               prop={"family": "Times New Roman", "size": 8},
-               bbox_to_anchor=(0.5, -0.04))
-
-    fig.suptitle("Figure 1.  Scale-Adjusted Forecast Error (UAPE) by Calendar Month\n"
-                 "All regions × all OOS years.  UAPE = |error| / mean(|actual|, |forecast|).",
-                 fontsize=10, fontweight="bold", fontfamily="Times New Roman")
-    fig.tight_layout(rect=[0, 0.07, 1, 0.92])
-    save_fig(fig, "F01_uape_by_month")
-
-
-# ── T04 — RMSE by region and year ────────────────────────────────────────────
-
-def fig_rmse_breakdown(monthly: pd.DataFrame) -> None:
-    """
-    Two-panel figure for each of the four index types:
-      left  — RMSE by NUTS-2 region  (regions as rows, models as cols)
-      right — RMSE by OOS year       (years as rows, models as cols)
-    Laid out as a 4-row × 2-col grid (one row per index type).
-    """
+def fig_region_for_index(monthly: pd.DataFrame, idx: str) -> None:
+    met     = compute_metrics_by_group(monthly, idx, "region")
     regions = sorted(monthly["region"].unique())
-    years   = sorted(monthly["year"].unique())
-    n_idx   = len(INDEX_TYPES)
 
-    fig, axes = plt.subplots(n_idx, 2, figsize=(16, 4.5 * n_idx))
+    row_labels = [REGION_NAMES.get(int(r), str(r)) for r in regions]
+    col_labels = ["ME", "MAE", "RMSE", "MAPE (%)"]
+    cell_text  = []
 
-    for i, idx in enumerate(INDEX_TYPES):
-        # ── region table ────────────────────────────────────────────────────
-        ax_r = axes[i, 0]
-        r_rows = [f"R{r}" for r in regions]
-        r_cols = [LABELS[m] for m in MODEL_ORDER]
-        r_data = []
-        for reg in regions:
-            row = []
-            for mdl in MODEL_ORDER:
-                sub = monthly[(monthly["model"] == mdl) & (monthly["region"] == reg)]
-                row.append(_fmt(np.sqrt(sub[f"{idx}_sq_error"].mean())
-                                if len(sub) else np.nan, 2))
-            r_data.append(row)
+    for reg in regions:
+        if reg not in met.index:
+            cell_text.append(["—"] * 4)
+            continue
+        r = met.loc[reg]
+        cell_text.append([
+            _fmt(r["ME"],   3),
+            _fmt(r["MAE"],  3),
+            _fmt(r["RMSE"], 3),
+            _fmt(r["MAPE"], 2),
+        ])
 
-        _draw_bw_table(ax_r, r_data, r_cols, r_rows, fontsize=7)
-        ax_r.set_title(f"{INDEX_LABELS[idx]} — by Region",
-                       fontsize=9, fontweight="bold",
-                       fontfamily="Times New Roman", pad=5)
-
-        # ── year table ──────────────────────────────────────────────────────
-        ax_y = axes[i, 1]
-        y_rows = [str(y) for y in years]
-        y_cols = [LABELS[m] for m in MODEL_ORDER]
-        y_data = []
-        for yr in years:
-            row = []
-            for mdl in MODEL_ORDER:
-                sub = monthly[(monthly["model"] == mdl) & (monthly["year"] == yr)]
-                row.append(_fmt(np.sqrt(sub[f"{idx}_sq_error"].mean())
-                                if len(sub) else np.nan, 2))
-            y_data.append(row)
-
-        _draw_bw_table(ax_y, y_data, y_cols, y_rows, fontsize=7)
-        ax_y.set_title(f"{INDEX_LABELS[idx]} — by Year",
-                       fontsize=9, fontweight="bold",
-                       fontfamily="Times New Roman", pad=5)
-
-    fig.suptitle("Table 4.  RMSE by Region and by OOS Year  (full monthly sample)",
-                 fontsize=10, fontweight="bold", fontfamily="Times New Roman")
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
-    save_fig(fig, "T04_rmse_region_year")
+    fig, ax = plt.subplots(figsize=(7, 0.45 + 0.32 * len(regions)))
+    _draw_econ_table(ax, cell_text, col_labels, row_labels, fontsize=9)
+    save_fig(fig, f"T03_region_{idx}")
 
 
+# ── T04 — Accuracy by year ───────────────────────────────────────────────────
+
+def fig_year_for_index(monthly: pd.DataFrame, idx: str) -> None:
+    years = sorted(monthly["year"].unique())
+    met   = compute_metrics_by_group(monthly, idx, "year")
+
+    row_labels = [str(y) for y in years]
+    col_labels = ["ME", "MAE", "RMSE", "MAPE (%)"]
+    cell_text  = []
+
+    for yr in years:
+        if yr not in met.index:
+            cell_text.append(["—"] * 4)
+            continue
+        r = met.loc[yr]
+        cell_text.append([
+            _fmt(r["ME"],   3),
+            _fmt(r["MAE"],  3),
+            _fmt(r["RMSE"], 3),
+            _fmt(r["MAPE"], 2),
+        ])
+
+    fig, ax = plt.subplots(figsize=(7, 0.45 + 0.30 * len(years)))
+    _draw_econ_table(ax, cell_text, col_labels, row_labels, fontsize=9)
+    save_fig(fig, f"T04_year_{idx}")
+
+
+# ============================================================================
+# CSV EXPORTS (optional diagnostics)
+# ============================================================================
+
+def export_csvs(monthly: pd.DataFrame, models: list) -> None:
+    """Write per-model metrics and DM p-values to CSV for further inspection."""
+    for idx in INDEX_TYPES:
+        # Per-model metrics
+        met = compute_metrics_by_model(monthly, idx, models)
+        met.to_csv(OUTPUT_DIR / f"csv_{idx}_model_metrics.csv")
+
+        # DM adjusted p-values
+        _, adj_p = compute_dm_matrices(monthly, idx, models)
+        adj_p.index   = [LABELS[m] for m in models if m in adj_p.index]
+        adj_p.columns = [LABELS[m] for m in models if m in adj_p.columns]
+        adj_p.to_csv(OUTPUT_DIR / f"csv_{idx}_dm_adj_pvalues.csv")
+
+    print("  CSV exports written.")
 
 
 # ============================================================================
@@ -627,31 +562,30 @@ def fig_rmse_breakdown(monthly: pd.DataFrame) -> None:
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("Loading bk_forecasts.csv ...")
+    print("Loading forecasts …")
     df = load_forecasts(FORECAST_CSV)
-    print(f"  {len(df):,} rows | "
-          f"regions: {sorted(df['region'].unique())} | "
-          f"years: {sorted(df['year'].unique())}")
+    models = active_models(df)
 
-    # Mirror the replication script: write bk_forecasts.csv to OUTPUT_DIR
-    FORECAST_COLS = ["region", "year", "date", "actual", "model", "forecast"]
-    df[FORECAST_COLS].to_csv(OUTPUT_DIR / "bk_forecasts.csv", index=False)
-    print(f"  -> bk_forecasts.csv  ({len(df):,} rows)")
+    print(f"  {len(df):,} daily rows")
+    print(f"  Models present : {models}")
+    print(f"  Regions        : {sorted(df['region'].unique())}")
+    print(f"  Years          : {sorted(df['year'].unique())}")
 
-    print("Computing monthly indices ...")
+    print("Building monthly indices …")
     monthly = build_monthly(df)
-    print(f"  Monthly table: {len(monthly):,} rows")
+    print(f"  {len(monthly):,} model × region × year × month records")
 
-    print("\nRendering figures ...")
-    fig_accuracy_metrics(monthly)
-    fig_murphy(monthly)
-    fig_model_comparison(monthly)
-    fig_uape_by_month(monthly)
-    fig_rmse_breakdown(monthly)
+    for idx in INDEX_TYPES:
+        print(f"Rendering tables for {idx} …")
+        fig_metrics_by_model_for_index(monthly, models, idx)
+        fig_dm_for_index(monthly, models, idx)
+        fig_region_for_index(monthly, idx)
+        fig_year_for_index(monthly, idx)
 
-    print(f"\n{'='*60}")
-    print(f"  All outputs -> {OUTPUT_DIR}")
-    print(f"{'='*60}")
+    print("Exporting CSVs …")
+    export_csvs(monthly, models)
+
+    print("\nAll outputs written to:", OUTPUT_DIR)
 
 
 if __name__ == "__main__":

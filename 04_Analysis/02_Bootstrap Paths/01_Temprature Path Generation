@@ -41,6 +41,19 @@ that already exists in the seasonal bootstrap while letting block lengths
 vary naturally between 1 and ~31 days. The Politis-White estimate is
 retained in the summary table as a diagnostic reference only.
 
+FEB 29 CONTIGUITY FIX
+----------------------
+Feb 29 rows are dropped for no-leap calendar consistency. This creates a
+2-day gap in the pool date sequence between Feb 28 and Mar 1 in leap years
+(2012, 2016, 2020, 2024). Without correction, the run_length precomputation
+would incorrectly extend a block across this gap — treating Feb 28 and
+Mar 1 as contiguous — corrupting block construction in late February.
+
+Fix: run_length is computed using BOTH a same-month check AND a calendar-
+day contiguity check (consecutive dates differ by exactly 1 day). A block
+is only extended if both conditions hold. This correctly breaks the run at
+the Feb 28 / Mar 1 boundary in leap years.
+
 Usage:
     python generate_paths.py
 """
@@ -48,8 +61,6 @@ Usage:
 import os
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 from pathlib import Path
 from arch.bootstrap import optimal_block_length
 
@@ -60,6 +71,14 @@ REGIONS       = [11, 24, 27, 28, 32, 44, 52, 53]
 OOS_YEARS     = list(range(2015, 2025))
 ROOT          = Path(__file__).resolve().parents[2]
 SCRIPT_DIR    = Path(__file__).resolve().parent
+
+# Active model set — must match Forecast Accuracy_v2.MODEL_ORDER. WaveletFNN
+# dropped. Models in bk_forecasts.csv that are not in this list are skipped,
+# and any stale on-disk outputs for them are deleted at the start of main().
+MODELS = [
+    "HBA", "Alaton", "Benth", "ARMA",
+    "XGB", "LSTM", "FeedForwardNN", "KNN", "SVM",
+]
 
 N_PATHS       = 10_000
 SEASON_MONTHS = list(range(1, 13))   # full year
@@ -79,6 +98,27 @@ MIN_FOR_BLOCK = 20   # minimum finite residuals to run diagnostic PW estimator
 # 1.  LOAD ALL FORECASTS (all models)
 # =============================================================================
 
+def compute_valid_dates_per_region(df: pd.DataFrame, models: list) -> dict:
+    """
+    Methodology parity: for each region, return the set of dates where EVERY
+    active model has a finite (actual, forecast) row. All downstream filtering
+    (forecast horizon and residual pool) uses these common dates so every model
+    bootstraps on identical day sets — no model sees more or different data.
+    """
+    valid = {}
+    df = df.assign(ok=np.isfinite(df["forecast"]) & np.isfinite(df["actual"]))
+    for region in sorted(df["region"].unique()):
+        df_r = df[df["region"] == region]
+        pivot = df_r.pivot_table(index="date", columns="model", values="ok",
+                                 aggfunc="all")
+        for m in models:
+            if m not in pivot.columns:
+                pivot[m] = False
+        all_ok = pivot[models].fillna(False).all(axis=1)
+        valid[region] = set(pivot.index[all_ok])
+    return valid
+
+
 def load_all_forecasts(csv_path: str) -> pd.DataFrame:
     """
     Load bk_forecasts.csv for all models and regions.
@@ -89,6 +129,7 @@ def load_all_forecasts(csv_path: str) -> pd.DataFrame:
 
     df = pd.read_csv(csv_path, parse_dates=["date"])
     df.columns = df.columns.str.lower().str.strip()
+    df = df[df["model"].isin(MODELS)].copy()
     df = df.sort_values(["model", "region", "date"]).reset_index(drop=True)
     df["residual"] = df["actual"] - df["forecast"]
     df["month"]    = df["date"].dt.month
@@ -96,7 +137,11 @@ def load_all_forecasts(csv_path: str) -> pd.DataFrame:
 
     feb29 = (df["date"].dt.month == 2) & (df["date"].dt.day == 29)
     if feb29.sum() > 0:
-        print(f"  [INFO] Dropping {feb29.sum()} Feb-29 rows for no-leap calendar")
+        print(f"  [INFO] Dropping {feb29.sum()} Feb-29 rows for no-leap "
+              f"calendar consistency.\n"
+              f"         run_length contiguity fix applied in bootstrap to\n"
+              f"         prevent blocks crossing the Feb-28/Mar-1 gap in "
+              f"leap years.")
         df = df[~feb29].copy()
 
     nan_by_model = (
@@ -116,7 +161,8 @@ def load_all_forecasts(csv_path: str) -> pd.DataFrame:
     print(f"[DATA] Loaded {len(df):,} rows")
     print(f"[DATA] Models   : {models}")
     print(f"[DATA] Regions  : {sorted(df['region'].unique().tolist())}")
-    print(f"[DATA] Date range: {df['date'].min().date()} -> {df['date'].max().date()}\n")
+    print(f"[DATA] Date range: {df['date'].min().date()} -> "
+          f"{df['date'].max().date()}\n")
 
     return df, models
 
@@ -131,6 +177,7 @@ def build_season_data(
     region: int,
     predict_year: int,
     season_months: list,
+    valid_dates: set = None,
 ) -> dict:
     """
     Filter to one (model, region), split into:
@@ -140,19 +187,29 @@ def build_season_data(
         pool_residuals : FINITE residuals from strictly prior years (ex-ante)
         pool_months    : calendar month of each FINITE pool residual
         pool_day       : calendar day-of-month for each FINITE pool residual
-        pool_dates     : DatetimeIndex for each pool entry (for diagnostics)
+        pool_dates     : DatetimeIndex for each pool entry (for diagnostics
+                         and run_length contiguity check)
     """
     df_mr = df[(df["model"] == model) & (df["region"] == region)]
+    if valid_dates is not None:
+        df_mr = df_mr[df_mr["date"].isin(valid_dates)]
 
-    mask_pred = (df_mr["year_col"] == predict_year) & (df_mr["month"].isin(season_months))
-    mask_pool = (df_mr["year_col"] < predict_year)  & (df_mr["month"].isin(season_months))
+    mask_pred = (
+        (df_mr["year_col"] == predict_year) &
+        (df_mr["month"].isin(season_months))
+    )
+    mask_pool = (
+        (df_mr["year_col"] < predict_year) &
+        (df_mr["month"].isin(season_months))
+    )
 
     pred_df = df_mr[mask_pred]
     pool_df = df_mr[mask_pool].copy()
 
     if pred_df.empty:
         raise ValueError(
-            f"No forecast data for model={model}, region={region}, year={predict_year}")
+            f"No forecast data for model={model}, region={region}, "
+            f"year={predict_year}")
 
     forecast_pred = pred_df["forecast"].values.astype(float)
     n_nan_fc = int(np.sum(~np.isfinite(forecast_pred)))
@@ -160,11 +217,11 @@ def build_season_data(
         raise ValueError(
             f"Point forecast contains {n_nan_fc} non-finite values for "
             f"model={model}, region={region}, year={predict_year}. "
-            f"Re-run bk_replication with fully populated PKLs before generating paths."
-        )
+            f"Re-run bk_replication with fully populated PKLs before "
+            f"generating paths.")
 
-    pool_res_raw = pool_df["residual"].values.astype(float)
-    pool_mon_raw = pool_df["month"].values
+    pool_res_raw   = pool_df["residual"].values.astype(float)
+    pool_mon_raw   = pool_df["month"].values
     pool_dates_raw = pd.DatetimeIndex(pool_df["date"].values)
 
     finite_mask = np.isfinite(pool_res_raw)
@@ -179,8 +236,7 @@ def build_season_data(
         raise ValueError(
             f"Pool too small after dropping non-finite: "
             f"{len(pool_res)} finite / {len(pool_res_raw)} total "
-            f"(need >={MIN_POOL_SIZE})"
-        )
+            f"(need >={MIN_POOL_SIZE})")
 
     return {
         "forecast_pred":    forecast_pred,
@@ -252,15 +308,19 @@ def marchand_block_bootstrap(season_data: dict, n_paths: int) -> tuple:
       - For each forecast day d with calendar month M:
           (1) Pick a random residual index k from the pool where
               pool_months[k] == M.
-          (2) Extend the block from k forward while pool_months stays == M
-              AND while day d remains within its own month M in the
-              forecast horizon AND while pool indices remain valid.
+          (2) Extend the block from k forward while BOTH:
+                (a) pool_months stays == M, AND
+                (b) pool dates are strictly consecutive (1-day apart).
+              The consecutive-date check prevents blocks from crossing
+              the Feb-28/Mar-1 gap created by Feb-29 removal in leap
+              years (2012, 2016, 2020, 2024).
           (3) Apply (forecast[d:d+L] + residual[k:k+L]) to the path.
           (4) Advance d by L and repeat until the path is complete.
 
     This is Marchand's original logic: blocks are contiguous runs within a
     single class (calendar month), length is whatever the pool supplies
-    naturally, with no external cap.
+    naturally, with no external cap. The date-contiguity check is the
+    minimal addition required to handle the Feb-29 removal gap correctly.
 
     Output:
         paths       : np.ndarray, shape (n_paths, n_days), raw temperatures
@@ -269,6 +329,7 @@ def marchand_block_bootstrap(season_data: dict, n_paths: int) -> tuple:
     forecast_pred   = season_data["forecast_pred"]
     pool_res        = season_data["pool_residuals"]
     pool_months     = season_data["pool_months"]
+    pool_dates      = season_data["pool_dates"]        # needed for contiguity
     forecast_dates  = season_data["forecast_dates"]
     forecast_months = forecast_dates.month.to_numpy()
 
@@ -282,12 +343,27 @@ def marchand_block_bootstrap(season_data: dict, n_paths: int) -> tuple:
     }
 
     # Precompute: for each pool index k, the length of the consecutive
-    # same-month run starting at k (i.e. how many days forward from k stay
-    # in the same calendar month without leaving the pool).
+    # same-month run starting at k.
+    #
+    # FIX: extend only if BOTH conditions hold:
+    #   (a) same calendar month as k+1
+    #   (b) pool_dates[k+1] - pool_dates[k] == exactly 1 calendar day
+    #
+    # Without (b), the run incorrectly crosses the Feb-28/Mar-1 gap
+    # introduced by Feb-29 removal in leap years, producing blocks that
+    # silently span two months.
+    pool_dates_arr = pool_dates.to_numpy()   # numpy datetime64 array
+
     run_length = np.ones(N_pool, dtype=int)
     for k in range(N_pool - 2, -1, -1):
-        if pool_months[k] == pool_months[k + 1]:
+        same_month  = pool_months[k] == pool_months[k + 1]
+        consecutive = (
+            (pool_dates_arr[k + 1] - pool_dates_arr[k])
+            == np.timedelta64(1, "D")
+        )
+        if same_month and consecutive:
             run_length[k] = run_length[k + 1] + 1
+        # else: run_length[k] stays at 1 (block stops here)
 
     # Precompute: for each forecast day d, how many days remain in its
     # forecast-side calendar month (including d itself).
@@ -301,19 +377,19 @@ def marchand_block_bootstrap(season_data: dict, n_paths: int) -> tuple:
     for b in range(n_paths):
         d = 0
         while d < n_days:
-            month = forecast_months[d]
+            month      = forecast_months[d]
             candidates = month_to_indices.get(month, np.array([], dtype=int))
 
             if len(candidates) == 0:
-                # No pool residuals in this month (shouldn't happen with a
-                # year-long pool but guarded for safety)
-                k = int(rng.integers(N_pool))
+                # No pool residuals in this month — safety fallback
+                k         = int(rng.integers(N_pool))
                 block_len = 1
             else:
                 k = int(candidates[rng.integers(len(candidates))])
-                # Natural Marchand block length: limited by (a) pool same-month
-                # run starting at k, (b) forecast-side same-month run at d,
-                # (c) remaining forecast days.
+                # Natural Marchand block length: limited by
+                #   (a) pool same-month consecutive run from k
+                #   (b) forecast-side same-month run from d
+                #   (c) remaining forecast days
                 block_len = min(
                     int(run_length[k]),
                     int(fcst_remaining[d]),
@@ -322,18 +398,19 @@ def marchand_block_bootstrap(season_data: dict, n_paths: int) -> tuple:
                 block_len = max(1, block_len)
 
             paths[b, d : d + block_len] = (
-                forecast_pred[d : d + block_len] + pool_res[k : k + block_len]
+                forecast_pred[d : d + block_len]
+                + pool_res[k : k + block_len]
             )
             block_lengths_observed.append(block_len)
             d += block_len
 
     block_lengths_arr = np.asarray(block_lengths_observed, dtype=int)
     block_stats = {
-        "mean":   float(block_lengths_arr.mean()),
-        "median": float(np.median(block_lengths_arr)),
-        "min":    int(block_lengths_arr.min()),
-        "max":    int(block_lengths_arr.max()),
-        "std":    float(block_lengths_arr.std()),
+        "mean":           float(block_lengths_arr.mean()),
+        "median":         float(np.median(block_lengths_arr)),
+        "min":            int(block_lengths_arr.min()),
+        "max":            int(block_lengths_arr.max()),
+        "std":            float(block_lengths_arr.std()),
         "n_blocks_total": int(block_lengths_arr.size),
     }
 
@@ -361,73 +438,31 @@ def save_paths(
 
 
 # =============================================================================
-# 6.  PLOT
+# CLEANUP — drop on-disk outputs for models no longer in the active set
 # =============================================================================
 
-def plot_region(region_results: list, model: str, region: int, output_dir: str):
-    """
-    One figure per (model, region) with one subplot per OOS year.
-    """
-    n_years = len(region_results)
-    ncols   = 2
-    nrows   = (n_years + 1) // ncols
+def cleanup_stale_outputs(active_models: list, output_dir: Path) -> None:
+    """Delete .npy/.csv path files for any model not in active_models."""
+    if not output_dir.exists():
+        return
+    active    = set(active_models)
+    n_deleted = 0
 
-    fig, axes = plt.subplots(nrows, ncols, figsize=(14, nrows * 3.8), sharey=False)
-    axes = np.atleast_1d(axes).flatten()
+    for f in output_dir.glob("paths_region*_*_*"):
+        stem = f.stem
+        if stem.endswith("_dates"):
+            stem = stem[:-len("_dates")]
+        parts = stem.split("_")
+        if len(parts) < 4:
+            continue
+        model = parts[-1]
+        if model not in active:
+            f.unlink()
+            n_deleted += 1
 
-    for i, r in enumerate(region_results):
-        ax     = axes[i]
-        paths  = r["paths"]
-        dates  = r["season_data"]["forecast_dates"]
-        actual = r["season_data"]["actual_temps"]
-        year   = r["year"]
-        stats  = r["block_stats"]
-
-        p5  = np.percentile(paths, 5,  axis=0)
-        p25 = np.percentile(paths, 25, axis=0)
-        p50 = np.percentile(paths, 50, axis=0)
-        p75 = np.percentile(paths, 75, axis=0)
-        p95 = np.percentile(paths, 95, axis=0)
-
-        ax.fill_between(dates, p5,  p95,  alpha=0.15, color="#2563eb")
-        ax.fill_between(dates, p25, p75,  alpha=0.30, color="#2563eb")
-        ax.plot(dates, p50,    color="#2563eb", lw=1.2,
-                linestyle="--", label="Median sim.")
-        ax.plot(dates, actual, color="#dc2626", lw=1.4,
-                label=f"Realised {year}")
-
-        ax.set_title(
-            f"{year}  (block len: mean={stats['mean']:.1f}d, "
-            f"median={stats['median']:.0f}d, max={stats['max']}d)",
-            fontsize=10,
-        )
-        ax.set_ylabel("degC (raw temperature)", fontsize=8)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
-        ax.xaxis.set_major_locator(mdates.MonthLocator())
-        ax.tick_params(axis="x", labelsize=8)
-        ax.tick_params(axis="y", labelsize=8)
-        ax.grid(axis="y", linestyle=":", alpha=0.4)
-        ax.spines[["top", "right"]].set_visible(False)
-        ax.legend(fontsize=7, framealpha=0.8)
-
-    for j in range(n_years, len(axes)):
-        axes[j].set_visible(False)
-
-    fig.suptitle(
-        f"Simulated raw temperature paths -- NUTS-2 Region {region}  |  Model: {model}\n"
-        f"Marchand-style month-adaptive block bootstrap  |  N = {N_PATHS:,}\n"
-        f"Block length varies naturally within calendar months "
-        f"(no external cap applied)",
-        fontsize=11, y=1.01,
-    )
-    plt.tight_layout()
-
-    plot_dir = os.path.join(output_dir, "plots")
-    os.makedirs(plot_dir, exist_ok=True)
-    out_path = os.path.join(plot_dir, f"fan_region{region}_{model}.png")
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"    [PLOT] {out_path}")
+    if n_deleted:
+        print(f"[CLEANUP] Removed {n_deleted} stale files for "
+              f"models not in {sorted(active)}.\n")
 
 
 # =============================================================================
@@ -437,17 +472,37 @@ def plot_region(region_results: list, model: str, region: int, output_dir: str):
 def main():
     print("=" * 70)
     print("  BLOCK BOOTSTRAP PATH GENERATION -- All Models")
+    print(f"  Models    : {MODELS}")
     print(f"  Regions   : {REGIONS}")
     print(f"  OOS years : {OOS_YEARS}")
     print(f"  Season    : full year (Jan-Dec)  |  N paths: {N_PATHS:,}")
-    print(f"  Residuals : strictly prior years only (ex-ante, year < predict_year)")
+    print(f"  Residuals : strictly prior years only (ex-ante)")
     print(f"  Method    : Marchand-style month-adaptive block bootstrap")
-    print(f"              (blocks extend naturally within calendar months;")
-    print(f"               Politis-White estimate retained as diagnostic only)")
-    print(f"  Output    : raw temperatures (degC) -- T_ref applied downstream")
+    print(f"              Blocks extend within calendar months;")
+    print(f"              date-contiguity check prevents crossing")
+    print(f"              Feb-28/Mar-1 gap from Feb-29 removal.")
+    print(f"              Politis-White retained as diagnostic only.")
+    print(f"  Bias      : model residual bias deliberately preserved —")
+    print(f"              forecast accuracy flows through to pricing.")
+    print(f"  Output    : raw temperatures (degC) -- T_ref downstream")
     print("=" * 70)
 
+    cleanup_stale_outputs(MODELS, OUTPUT_DIR)
+
     df_all, models = load_all_forecasts(FORECASTS_CSV)
+
+    print("[PARITY] Computing common valid-date set per region "
+          "(intersection across all active models) ...")
+    valid_dates_per_region = compute_valid_dates_per_region(df_all, models)
+    for r in sorted(valid_dates_per_region.keys()):
+        all_dates = sorted(df_all[df_all["region"] == r]["date"].unique())
+        n_total = len(all_dates)
+        n_valid = len(valid_dates_per_region[r])
+        n_drop  = n_total - n_valid
+        if n_drop > 0:
+            print(f"  region {r}: {n_valid:,}/{n_total:,} dates kept "
+                  f"({n_drop} dropped where >=1 model has NaN)")
+    print()
 
     log   = []
     total = len(models) * len(REGIONS) * len(OOS_YEARS)
@@ -458,17 +513,17 @@ def main():
 
         for region in REGIONS:
             print(f"\n  -- Region {region}")
-            region_results = []
 
             for year in OOS_YEARS:
                 done += 1
-                print(f"    [{done:>3}/{total}] {year} ...", end=" ", flush=True)
+                print(f"    [{done:>3}/{total}] {year} ...",
+                      end=" ", flush=True)
 
                 try:
                     season_data = build_season_data(
-                        df_all, model, region, year, SEASON_MONTHS)
+                        df_all, model, region, year, SEASON_MONTHS,
+                        valid_dates=valid_dates_per_region.get(region))
 
-                    # Diagnostic only -- not used to generate paths
                     pw_block, pw_raw, pw_status = diagnostic_pw_block_length(
                         season_data["pool_residuals"])
 
@@ -478,39 +533,31 @@ def main():
                     save_paths(paths, season_data["forecast_dates"],
                                model, region, year, OUTPUT_DIR)
 
-                    region_results.append({
-                        "year":        year,
-                        "paths":       paths,
-                        "season_data": season_data,
-                        "block_stats": block_stats,
-                        "pw_raw":      pw_raw,
-                        "pw_block":    pw_block,
-                        "pw_status":   pw_status,
-                    })
                     log.append({
-                        "model":       model,
-                        "region":      region,
-                        "year":        year,
-                        "pool_n":      len(season_data["pool_residuals"]),
+                        "model":            model,
+                        "region":           region,
+                        "year":             year,
+                        "pool_n":           len(season_data["pool_residuals"]),
                         "pool_dropped_nan": season_data["pool_dropped_nan"],
-                        "pool_years":  season_data["pool_years"],
-                        "block_mean":  block_stats["mean"],
-                        "block_median": block_stats["median"],
-                        "block_max":   block_stats["max"],
-                        "pw_raw":      pw_raw,
-                        "pw_status":   pw_status,
-                        "n_days":      paths.shape[1],
+                        "pool_years":       season_data["pool_years"],
+                        "block_mean":       block_stats["mean"],
+                        "block_median":     block_stats["median"],
+                        "block_max":        block_stats["max"],
+                        "pw_raw":           pw_raw,
+                        "pw_status":        pw_status,
+                        "n_days":           paths.shape[1],
                     })
 
-                    dropped = season_data["pool_dropped_nan"]
-                    drop_note = f", dropped_nan={dropped}" if dropped > 0 else ""
-                    pw_note = (
+                    dropped   = season_data["pool_dropped_nan"]
+                    drop_note = f", dropped_nan={dropped}" if dropped else ""
+                    pw_note   = (
                         f", PW_ref={pw_raw:.1f}d"
                         if pw_raw is not None else
                         f", PW={pw_status}"
                     )
                     print(
-                        f"done  (pool={len(season_data['pool_residuals'])}"
+                        f"done  "
+                        f"(pool={len(season_data['pool_residuals'])}"
                         f"{drop_note}, "
                         f"block_mean={block_stats['mean']:.1f}d, "
                         f"block_max={block_stats['max']}d"
@@ -528,10 +575,6 @@ def main():
                         "pw_raw": None, "pw_status": None, "n_days": None,
                     })
 
-            if region_results:
-                plot_region(region_results, model, region, OUTPUT_DIR)
-
-    # Summary table
     print("\n" + "=" * 70)
     print("  SUMMARY")
     print("=" * 70)
@@ -543,8 +586,8 @@ def main():
         if row["block_mean"] is not None:
             pw_str = (
                 f"{row['pw_raw']:.1f}"
-                if row['pw_raw'] is not None else
-                row.get('pw_status', '-')
+                if row["pw_raw"] is not None else
+                row.get("pw_status", "-")
             )
             print(
                 f"  {row['model']:<14} {row['region']:<4} {row['year']:<6} "
@@ -555,15 +598,17 @@ def main():
                 f"{pw_str:<10} {row['n_days']}"
             )
         else:
-            print(f"  {row['model']:<14} {row['region']:<4} {row['year']:<6} SKIPPED")
+            print(f"  {row['model']:<14} {row['region']:<4} "
+                  f"{row['year']:<6} SKIPPED")
 
     print("=" * 70)
     print(f"\nPaths saved : {OUTPUT_DIR}")
-    print(f"Plots saved : {os.path.join(OUTPUT_DIR, 'plots')}")
     print(
         "\nNote: 'PW ref' is the Politis-White automatic estimate, shown as a\n"
         "diagnostic reference only. The actual block lengths used are the\n"
-        "Marchand-adaptive realised lengths summarised in the 'Blk' columns."
+        "Marchand-adaptive realised lengths summarised in the 'Blk' columns.\n"
+        "Model residual bias is preserved intentionally — forecast accuracy\n"
+        "differences propagate into pricing and hedging effectiveness."
     )
 
     return log
