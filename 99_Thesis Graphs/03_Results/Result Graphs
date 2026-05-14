@@ -56,7 +56,7 @@ from scipy import stats as sp_stats
 # =============================================================================
 
 ROOT             = Path(__file__).resolve().parents[2]
-HEDGING_DIR      = ROOT / "04_Analysis" / "03_Hedging Effectiveness" / "outputs"
+HEDGING_DIR      = ROOT / "04_Analysis" / "04_Hedging Effectiveness" / "outputs"
 PRICING_DIR      = ROOT / "04_Analysis" / "04_Pricing Accuracy"
 PLOT_DIR         = Path(__file__).resolve().parent
 HEDGING_PLOT_DIR = PLOT_DIR / "hedging"
@@ -71,6 +71,13 @@ PRICING_CSV  = PRICING_DIR / "pricing_results.csv"
 ROB_CSV      = HEDGING_DIR / "robustness_results.csv"
 
 MODELS = ["HBA", "Alaton", "Benth", "XGB", "WaveletFNN", "LSTM", "FeedForwardNN"]
+
+MODEL_LABELS = {
+    "HBA": "Naïve",
+}
+
+def _model_label(model):
+    return MODEL_LABELS.get(model, model)
 
 REGION_LABELS = {
     11: "Île-de-France",
@@ -326,7 +333,7 @@ def fig1_delta_by_model(df):
     data   = [df[df["model"] == m]["delta_rev"].values for m in models]
 
     fig, ax = plt.subplots(figsize=(8.5, 4.5))
-    _strip_axis(ax, models, data,
+    _strip_axis(ax, [_model_label(m) for m in models], data,
                 ylabel="$\\Delta Rev$ (EUR/ha)",
                 xlabel="Forecast model")
     plt.tight_layout()
@@ -407,7 +414,7 @@ def fig3_summary_table():
     fig, ax = plt.subplots(figsize=(13, 0.52 * n_r + 1.8))
     ax.set_axis_off()
 
-    tbl = ax.table(cellText=cell_data, rowLabels=models,
+    tbl = ax.table(cellText=cell_data, rowLabels=[_model_label(m) for m in models],
                    colLabels=col_labels, loc="center", cellLoc="center")
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(9)
@@ -506,7 +513,7 @@ def fig5_nstar_by_model(df):
     data   = [df[df["model"] == m]["N_star"].values for m in models]
 
     fig, ax = plt.subplots(figsize=(8.5, 4.0))
-    _strip_axis(ax, models, data,
+    _strip_axis(ax, [_model_label(m) for m in models], data,
                 ylabel="$N^*$ (contracts/ha)",
                 xlabel="Forecast model",
                 zero_line=False)
@@ -618,7 +625,7 @@ def fig8_year_heatmap(df):
     ax.set_xticks(range(len(years)))
     ax.set_xticklabels(years, fontsize=9)
     ax.set_yticks(range(len(models)))
-    ax.set_yticklabels(models, fontsize=9)
+    ax.set_yticklabels([_model_label(m) for m in models], fontsize=9)
     ax.set_xlabel("OOS year")
     ax.set_ylabel("Model")
     ax.set_xticks(np.arange(-0.5, len(years),  1), minor=True)
@@ -645,7 +652,7 @@ def tab1_bare_numbers():
         r = summary.loc[m]
         p = r.get("wilcoxon_p", np.nan)
         rows.append([
-            m,
+            _model_label(m),
             f"{r.get('mean_delta', np.nan):+.2f}",
             f"{p:.3f}{_stars(p)}" if not pd.isna(p) else "—",
             f"{r.get('hit_rate', np.nan):.1f}",
@@ -781,7 +788,7 @@ def tab2_pricing_accuracy():
     for m in models:
         n, bias, mae, rmse = _stats(pr[pr["model"] == m]["pricing_error"])
         rows.append([str(n), f"{bias:+.1f}", f"{mae:.1f}", f"{rmse:.1f}"])
-        rlabels.append(m)
+        rlabels.append(_model_label(m))
 
     col_labels = ["N", "Bias (EUR)", "MAE (EUR)", "RMSE (EUR)"]
     fig, ax = plt.subplots(figsize=(8, 0.42 * len(models) + 0.9))
@@ -825,7 +832,7 @@ def figp1_error_by_model():
     data     = [pr[pr["model"] == m]["pricing_error"].values for m in models]
     horizons = [pr[pr["model"] == m]["horizon"].values for m in models]
     fig, ax  = plt.subplots(figsize=(8.5, 4.5))
-    _strip_axis_horizon(ax, models, data, horizons,
+    _strip_axis_horizon(ax, [_model_label(m) for m in models], data, horizons,
                         ylabel="Pricing error (EUR)",
                         xlabel="Forecast model")
     plt.tight_layout()
@@ -881,7 +888,7 @@ def figp2_price_vs_payoff():
                 transform=ax.transAxes, ha="right", va="bottom", fontsize=7.5,
                 bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
                           edgecolor="black", linewidth=0.6))
-        ax.text(0.03, 0.97, model, transform=ax.transAxes,
+        ax.text(0.03, 0.97, _model_label(model), transform=ax.transAxes,
                 ha="left", va="top", fontsize=9, fontweight="bold")
         ax.set_xlim(vmin, vmax)
         ax.set_ylim(vmin, vmax)
@@ -1090,7 +1097,7 @@ def tabp_pricing_accuracy():
 
     # --- by model ---
     models = [m for m in MODELS if m in pr["model"].unique()]
-    m_rows = [[m] + _stats_h(pr[pr["model"] == m], "H1")
+    m_rows = [[_model_label(m)] + _stats_h(pr[pr["model"] == m], "H1")
                    + _stats_h(pr[pr["model"] == m], "H2")
               for m in models]
     fig1, ax1 = plt.subplots(figsize=(11, 0.42 * len(m_rows) + 0.8))
@@ -1216,7 +1223,7 @@ def tabhe_effectiveness():
         else:
             p_str = "—"
         # Insert p-value after Mean ΔRev
-        m_rows.append([m, s[0], p_str, s[1], s[2]])
+        m_rows.append([_model_label(m), s[0], p_str, s[1], s[2]])
 
     fig1, ax1 = plt.subplots(figsize=(11, 0.42 * len(m_rows) + 0.8))
     _draw_table(ax1, m_rows, col_labels_model)

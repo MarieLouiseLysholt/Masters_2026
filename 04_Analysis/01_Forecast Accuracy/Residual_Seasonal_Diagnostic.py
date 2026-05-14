@@ -27,12 +27,12 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 MODEL_ORDER = [
     "HBA", "Alaton", "Benth", "ARMA",
-    "XGB", "LSTM", "FeedForwardNN", "KNN", "SVM",
+    "XGB", "LSTM", "FeedForwardNN", "KNN", "SVM", "RF",
 ]
 LABELS = {
-    "HBA": "HBA", "Alaton": "Alaton", "Benth": "Benth", "ARMA": "ARMA",
+    "HBA": "Naïve", "Alaton": "Alaton", "Benth": "Benth", "ARMA": "ARMA",
     "XGB": "XGBoost", "LSTM": "LSTM", "FeedForwardNN": "Feed Forward NN",
-    "KNN": "KNN", "SVM": "SVM",
+    "KNN": "KNN", "SVM": "SVR", "RF": "Random Forest",
 }
 REGION_NAMES = {
     11: "Île-de-France",           24: "Centre-Val de Loire",
@@ -132,54 +132,14 @@ def time_panel(ax, model: str, df: pd.DataFrame) -> None:
         ax.set_visible(False)
         return
 
-    # Per-region monthly means (very faint)
     sub = sub.copy()
     sub["ym"] = sub["date"].dt.to_period("M").dt.to_timestamp()
-    region_monthly = (sub.groupby(["region", "ym"])["resid"].mean()
-                      .reset_index())
-    for region, grp in region_monthly.groupby("region"):
-        ax.plot(grp["ym"], grp["resid"], color="0.85", lw=0.4, alpha=0.7)
 
-    # Pooled monthly mean (faint, shows seasonal noise)
     pooled = sub.groupby("ym")["resid"].mean().sort_index()
-    ax.plot(pooled.index, pooled.values, color="0.55", lw=0.5)
-
-    # 12-month rolling mean of pooled residual — strips seasonal noise,
-    # leaves long-range structure / drift
-    roll = pooled.rolling(12, center=True, min_periods=6).mean()
-    ax.plot(roll.index, roll.values, color="black", lw=1.4)
-
-    # Linear trend overlay
-    t      = np.arange(len(pooled))
-    y      = pooled.values
-    mask   = np.isfinite(y)
-    slope, intercept = np.polyfit(t[mask], y[mask], 1)
-    trend  = intercept + slope * t
-
-    # Slope significance (OLS t-test)
-    n      = mask.sum()
-    resid  = y[mask] - (intercept + slope * t[mask])
-    sigma2 = float(np.sum(resid ** 2) / max(1, n - 2))
-    ssx    = float(np.sum((t[mask] - t[mask].mean()) ** 2))
-    se     = float(np.sqrt(sigma2 / ssx)) if ssx > 0 else np.nan
-    t_stat = slope / se if (se and np.isfinite(se) and se > 0) else np.nan
-    from scipy.stats import t as scipy_t
-    p_val  = float(2.0 * (1.0 - scipy_t.cdf(abs(t_stat), df=n - 2))) \
-             if np.isfinite(t_stat) else np.nan
-
-    ax.plot(pooled.index, trend, color="crimson", lw=1.2, linestyle="--")
+    ax.plot(pooled.index, pooled.values, color="black", lw=1.1)
     ax.axhline(0, color="black", lw=0.5, linestyle=":", alpha=0.6)
 
-    # Convert slope from per-month to per-year for readability
-    slope_year = slope * 12
-    sig_mark = "***" if p_val < 0.001 else ("**" if p_val < 0.01
-              else ("*" if p_val < 0.05 else ""))
-    ax.text(0.97, 0.95,
-            f"trend = {slope_year:+.3f} °C/yr{sig_mark}",
-            transform=ax.transAxes, fontsize=7.5,
-            ha="right", va="top", color="crimson")
-
-    ax.set_ylim(-2.5, 2.5)
+    ax.set_ylim(-5, 5)
     ax.set_title(LABELS.get(model, model), fontsize=10, loc="left",
                  fontweight="bold")
     ax.tick_params(labelsize=7)
@@ -187,9 +147,9 @@ def time_panel(ax, model: str, df: pd.DataFrame) -> None:
 
 def make_grid(df: pd.DataFrame, panel_fn, title: str, out_name: str,
               ylabel: str) -> None:
-    fig, axes = plt.subplots(3, 3, figsize=(11, 8.5),
+    fig, axes = plt.subplots(4, 3, figsize=(12, 11.2),
                              sharex=True, sharey=True,
-                             gridspec_kw={"hspace": 0.35, "wspace": 0.18})
+                             gridspec_kw={"hspace": 0.38, "wspace": 0.16})
     axes_flat = axes.flatten()
 
     present = [m for m in MODEL_ORDER if m in df["model"].unique()]
@@ -232,9 +192,7 @@ def main():
 
     make_grid(
         df, time_panel,
-        title=("Residual over the full forecasting range — light grey: "
-               "per-region monthly; grey: pooled monthly; "
-               "black: 12-month rolling; red dashed: linear trend"),
+        title="Residual over the full forecasting range — black: pooled monthly residual across regions",
         out_name="T10_residual_over_time.png",
         ylabel="ε̄  [°C]",
     )

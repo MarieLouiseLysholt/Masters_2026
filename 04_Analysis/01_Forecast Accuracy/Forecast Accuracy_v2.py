@@ -10,9 +10,12 @@ Outputs (all written to OUTPUT_DIR)
   T02_dm_test.png              Diebold-Mariano pairwise test matrix
   T03_metrics_by_region.png    ME / MAE / RMSE / MAPE — per NUTS-2 region
   T04_metrics_by_year.png      ME / MAE / RMSE / MAPE — per OOS year
+  T19_rolling_forecast_error.png
+                                12-month rolling MAE over time — per model
+  T20_bias_ME_by_model.png      Signed ME barplot — per model
 
-Each output is produced for all four index types (AvgT, HDD, CDD, CAT)
-as a 2×2 panel figure.
+Each output is produced for daily average temperature and the monthly weather
+index targets (MonthlyAvgT, HDD, CDD, CAT).
 
 Methodology notes
 -----------------
@@ -22,9 +25,11 @@ Metrics
   RMSE = sqrt(mean((forecast − actual)²))
   MAPE = mean(|error| / |actual|) × 100
          HDD/CDD: months with actual < MIN_INDEX excluded from MAPE.
-         AvgT/CAT: months with |actual| < 0.5 excluded from MAPE.
+         DailyAvgT/MonthlyAvgT/CAT: observations with |actual| < 0.5
+         excluded from MAPE.
 
-Metrics are computed on monthly aggregated index values.
+Metrics are computed on daily observations for DailyAvgT and on monthly
+aggregated index values for MonthlyAvgT, HDD, CDD, and CAT.
 
 Diebold-Mariano test
   Loss:      squared error  L(e) = e²
@@ -38,6 +43,13 @@ Diebold-Mariano test
 T03 / T04
   Metrics aggregated across ALL models.  Purpose: reveal how forecast
   difficulty varies by region and by OOS year, not model ranking.
+
+T19 / T20
+  T19 plots the 12-month rolling mean of absolute monthly forecast error,
+  averaged across regions within each model-month.  This shows whether model
+  error is stable over the OOS period or concentrated in particular years.
+  T20 plots ME by model, where positive values indicate over-forecasting and
+  negative values indicate under-forecasting.
 """
 
 import warnings
@@ -71,13 +83,13 @@ DPI       = 260
 MODEL_ORDER = [
     "HBA", "Alaton", "Benth", "ARMA",
     "XGB", "LSTM", "FeedForwardNN",
-    "KNN", "SVM",
+    "KNN", "SVM", "RF"
 ]
 
 BASELINE = "HBA"
 
 LABELS = {
-    "HBA":           "HBA",
+    "HBA":           "Naïve",
     "Alaton":        "Alaton",
     "Benth":         "Benth",
     "ARMA":          "ARMA",
@@ -85,7 +97,21 @@ LABELS = {
     "LSTM":          "LSTM",
     "FeedForwardNN": "Feed Forward NN",
     "KNN":           "KNN",
-    "SVM":           "SVM",
+    "SVM":           "SVR",
+    "RF":            "Random Forest",
+}
+
+MODEL_COLORS = {
+    "HBA":           "#000000",
+    "Alaton":        "#0072B2",
+    "Benth":         "#D55E00",
+    "ARMA":          "#009E73",
+    "XGB":           "#CC79A7",
+    "LSTM":          "#E69F00",
+    "FeedForwardNN": "#56B4E9",
+    "KNN":           "#F0E442",
+    "SVM":           "#6A3D9A",
+    "RF":            "#A6761D",
 }
 
 REGION_NAMES = {
@@ -99,9 +125,12 @@ REGION_NAMES = {
     53: "Bretagne",
 }
 
-INDEX_TYPES = ["AvgT", "HDD", "CDD", "CAT"]
+DAILY_INDEX_TYPES = ["DailyAvgT"]
+MONTHLY_INDEX_TYPES = ["MonthlyAvgT", "HDD", "CDD", "CAT"]
+INDEX_TYPES = DAILY_INDEX_TYPES + MONTHLY_INDEX_TYPES
 INDEX_LABELS = {
-    "AvgT": "Average Temperature (°C / month)",
+    "DailyAvgT": "Daily Average Temperature (°C / day)",
+    "MonthlyAvgT": "Monthly Average Temperature (°C / month)",
     "HDD":  r"HDD  (T$_{ref}$ = 10 °C)",
     "CDD":  r"CDD  (T$_{ref}$ = 10 °C)",
     "CAT":  "CAT  (°C · days)",
@@ -232,11 +261,26 @@ def active_models(df: pd.DataFrame) -> list:
 
 
 # ============================================================================
-# MONTHLY INDEX COMPUTATION
+# DAILY / MONTHLY INDEX COMPUTATION
 # ============================================================================
 
+def build_daily_avgt(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep daily average-temperature forecast errors at daily frequency."""
+    daily = df[["region", "year", "month", "date", "model",
+                "actual", "forecast"]].copy()
+    daily = daily.rename(columns={
+        "actual": "DailyAvgT_actual",
+        "forecast": "DailyAvgT_forecast",
+    })
+    e = daily["DailyAvgT_forecast"] - daily["DailyAvgT_actual"]
+    daily["DailyAvgT_error"] = e
+    daily["DailyAvgT_sq_error"] = e ** 2
+    daily["DailyAvgT_abs_error"] = e.abs()
+    return daily
+
+
 def build_monthly(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate daily temps to monthly HDD, CDD, CAT, AvgT per model."""
+    """Aggregate daily temps to monthly HDD, CDD, CAT, MonthlyAvgT per model."""
 
     def _agg(grp):
         a = grp["actual"].values.astype(float)
@@ -248,8 +292,8 @@ def build_monthly(df: pd.DataFrame) -> pd.DataFrame:
             "CDD_forecast":  np.sum(np.maximum(0.0, f - T_REF)),
             "CAT_actual":    np.sum(a),
             "CAT_forecast":  np.sum(f),
-            "AvgT_actual":   np.mean(a),
-            "AvgT_forecast": np.mean(f),
+            "MonthlyAvgT_actual":   np.mean(a),
+            "MonthlyAvgT_forecast": np.mean(f),
             "n_days":        len(a),
         })
 
@@ -259,7 +303,7 @@ def build_monthly(df: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
 
-    for idx in INDEX_TYPES:
+    for idx in MONTHLY_INDEX_TYPES:
         e = mon[f"{idx}_forecast"] - mon[f"{idx}_actual"]
         mon[f"{idx}_error"]    = e
         mon[f"{idx}_sq_error"] = e ** 2
@@ -276,7 +320,7 @@ def _mape_mask(actual: np.ndarray, idx: str) -> np.ndarray:
     """Boolean mask selecting rows safe to include in MAPE."""
     if idx in ("HDD", "CDD"):
         return np.abs(actual) >= MIN_INDEX
-    else:  # AvgT, CAT
+    else:  # DailyAvgT, MonthlyAvgT, CAT
         return np.abs(actual) >= MAPE_AVGT_MIN
 
 
@@ -340,7 +384,7 @@ def _dm_stat(e1: np.ndarray, e2: np.ndarray, h: int = 1) -> tuple:
     Parameters
     ----------
     e1, e2  : forecast error arrays for model 1 and model 2 (matched pairs)
-    h       : forecast horizon (set to 1 for monthly indices)
+    h       : forecast horizon (set to 1 for daily/monthly targets here)
 
     Returns
     -------
@@ -384,9 +428,12 @@ def compute_dm_matrices(df_m: pd.DataFrame, idx: str,
     dm_stat_df : DataFrame of DM statistics (row vs col)
     adj_p_df   : DataFrame of BH-adjusted p-values
     """
-    # Pivot to matched pairs on (region, year, month)
+    # Pivot to matched pairs on the target's evaluation frequency.
+    match_index = (["region", "year", "date"]
+                   if idx in DAILY_INDEX_TYPES
+                   else ["region", "year", "month"])
     pivot = df_m.pivot_table(
-        index=["region", "year", "month"],
+        index=match_index,
         columns="model",
         values=f"{idx}_error",
         aggfunc="first",
@@ -535,19 +582,112 @@ def fig_year_for_index(monthly: pd.DataFrame, idx: str) -> None:
     save_fig(fig, f"T04_year_{idx}")
 
 
+# ── T19 — Rolling forecast error over time ──────────────────────────────────
+
+def fig_rolling_error_for_index(monthly: pd.DataFrame, models: list,
+                                idx: str) -> None:
+    d = monthly.copy()
+    d["ym"] = pd.to_datetime(
+        dict(year=d["year"].astype(int),
+             month=d["month"].astype(int),
+             day=1)
+    )
+
+    fig, ax = plt.subplots(figsize=(9.4, 5.2))
+
+    rows = []
+    for i, model in enumerate(models):
+        sub = (
+            d[d["model"] == model]
+            .groupby("ym", as_index=False)[f"{idx}_abs_error"]
+            .mean()
+            .sort_values("ym")
+        )
+        if sub.empty:
+            continue
+        sub["rolling_mae"] = (
+            sub[f"{idx}_abs_error"]
+            .rolling(12, center=True, min_periods=4)
+            .mean()
+        )
+        sub["model"] = LABELS.get(model, model)
+        rows.append(sub[["model", "ym", f"{idx}_abs_error", "rolling_mae"]])
+        ax.plot(
+            sub["ym"], sub["rolling_mae"],
+            color=MODEL_COLORS.get(model, "0.35"),
+            linestyle="-",
+            linewidth=1.8,
+            label=LABELS.get(model, model),
+        )
+
+    ax.set_ylabel("12-month rolling MAE")
+    ax.set_xlabel("Forecast month")
+    ax.set_ylim(bottom=0)
+    ax.axhline(0, color="black", linewidth=0.6)
+    ax.grid(axis="y", color="0.86", linewidth=0.5)
+    ax.legend(frameon=False, fontsize=8, ncol=5, loc="upper center",
+              bbox_to_anchor=(0.5, -0.18), borderaxespad=0.0)
+    ax.set_title(f"Rolling forecast error over time - {INDEX_LABELS[idx]}",
+                 fontsize=10, fontweight="normal")
+    fig.subplots_adjust(bottom=0.27)
+    save_fig(fig, f"T19_rolling_forecast_error_{idx}")
+
+    if rows:
+        out = pd.concat(rows, ignore_index=True)
+        out.to_csv(OUTPUT_DIR / f"csv_{idx}_rolling_forecast_error.csv",
+                   index=False)
+
+
+# ── T20 — Bias by model ─────────────────────────────────────────────────────
+
+def fig_bias_me_by_model_for_index(monthly: pd.DataFrame, models: list,
+                                   idx: str) -> None:
+    met = compute_metrics_by_model(monthly, idx, models)
+    vals = met.loc[models, "ME"].astype(float)
+    labels = [LABELS.get(m, m) for m in models]
+    colors = ["0.20" if v >= 0 else "0.62" for v in vals]
+
+    fig, ax = plt.subplots(figsize=(max(7.2, 0.72 * len(models)), 4.4))
+    x = np.arange(len(models))
+    ax.bar(x, vals.values, color=colors, edgecolor="black", linewidth=0.6)
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=35, ha="right")
+    ax.set_ylabel("Mean error (forecast - actual)")
+    ax.set_title(f"Bias by model - {INDEX_LABELS[idx]}",
+                 fontsize=10, fontweight="normal")
+    ax.grid(axis="y", color="0.86", linewidth=0.5)
+
+    ymax = np.nanmax(np.abs(vals.values)) if np.isfinite(vals.values).any() else 1
+    ax.set_ylim(-1.18 * ymax if ymax > 0 else -1,
+                1.18 * ymax if ymax > 0 else 1)
+    for xi, v in zip(x, vals.values):
+        if not np.isfinite(v):
+            continue
+        va = "bottom" if v >= 0 else "top"
+        offset = 0.025 * ymax if ymax > 0 else 0.05
+        ax.text(xi, v + (offset if v >= 0 else -offset),
+                _fmt(v, 3), ha="center", va=va, fontsize=7)
+
+    fig.tight_layout()
+    save_fig(fig, f"T20_bias_ME_by_model_{idx}")
+
+
 # ============================================================================
 # CSV EXPORTS (optional diagnostics)
 # ============================================================================
 
-def export_csvs(monthly: pd.DataFrame, models: list) -> None:
+def export_csvs(eval_data: dict, models: list) -> None:
     """Write per-model metrics and DM p-values to CSV for further inspection."""
     for idx in INDEX_TYPES:
+        data = eval_data[idx]
         # Per-model metrics
-        met = compute_metrics_by_model(monthly, idx, models)
+        met = compute_metrics_by_model(data, idx, models)
+        met.index = [LABELS[m] for m in models if m in met.index]
         met.to_csv(OUTPUT_DIR / f"csv_{idx}_model_metrics.csv")
 
         # DM adjusted p-values
-        _, adj_p = compute_dm_matrices(monthly, idx, models)
+        _, adj_p = compute_dm_matrices(data, idx, models)
         adj_p.index   = [LABELS[m] for m in models if m in adj_p.index]
         adj_p.columns = [LABELS[m] for m in models if m in adj_p.columns]
         adj_p.to_csv(OUTPUT_DIR / f"csv_{idx}_dm_adj_pvalues.csv")
@@ -571,19 +711,26 @@ def main():
     print(f"  Regions        : {sorted(df['region'].unique())}")
     print(f"  Years          : {sorted(df['year'].unique())}")
 
-    print("Building monthly indices …")
+    print("Building daily AvgT and monthly indices …")
+    daily = build_daily_avgt(df)
     monthly = build_monthly(df)
+    eval_data = {"DailyAvgT": daily}
+    eval_data.update({idx: monthly for idx in MONTHLY_INDEX_TYPES})
+    print(f"  {len(daily):,} daily model × region × date records")
     print(f"  {len(monthly):,} model × region × year × month records")
 
     for idx in INDEX_TYPES:
         print(f"Rendering tables for {idx} …")
-        fig_metrics_by_model_for_index(monthly, models, idx)
-        fig_dm_for_index(monthly, models, idx)
-        fig_region_for_index(monthly, idx)
-        fig_year_for_index(monthly, idx)
+        data = eval_data[idx]
+        fig_metrics_by_model_for_index(data, models, idx)
+        fig_dm_for_index(data, models, idx)
+        fig_region_for_index(data, idx)
+        fig_year_for_index(data, idx)
+        fig_rolling_error_for_index(data, models, idx)
+        fig_bias_me_by_model_for_index(data, models, idx)
 
     print("Exporting CSVs …")
-    export_csvs(monthly, models)
+    export_csvs(eval_data, models)
 
     print("\nAll outputs written to:", OUTPUT_DIR)
 

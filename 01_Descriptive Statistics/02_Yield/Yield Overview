@@ -1,5 +1,5 @@
 """
-Descriptive statistics of annual winter wheat yield – full sample
+Descriptive statistics of annual winter wheat yield – 2000-2024
 Generates both CSV and PNG table for thesis insertion
 Yield unit: quintals per hectare (q/ha)
 """
@@ -12,13 +12,16 @@ from pathlib import Path
 mpl.rcParams['font.family'] = 'serif'
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
-THESIS_GRAPH_DIR = ROOT / "04_Thesis Graphs"
+THESIS_GRAPH_DIR = ROOT / "99_Thesis Graphs" / "02_Yield"
 THESIS_GRAPH_DIR.mkdir(parents=True, exist_ok=True)
 DATA_PATH = ROOT / "02_Data" / "02_Wheat" / "ble_tendre_hiver_yield_2000_2024_regions_mainland.csv"
 OUT_CSV   = SCRIPT_DIR / "yield_descriptive_stats.csv"
 OUT_PNG   = THESIS_GRAPH_DIR / "yield_descriptive_stats.png"
+
+YEAR_START = 2000
+YEAR_END = 2024
 
 REGION_NAMES = {
     11: "Île-de-France",
@@ -34,6 +37,7 @@ REGION_NAMES = {
 # ── Load ──────────────────────────────────────────────────────────────────────
 df = pd.read_csv(DATA_PATH)
 df = df[df["reg"].isin(REGION_NAMES.keys())].copy()
+df = df[(df["year"] >= YEAR_START) & (df["year"] <= YEAR_END)].copy()
 
 # ── Compute stats ─────────────────────────────────────────────────────────────
 rows = []
@@ -54,6 +58,7 @@ for code in sorted(REGION_NAMES.keys()):
 
 results = pd.DataFrame(rows).set_index("Region")
 results.round(4).to_csv(OUT_CSV)
+results.round(4).to_csv(THESIS_GRAPH_DIR / "yield_descriptive_stats.csv")
 
 # ── PNG table ─────────────────────────────────────────────────────────────────
 cols = ["N", "Mean", "St. Dev", "Max", "Median", "Min"]

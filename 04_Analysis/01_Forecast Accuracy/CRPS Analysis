@@ -74,7 +74,7 @@ MODEL_ORDER = [
 ]
 
 LABELS = {
-    "HBA":           "HBA",
+    "HBA":           "Naïve",
     "Alaton":        "Alaton",
     "Benth":         "Benth",
     "ARMA":          "ARMA",
@@ -82,7 +82,7 @@ LABELS = {
     "LSTM":          "LSTM",
     "FeedForwardNN": "Feed Forward NN",
     "KNN":           "KNN",
-    "SVM":           "SVM",
+    "SVM":           "SVR",
 }
 
 REGIONS     = [11, 24, 27, 28, 32, 44, 52, 53]

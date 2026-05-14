@@ -62,7 +62,11 @@ import os
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from arch.bootstrap import optimal_block_length
+
+try:
+    from arch.bootstrap import optimal_block_length
+except ModuleNotFoundError:
+    optimal_block_length = None
 
 # =============================================================================
 # CONFIG
@@ -75,10 +79,7 @@ SCRIPT_DIR    = Path(__file__).resolve().parent
 # Active model set — must match Forecast Accuracy_v2.MODEL_ORDER. WaveletFNN
 # dropped. Models in bk_forecasts.csv that are not in this list are skipped,
 # and any stale on-disk outputs for them are deleted at the start of main().
-MODELS = [
-    "HBA", "Alaton", "Benth", "ARMA",
-    "XGB", "LSTM", "FeedForwardNN", "KNN", "SVM",
-]
+MODELS = [ "HBA", "Alaton", "Benth", "ARMA","XGB", "LSTM", "FeedForwardNN", "KNN", "SVM", "RF",]
 
 N_PATHS       = 10_000
 SEASON_MONTHS = list(range(1, 13))   # full year
@@ -262,6 +263,7 @@ def diagnostic_pw_block_length(pool_residuals: np.ndarray) -> tuple:
 
     Returns (b_int, b_raw, status) where status is one of:
         'pw'           - Politis-White estimator succeeded
+        'unavailable'  - arch package is not installed
         'degenerate'   - residuals had near-zero variance
         'insufficient' - too few finite residuals
         'failed'       - arch returned NaN
@@ -274,6 +276,9 @@ def diagnostic_pw_block_length(pool_residuals: np.ndarray) -> tuple:
 
     if np.std(clean) < 1e-10:
         return None, None, "degenerate"
+
+    if optimal_block_length is None:
+        return None, None, "unavailable"
 
     try:
         result = optimal_block_length(clean)

@@ -33,6 +33,7 @@ ROOT      = _find_root(Path(__file__).resolve().parent)
 DATA_PATH = ROOT / "02_Data" / "01_Temprature" / "region_avg.csv"
 OUT_DIR   = ROOT / "99_Thesis Graphs" / "04_Data Tests"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+START_DATE = pd.Timestamp("1980-01-01")
 
 REGION_NAMES = {
     11: "Île-de-France",           24: "Centre-Val de Loire",
@@ -73,6 +74,7 @@ def plot_acf(ax, vals, xmax, ci_n):
 
 def make_figure():
     raw = pd.read_csv(DATA_PATH, parse_dates=["date"]).sort_values("date")
+    raw = raw[raw["date"] >= START_DATE].copy()
     regions = sorted(raw["region_code"].unique())
 
     n = len(regions)
@@ -106,7 +108,7 @@ def make_figure():
     for j in range(n, len(axes_flat)):
         axes_flat[j].axis("off")
 
-    fig.suptitle("Autocorrelation — daily mean temperature (1970–2024)",
+    fig.suptitle("Autocorrelation — daily mean temperature (1980–2024)",
                  fontsize=11, y=0.995)
     out = OUT_DIR / "Figure_ACF_Murat.png"
     fig.savefig(out, dpi=200, bbox_inches="tight", facecolor="white")

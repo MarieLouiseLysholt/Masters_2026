@@ -23,12 +23,13 @@ from pathlib import Path
 mpl.rcParams['font.family'] = 'serif'
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 SCRIPT_DIR = Path(__file__).resolve().parent
-THESIS_GRAPH_DIR = ROOT / "04_Thesis Graphs"
+THESIS_GRAPH_DIR = ROOT / "99_Thesis Graphs" / "01_Temprature"
 THESIS_GRAPH_DIR.mkdir(parents=True, exist_ok=True)
 DATA_PATH  = ROOT / "02_Data" / "01_Temprature" / "region_avg.csv"
 CSV_DIR    = SCRIPT_DIR
+START_DATE = "1980-01-01"
 
 REGION_NAMES = {
     11: "Île-de-France",
@@ -54,6 +55,7 @@ SHORT_NAMES = {
 
 # ── Load and pivot ────────────────────────────────────────────────────────────
 df = pd.read_csv(DATA_PATH, parse_dates=["date"])
+df = df[df["date"] >= START_DATE].copy()
 all_codes     = sorted(df["region_code"].unique())
 region_labels = {code: REGION_NAMES.get(code, f"Region {code}") for code in all_codes}
 

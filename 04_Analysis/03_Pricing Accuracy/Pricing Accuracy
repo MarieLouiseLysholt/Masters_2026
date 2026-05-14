@@ -50,19 +50,19 @@ OOS_YEARS = list(range(2015, 2025))
 ROOT      = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-MODELS = ["HBA", "Alaton", "Benth", "ARMA", "XGB", "WaveletFNN", "LSTM", "FeedForwardNN", "KNN", "SVM"]
+MODELS = ["HBA", "Alaton", "Benth", "ARMA","XGB", "LSTM", "FeedForwardNN", "KNN", "SVM", "RF"]
 
 LABELS = {
-    "HBA":           "Burn Analysis",
+    "HBA":           "Naïve",
     "Alaton":        "Alaton (2002)",
     "Benth":         "Benth (2007)",
     "ARMA":          "ARMA",
     "XGB":           "XGBoost",
-    "WaveletFNN":    "Wavelet FNN",
     "LSTM":          "LSTM",
     "FeedForwardNN": "Feed Forward NN",
     "KNN":           "KNN",
-    "SVM":           "SVM (SVR)",
+    "SVM":           "SVR",
+    "RF":            "Random Forest",
 }
 
 T_REF     = 10.0    # degC
@@ -73,6 +73,7 @@ HORIZONS = {
     "H1": (1,   90),    # Jan 1  - Mar 31  (immediate purchase)
     "H2": (91,  181),   # Apr 1  - Jun 30  (3-month forward purchase)
 }
+HORIZON_LABELS = {"H1": "Q1", "H2": "Q2"}
 
 INDEX_TYPES    = ["CDD", "HDD", "CAT"]
 CONTRACT_TYPES = ["call", "put"]           # both priced for every index type
@@ -81,8 +82,10 @@ STRIKE_HISTORY_START = 1970               # expanding: 1970 to oos_year-1
 
 PATHS_DIR  = ROOT / "04_Analysis" / "02_Bootstrap Paths" / "bootstrap_paths"
 TEMP_CSV   = ROOT / "02_Data" / "01_Temprature" / "region_avg.csv"
+FORECAST_CSV = ROOT / "04_Analysis" / "01_Forecast Accuracy" / "bk_forecasts.csv"
 OUTPUT_CSV = SCRIPT_DIR / "pricing_results.csv"
 PNG_DIR    = ROOT / "99_Thesis Graphs" / "03_Results" / "03_Pricing Accuracy"
+SENSITIVITY_BASELINE = "HBA"
 
 
 # =============================================================================
@@ -497,7 +500,8 @@ def render_dm_pngs(df, models):
                              pad=6)
         h_lo, h_hi = HORIZONS[h_name]
         fig.suptitle(
-            f"Diebold-Mariano Pairwise Pricing Accuracy — Horizon {h_name}  "
+            f"Diebold-Mariano Pairwise Pricing Accuracy — Horizon "
+            f"{HORIZON_LABELS.get(h_name, h_name)}  "
             f"(DOY {h_lo}–{h_hi})\n"
             "Loss: squared pricing error.  HLN (1997) correction.  "
             "Matched on (region × year).  BH FDR within each panel.",
@@ -532,6 +536,651 @@ def export_dm_csvs(df, models):
                 adj_p.columns = [LABELS[m] for m in models]
                 adj_p.to_csv(PNG_DIR / f"csv_dm_adj_p_{idx}_{ct}_{h_name}.csv")
     print("  DM p-value CSVs written.")
+
+
+def build_pricing_pairwise_dm_long(df: pd.DataFrame, models: list
+                                   ) -> pd.DataFrame:
+    """
+    Full pairwise pricing DM tests in long form.
+
+    Positive DM means row_model has higher squared pricing loss than
+    col_model; negative DM means row_model has lower loss. BH correction is
+    applied within each (index, contract, horizon) panel across all pairs.
+    """
+    rows = []
+    for h_name in HORIZONS:
+        for idx in INDEX_TYPES:
+            for ct in CONTRACT_TYPES:
+                pivot = _dm_pair_pivot(df, idx, ct, h_name)
+                panel_rows = []
+                p_values = []
+                for row_model in models:
+                    for col_model in models:
+                        if row_model == col_model:
+                            continue
+                        if row_model not in pivot.columns or col_model not in pivot.columns:
+                            continue
+                        matched = pivot[[row_model, col_model]].dropna()
+                        if len(matched) < 10:
+                            dm, p = np.nan, np.nan
+                        else:
+                            dm, p = _dm_stat(matched[row_model].values,
+                                             matched[col_model].values, h=1)
+                        panel_rows.append({
+                            "index": idx,
+                            "contract": ct,
+                            "horizon": h_name,
+                            "row_model": row_model,
+                            "col_model": col_model,
+                            "n_matched": int(len(matched)),
+                            "dm_stat": dm,
+                            "p_raw": p,
+                        })
+                        p_values.append(p)
+
+                adj = _bh_correct(np.array(p_values, dtype=float))
+                for row, p_adj in zip(panel_rows, adj):
+                    row["p_adj"] = p_adj
+                    row["significant_5pct"] = bool(
+                        np.isfinite(p_adj) and p_adj < 0.05
+                    )
+                    rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def render_pairwise_dm_matrix_pngs(dm_long: pd.DataFrame, models: list) -> None:
+    """One pairwise DM matrix per index x contract x horizon."""
+    if dm_long.empty:
+        print("  Pairwise pricing DM table empty — skipping PNGs.")
+        return
+
+    for idx in INDEX_TYPES:
+        for ct in CONTRACT_TYPES:
+            for h_name in HORIZONS:
+                panel = dm_long[
+                    (dm_long["index"] == idx) &
+                    (dm_long["contract"] == ct) &
+                    (dm_long["horizon"] == h_name)
+                ]
+                if panel.empty:
+                    continue
+
+                lookup = panel.set_index(["row_model", "col_model"])
+                cell_text = []
+                for row_model in models:
+                    row = []
+                    for col_model in models:
+                        if row_model == col_model:
+                            row.append("—")
+                            continue
+                        key = (row_model, col_model)
+                        if key not in lookup.index:
+                            row.append("n/a")
+                            continue
+                        r = lookup.loc[key]
+                        dm = r["dm_stat"]
+                        p_adj = r["p_adj"]
+                        if pd.isna(dm) or not np.isfinite(float(dm)):
+                            row.append("n/a")
+                        else:
+                            row.append(f"{float(dm):+.2f}{_stars(p_adj)}")
+                    cell_text.append(row)
+
+                fig_w = max(8.5, 0.85 * len(models))
+                fig_h = max(4.8, 0.40 * len(models))
+                fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+                _draw_econ_table(
+                    ax, cell_text,
+                    col_labels=[LABELS.get(m, m) for m in models],
+                    row_labels=[LABELS.get(m, m) for m in models],
+                    fontsize=max(5.5, 8.0 - max(0, len(models) - 7) * 0.4),
+                    col_width_scale=0.90,
+                    row_height_scale=1.18,
+                    header_top_edge=True,
+                )
+                ax.text(
+                    0.0, -0.07,
+                    "DM on squared pricing error. Positive = row model has "
+                    "higher loss than column model. Stars use BH-adjusted "
+                    "p-values: * < .05, ** < .01, *** < .001.",
+                    transform=ax.transAxes,
+                    ha="left", va="top", fontsize=7,
+                    fontfamily="Times New Roman",
+                )
+                _save_fig(fig, f"P02_pairwise_dm_{idx}_{ct}_{h_name}")
+
+
+def build_pairwise_dm_summary(dm_long: pd.DataFrame, models: list
+                              ) -> pd.DataFrame:
+    """
+    Compact main-text summary of pairwise pricing DM results.
+
+    A win is a significant pairwise comparison where the row model has lower
+    pricing loss than the column model (DM < 0). A loss is significant DM > 0.
+    Counts are across all index x contract x horizon panels and peers.
+    """
+    rows = []
+    total_panels = (
+        dm_long[["index", "contract", "horizon"]]
+        .drop_duplicates()
+        .shape[0]
+    )
+    max_comparisons = total_panels * max(0, len(models) - 1)
+
+    for model in models:
+        sub = dm_long[dm_long["row_model"] == model].copy()
+        sig = sub[sub["significant_5pct"]].copy()
+        wins = sig[sig["dm_stat"] < 0]
+        losses = sig[sig["dm_stat"] > 0]
+
+        row = {
+            "model": model,
+            "label": LABELS.get(model, model),
+            "significant_wins": int(len(wins)),
+            "significant_losses": int(len(losses)),
+            "net_wins": int(len(wins) - len(losses)),
+            "win_share_pct": (
+                100.0 * len(wins) / max_comparisons
+                if max_comparisons > 0 else np.nan
+            ),
+            "loss_share_pct": (
+                100.0 * len(losses) / max_comparisons
+                if max_comparisons > 0 else np.nan
+            ),
+        }
+        for idx in INDEX_TYPES:
+            row[f"{idx}_wins"] = int((wins["index"] == idx).sum())
+            row[f"{idx}_losses"] = int((losses["index"] == idx).sum())
+        for h_name in HORIZONS:
+            row[f"{h_name}_wins"] = int((wins["horizon"] == h_name).sum())
+            row[f"{h_name}_losses"] = int((losses["horizon"] == h_name).sum())
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+    return out.sort_values(
+        ["net_wins", "significant_wins", "significant_losses"],
+        ascending=[False, False, True],
+    )
+
+
+def render_pairwise_dm_summary_png(summary: pd.DataFrame) -> None:
+    """Compact pricing DM win/loss summary for the main thesis text."""
+    if summary.empty:
+        print("  Pairwise DM summary empty — skipping PNG.")
+        return
+
+    cols = [
+        ("Wins", "significant_wins", 0),
+        ("Losses", "significant_losses", 0),
+        ("Net", "net_wins", 0),
+        ("Win %", "win_share_pct", 1),
+        ("HDD", "HDD_wins", 0),
+        ("CDD", "CDD_wins", 0),
+        ("CAT", "CAT_wins", 0),
+        (HORIZON_LABELS.get("H1", "H1"), "H1_wins", 0),
+        (HORIZON_LABELS.get("H2", "H2"), "H2_wins", 0),
+    ]
+
+    cell_text = []
+    row_labels = []
+    for _, r in summary.iterrows():
+        row_labels.append(r["label"])
+        row = []
+        for _, col, dec in cols:
+            row.append(_fmt_num(r[col], dec))
+        cell_text.append(row)
+
+    fig, ax = plt.subplots(figsize=(9.8, max(3.2, 0.42 * len(summary))))
+    _draw_econ_table(
+        ax, cell_text,
+        col_labels=[c[0] for c in cols],
+        row_labels=row_labels,
+        fontsize=8,
+        col_width_scale=0.95,
+        row_height_scale=1.25,
+        header_top_edge=True,
+    )
+    ax.text(
+        0.0, -0.08,
+        "Wins/losses are significant pairwise DM tests on squared pricing "
+        "error at BH-adjusted p < .05. A win means lower pricing loss than "
+        "the comparison model. Counts cover all index, contract, and horizon "
+        "panels.",
+        transform=ax.transAxes,
+        ha="left", va="top", fontsize=7,
+        fontfamily="Times New Roman",
+    )
+    _save_fig(fig, "P02_pairwise_dm_summary")
+
+
+def _build_forecast_horizon_rmse(forecast_csv: Path, models: list) -> pd.DataFrame:
+    """
+    Forecast RMSE on the same index/horizon objects used for pricing.
+    This makes the sensitivity comparison like with like: H1/H2 index
+    errors against H1/H2 option-pricing errors.
+    """
+    fc = pd.read_csv(forecast_csv, parse_dates=["date"])
+    fc = fc[fc["model"].isin(models)].copy()
+    fc = fc[fc["year"].isin(OOS_YEARS)].copy()
+    fc = fc.dropna(subset=["actual", "forecast"])
+    fc["doy"] = fc["date"].map(lambda d: _doy_noleap(pd.Timestamp(d)))
+
+    rows = []
+    for h_name, h_window in HORIZONS.items():
+        start_doy, end_doy = h_window
+        h = fc[fc["doy"].between(start_doy, end_doy)].copy()
+        if h.empty:
+            continue
+        for (model, region, year), grp in h.groupby(["model", "region", "year"]):
+            actual = grp["actual"].values.astype(float)
+            forecast = grp["forecast"].values.astype(float)
+            for idx in INDEX_TYPES:
+                actual_idx = float(daily_index(actual, idx).sum())
+                forecast_idx = float(daily_index(forecast, idx).sum())
+                rows.append({
+                    "model": model,
+                    "region": int(region),
+                    "year": int(year),
+                    "index": idx,
+                    "horizon": h_name,
+                    "forecast_error": forecast_idx - actual_idx,
+                })
+
+    idx_err = pd.DataFrame(rows)
+    if idx_err.empty:
+        return pd.DataFrame(columns=["model", "index", "horizon",
+                                     "forecast_rmse"])
+
+    return (
+        idx_err.groupby(["model", "index", "horizon"])["forecast_error"]
+        .apply(lambda s: float(np.sqrt(np.mean(np.square(s.astype(float))))))
+        .reset_index(name="forecast_rmse")
+    )
+
+
+def build_pricing_sensitivity_table(df: pd.DataFrame, models: list,
+                                    baseline: str = SENSITIVITY_BASELINE
+                                    ) -> pd.DataFrame:
+    """
+    Compare percentage RMSE improvement in index forecasting with percentage
+    RMSE improvement in derivative pricing, both relative to the same baseline.
+
+    improvement_delta = forecast_improvement - pricing_improvement
+
+    A positive delta means forecast RMSE improves more than price RMSE.
+    A negative delta means price RMSE improves more than forecast RMSE.
+    """
+    if baseline not in models:
+        raise ValueError(f"Sensitivity baseline {baseline!r} is not present.")
+
+    f_rmse = _build_forecast_horizon_rmse(FORECAST_CSV, models)
+    p_rmse = (
+        df.dropna(subset=["pricing_error"])
+        .groupby(["model", "index", "contract", "horizon"])["pricing_error"]
+        .apply(lambda s: float(np.sqrt(np.mean(np.square(s.astype(float))))))
+        .reset_index(name="pricing_rmse")
+    )
+
+    rows = []
+    for h_name in HORIZONS:
+        for idx in INDEX_TYPES:
+            base_f = f_rmse[
+                (f_rmse["model"] == baseline) &
+                (f_rmse["index"] == idx) &
+                (f_rmse["horizon"] == h_name)
+            ]
+            if base_f.empty:
+                continue
+            base_f_val = float(base_f["forecast_rmse"].iloc[0])
+            for ct in CONTRACT_TYPES:
+                base_p = p_rmse[
+                    (p_rmse["model"] == baseline) &
+                    (p_rmse["index"] == idx) &
+                    (p_rmse["contract"] == ct) &
+                    (p_rmse["horizon"] == h_name)
+                ]
+                if base_p.empty:
+                    continue
+                base_p_val = float(base_p["pricing_rmse"].iloc[0])
+                for model in models:
+                    if model == baseline:
+                        continue
+                    f_row = f_rmse[
+                        (f_rmse["model"] == model) &
+                        (f_rmse["index"] == idx) &
+                        (f_rmse["horizon"] == h_name)
+                    ]
+                    p_row = p_rmse[
+                        (p_rmse["model"] == model) &
+                        (p_rmse["index"] == idx) &
+                        (p_rmse["contract"] == ct) &
+                        (p_rmse["horizon"] == h_name)
+                    ]
+                    if f_row.empty or p_row.empty:
+                        continue
+                    f_val = float(f_row["forecast_rmse"].iloc[0])
+                    p_val = float(p_row["pricing_rmse"].iloc[0])
+                    f_imp = ((base_f_val - f_val) / base_f_val
+                             if base_f_val > 0 else np.nan)
+                    p_imp = ((base_p_val - p_val) / base_p_val
+                             if base_p_val > 0 else np.nan)
+                    delta = (f_imp - p_imp
+                             if np.isfinite(f_imp) and np.isfinite(p_imp)
+                             else np.nan)
+                    rows.append({
+                        "baseline": baseline,
+                        "index": idx,
+                        "contract": ct,
+                        "horizon": h_name,
+                        "model": model,
+                        "forecast_rmse_baseline": base_f_val,
+                        "forecast_rmse_model": f_val,
+                        "pricing_rmse_baseline": base_p_val,
+                        "pricing_rmse_model": p_val,
+                        "forecast_improvement": f_imp,
+                        "pricing_improvement": p_imp,
+                        "improvement_delta": delta,
+                    })
+
+    return pd.DataFrame(rows)
+
+
+def _draw_econ_table(ax, cell_text, col_labels, row_labels,
+                     fontsize=8,
+                     col_width_scale=1.0, row_height_scale=1.35,
+                     header_top_edge=False):
+    """Plain B&W table matching the pricing-bias table layout."""
+    ax.axis("off")
+    n_rows = len(cell_text)
+    tbl = ax.table(
+        cellText=cell_text,
+        colLabels=col_labels,
+        rowLabels=row_labels,
+        loc="center",
+        cellLoc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(fontsize)
+    tbl.scale(col_width_scale, row_height_scale)
+
+    header_edges = "TB" if header_top_edge else ""
+    for (row, col), cell in tbl.get_celld().items():
+        cell.set_facecolor("white")
+        cell.set_edgecolor("black")
+        cell.set_linewidth(0.8)
+        cell.visible_edges = ""
+        if row == 0:
+            cell.visible_edges = header_edges
+            cell.set_text_props(fontweight="normal",
+                                ha="left" if col == -1 else "center",
+                                fontfamily="Times New Roman")
+        else:
+            if row == n_rows:
+                cell.visible_edges = "B"
+            ha = "left" if col == -1 else "right"
+            cell.set_text_props(ha=ha, fontweight="normal",
+                                fontfamily="Times New Roman")
+    return tbl
+
+
+def _add_section_banners(ax, tbl, fig, sections, fontsize=9,
+                         cmidrule_offset=0.012, banner_offset=0.022,
+                         rule_inset=0.006):
+    """Draw grouped column labels and partial rules above a matplotlib table."""
+    fig.canvas.draw()
+    cells = tbl.get_celld()
+    if (0, 0) not in cells:
+        return
+    y_top = cells[(0, 0)].get_y() + cells[(0, 0)].get_height()
+    cmidrule_y = y_top + cmidrule_offset
+    banner_y = y_top + banner_offset
+    header_bottom = cells[(0, 0)].get_y()
+
+    for label, cols in sections:
+        if not cols:
+            continue
+        x_starts = [cells[(0, c)].get_x() for c in cols]
+        widths = [cells[(0, c)].get_width() for c in cols]
+        x0_full = min(x_starts)
+        x1_full = max(x_starts[i] + widths[i] for i in range(len(cols)))
+        xc = (x0_full + x1_full) / 2
+        x0 = x0_full + rule_inset
+        x1 = x1_full - rule_inset
+
+        ax.text(xc, banner_y, label, ha="center", va="bottom",
+                fontsize=fontsize, fontfamily="Times New Roman",
+                transform=ax.transAxes)
+        ax.plot([x0, x1], [cmidrule_y, cmidrule_y],
+                color="black", linewidth=0.7,
+                transform=ax.transAxes, clip_on=False)
+        ax.plot([x0, x1], [header_bottom, header_bottom],
+                color="black", linewidth=0.7,
+                transform=ax.transAxes, clip_on=False)
+
+
+def render_sensitivity_pngs(sens: pd.DataFrame, models: list,
+                            baseline: str = SENSITIVITY_BASELINE) -> None:
+    """One wide PNG per index, with Call/Put banners like the bias tables."""
+    if sens.empty:
+        print("  Sensitivity table empty — skipping PNGs.")
+        return
+
+    row_models = [m for m in models if m != baseline]
+    indices = [i for i in ["HDD", "CDD", "CAT"] if i in sens["index"].unique()]
+    contracts = [c for c in CONTRACT_TYPES if c in sens["contract"].unique()]
+    horizons = [h for h in HORIZONS if h in sens["horizon"].unique()]
+    horizon_labels = {"H1": "Q1", "H2": "Q2"}
+    metrics = [
+        ("Forecast", "forecast_improvement", 1, 100.0),
+        ("Price", "pricing_improvement", 1, 100.0),
+        ("Improvement", "improvement_delta", 1, 100.0),
+    ]
+
+    cols_per_contract = len(horizons) * len(metrics)
+    col_labels = []
+    for _ in contracts:
+        for h_name in horizons:
+            for short, _, _, _ in metrics:
+                col_labels.append(f"{horizon_labels.get(h_name, h_name)}\n{short}")
+
+    sections = [
+        (ct.capitalize(),
+         list(range(i * cols_per_contract, (i + 1) * cols_per_contract)))
+        for i, ct in enumerate(contracts)
+    ]
+
+    for idx in indices:
+        cell_text = []
+        row_labels = [LABELS.get(m, m) for m in row_models]
+        for model in row_models:
+            row_vals = []
+            for ct in contracts:
+                for h_name in horizons:
+                    sub = sens[
+                        (sens["model"] == model) &
+                        (sens["index"] == idx) &
+                        (sens["contract"] == ct) &
+                        (sens["horizon"] == h_name)
+                    ]
+                    if sub.empty:
+                        row_vals += ["—"] * len(metrics)
+                        continue
+                    r = sub.iloc[0]
+                    for _, col, dec, scale in metrics:
+                        row_vals.append(_fmt_num(scale * r[col], dec))
+            cell_text.append(row_vals)
+
+        fig_w = max(11, 0.85 * len(col_labels))
+        fig_h = max(3.2, 0.42 * len(row_models))
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        tbl = _draw_econ_table(
+            ax, cell_text, col_labels, row_labels,
+            fontsize=7.6,
+            col_width_scale=0.95,
+            row_height_scale=1.25,
+            header_top_edge=False,
+        )
+        _add_section_banners(ax, tbl, fig, sections, fontsize=10)
+
+        ax.text(
+            0.0, -0.08,
+            f"Relative to {LABELS.get(baseline, baseline)}. "
+            "Forecast = forecast RMSE improvement (%); "
+            "Price = price RMSE improvement (%); "
+            "Improvement = forecast improvement - price improvement "
+            "(percentage points).",
+            transform=ax.transAxes,
+            ha="left", va="top", fontsize=7,
+            fontfamily="Times New Roman",
+        )
+        _save_fig(fig, f"P03_pricing_sensitivity_{idx}")
+
+
+def build_pricing_dm_vs_baseline(df: pd.DataFrame, models: list,
+                                 baseline: str = SENSITIVITY_BASELINE
+                                 ) -> pd.DataFrame:
+    """
+    Benchmark-focused DM tests for pricing errors.
+
+    DM is computed on squared pricing error, matched by (region, year).
+    Negative DM means the row model has lower loss than the baseline.
+    Positive DM means the row model has higher loss than the baseline.
+    BH adjustment is applied within each (index, contract, horizon) panel.
+    """
+    if baseline not in models:
+        raise ValueError(f"DM baseline {baseline!r} is not present.")
+
+    rows = []
+    for h_name in HORIZONS:
+        for idx in INDEX_TYPES:
+            for ct in CONTRACT_TYPES:
+                pivot = _dm_pair_pivot(df, idx, ct, h_name)
+                panel_rows = []
+                p_values = []
+                if baseline not in pivot.columns:
+                    continue
+                for model in models:
+                    if model == baseline or model not in pivot.columns:
+                        continue
+                    matched = pivot[[model, baseline]].dropna()
+                    if len(matched) < 10:
+                        dm, p = np.nan, np.nan
+                    else:
+                        dm, p = _dm_stat(matched[model].values,
+                                         matched[baseline].values, h=1)
+                    panel_rows.append({
+                        "baseline": baseline,
+                        "index": idx,
+                        "contract": ct,
+                        "horizon": h_name,
+                        "model": model,
+                        "n_matched": int(len(matched)),
+                        "dm_stat": dm,
+                        "p_raw": p,
+                    })
+                    p_values.append(p)
+
+                adj = _bh_correct(np.array(p_values, dtype=float))
+                for row, p_adj in zip(panel_rows, adj):
+                    dm = row["dm_stat"]
+                    row["p_adj"] = p_adj
+                    row["significant_5pct"] = (
+                        bool(np.isfinite(p_adj) and p_adj < 0.05)
+                    )
+                    if not np.isfinite(dm):
+                        row["direction"] = "n/a"
+                    elif dm < 0:
+                        row["direction"] = "lower pricing loss"
+                    else:
+                        row["direction"] = "higher pricing loss"
+                    row["significant_improvement"] = (
+                        bool(row["significant_5pct"] and np.isfinite(dm)
+                             and dm < 0)
+                    )
+                    row["significant_deterioration"] = (
+                        bool(row["significant_5pct"] and np.isfinite(dm)
+                             and dm > 0)
+                    )
+                    rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def render_pricing_dm_vs_baseline_pngs(dm_df: pd.DataFrame, models: list,
+                                       baseline: str = SENSITIVITY_BASELINE
+                                       ) -> None:
+    """One wide DM-vs-baseline table per index, matching pricing table layout."""
+    if dm_df.empty:
+        print("  Pricing DM-vs-baseline table empty — skipping PNGs.")
+        return
+
+    row_models = [m for m in models if m != baseline]
+    indices = [i for i in ["HDD", "CDD", "CAT"] if i in dm_df["index"].unique()]
+    contracts = [c for c in CONTRACT_TYPES if c in dm_df["contract"].unique()]
+    horizons = [h for h in HORIZONS if h in dm_df["horizon"].unique()]
+
+    cols_per_contract = len(horizons) * 2
+    col_labels = []
+    for _ in contracts:
+        for h_name in horizons:
+            h_label = HORIZON_LABELS.get(h_name, h_name)
+            col_labels.extend([f"{h_label}\nDM", f"{h_label}\np-adj"])
+
+    sections = [
+        (ct.capitalize(),
+         list(range(i * cols_per_contract, (i + 1) * cols_per_contract)))
+        for i, ct in enumerate(contracts)
+    ]
+
+    for idx in indices:
+        cell_text = []
+        row_labels = [LABELS.get(m, m) for m in row_models]
+        for model in row_models:
+            row_vals = []
+            for ct in contracts:
+                for h_name in horizons:
+                    sub = dm_df[
+                        (dm_df["model"] == model) &
+                        (dm_df["index"] == idx) &
+                        (dm_df["contract"] == ct) &
+                        (dm_df["horizon"] == h_name)
+                    ]
+                    if sub.empty:
+                        row_vals += ["—", "—"]
+                        continue
+                    r = sub.iloc[0]
+                    dm = r["dm_stat"]
+                    p_adj = r["p_adj"]
+                    dm_txt = (
+                        "—" if pd.isna(dm) or not np.isfinite(float(dm))
+                        else f"{float(dm):+.2f}{_stars(p_adj)}"
+                    )
+                    row_vals += [dm_txt, _fmt_num(p_adj, 3)]
+            cell_text.append(row_vals)
+
+        fig_w = max(10, 0.84 * len(col_labels))
+        fig_h = max(3.2, 0.42 * len(row_models))
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        tbl = _draw_econ_table(
+            ax, cell_text, col_labels, row_labels,
+            fontsize=7.6,
+            col_width_scale=0.95,
+            row_height_scale=1.25,
+            header_top_edge=False,
+        )
+        _add_section_banners(ax, tbl, fig, sections, fontsize=10)
+        ax.text(
+            0.0, -0.08,
+            f"DM on squared pricing error relative to "
+            f"{LABELS.get(baseline, baseline)}. "
+            "Negative DM = lower pricing loss than benchmark. "
+            "Stars use BH-adjusted p-values: * < .05, ** < .01, *** < .001.",
+            transform=ax.transAxes,
+            ha="left", va="top", fontsize=7,
+            fontfamily="Times New Roman",
+        )
+        _save_fig(fig, f"P04_pricing_dm_vs_hba_{idx}")
 
 
 # =============================================================================
@@ -676,6 +1325,48 @@ def main():
         render_metrics_pngs(df, models_present)
         render_dm_pngs(df, models_present)
         export_dm_csvs(df, models_present)
+        dm_pairwise = build_pricing_pairwise_dm_long(df, models_present)
+        dm_pairwise_csv = PNG_DIR / "csv_pricing_pairwise_dm_long.csv"
+        dm_pairwise_out = dm_pairwise.copy()
+        dm_pairwise_out["row_model"] = dm_pairwise_out["row_model"].map(
+            lambda m: LABELS.get(m, m)
+        )
+        dm_pairwise_out["col_model"] = dm_pairwise_out["col_model"].map(
+            lambda m: LABELS.get(m, m)
+        )
+        dm_pairwise_out.to_csv(dm_pairwise_csv, index=False)
+        print(f"  -> {dm_pairwise_csv.name}")
+        render_pairwise_dm_matrix_pngs(dm_pairwise, models_present)
+        dm_summary = build_pairwise_dm_summary(dm_pairwise, models_present)
+        dm_summary_csv = PNG_DIR / "csv_pricing_pairwise_dm_summary.csv"
+        dm_summary_out = dm_summary.copy()
+        dm_summary_out["model"] = dm_summary_out["label"]
+        dm_summary_out = dm_summary_out.rename(columns={
+            "H1_wins": "Q1_wins",
+            "H1_losses": "Q1_losses",
+            "H2_wins": "Q2_wins",
+            "H2_losses": "Q2_losses",
+        })
+        dm_summary_out.to_csv(dm_summary_csv, index=False)
+        print(f"  -> {dm_summary_csv.name}")
+        render_pairwise_dm_summary_png(dm_summary)
+        sens = build_pricing_sensitivity_table(df, models_present)
+        sens_csv = PNG_DIR / "csv_pricing_sensitivity_hba.csv"
+        sens.to_csv(sens_csv, index=False)
+        print(f"  -> {sens_csv.name}")
+        render_sensitivity_pngs(sens, models_present)
+        dm_hba = build_pricing_dm_vs_baseline(df, models_present)
+        dm_hba_csv = PNG_DIR / "csv_pricing_dm_vs_hba.csv"
+        dm_hba_out = dm_hba.copy()
+        dm_hba_out["baseline"] = dm_hba_out["baseline"].map(
+            lambda m: LABELS.get(m, m)
+        )
+        dm_hba_out["model"] = dm_hba_out["model"].map(
+            lambda m: LABELS.get(m, m)
+        )
+        dm_hba_out.to_csv(dm_hba_csv, index=False)
+        print(f"  -> {dm_hba_csv.name}")
+        render_pricing_dm_vs_baseline_pngs(dm_hba, models_present)
         print(f"\n[SAVE] PNGs and CSVs in {PNG_DIR}")
 
     return df

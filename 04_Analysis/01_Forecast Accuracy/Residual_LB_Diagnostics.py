@@ -1,8 +1,8 @@
 """
 Daily residual diagnostics — Murat-style accuracy table.
-Reads bk_forecasts.csv and produces a per-model table reporting:
+Reads bk_forecasts.csv and produces residual autocorrelation diagnostics:
 
-  RMSE  MAE  MASE  LB(365) stat  p-value (lag = 365)
+  LB(1..7), LB(1..30), LB(1..90), and LB(1..365) p-values
 
 on the daily residuals  ε(t) = actual(t) − forecast(t).
 
@@ -19,7 +19,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from statsmodels.stats.diagnostic import acorr_ljungbox
-from scipy.stats import chi2 as scipy_chi2
 
 warnings.filterwarnings("ignore")
 
@@ -28,19 +27,18 @@ FORECAST_CSV = Path(__file__).resolve().parent / "bk_forecasts.csv"
 OUTPUT_DIR   = ROOT / "99_Thesis Graphs" / "03_Results" / "01_Forecast Accuracy"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-LB_LAG = 365
-SEASONAL_M = 365
+LB_LAGS = [7, 30, 90, 365]
 DPI = 260
 
 MODEL_ORDER = [
     "HBA", "Alaton", "Benth", "ARMA",
-    "XGB", "LSTM", "FeedForwardNN", "KNN", "SVM",
+    "XGB", "LSTM", "FeedForwardNN", "KNN", "SVM", "RF",
 ]
 
 LABELS = {
-    "HBA": "HBA", "Alaton": "Alaton", "Benth": "Benth", "ARMA": "ARMA",
+    "HBA": "Naïve", "Alaton": "Alaton", "Benth": "Benth", "ARMA": "ARMA",
     "XGB": "XGBoost", "LSTM": "LSTM", "FeedForwardNN": "Feed Forward NN",
-    "KNN": "KNN", "SVM": "SVM",
+    "KNN": "KNN", "SVM": "SVR", "RF": "Random Forest",
 }
 
 REGION_NAMES = {
@@ -67,62 +65,8 @@ def stars(p: float) -> str:
     return ""
 
 
-def mase_from_residuals(actual: np.ndarray, residuals: np.ndarray,
-                         m: int = SEASONAL_M) -> float:
-    """Hyndman-Koehler MASE with seasonal-naive denominator."""
-    if len(actual) <= m:
-        return np.nan
-    naive = np.abs(actual[m:] - actual[:-m])
-    denom = float(np.mean(naive)) if naive.size else np.nan
-    if not np.isfinite(denom) or denom <= 0:
-        return np.nan
-    return float(np.mean(np.abs(residuals)) / denom)
-
-
-def single_lag_test(resid: np.ndarray, lag: int) -> tuple:
-    """
-    Single-lag autocorrelation test (non-cumulative).
-    Under H₀ of no autocorrelation at this lag, n·r_k² ~ χ²(1).
-    Returns (statistic, two-sided p-value).
-    """
-    n = len(resid)
-    if n <= lag + 1:
-        return np.nan, np.nan
-    e = resid - resid.mean()
-    v = float(np.mean(e * e))
-    if v <= 0:
-        return np.nan, np.nan
-    rk = float(np.mean(e[lag:] * e[:-lag]) / v)
-    stat = n * rk * rk
-    p    = float(1.0 - scipy_chi2.cdf(stat, df=1))
-    return stat, p
-
-
-def monthly_lb_test(dates: pd.Series, resid: np.ndarray,
-                     lag: int = 12) -> tuple:
-    """
-    Aggregate daily residuals to monthly means, then Ljung-Box at lag months.
-    Daily weather persistence (~5-15 days) collapses, so what remains
-    reflects genuine seasonal / annual mis-fit.
-    Returns (statistic, p-value, n_months).
-    """
-    s = (pd.DataFrame({"date": dates, "e": resid})
-         .dropna()
-         .assign(ym=lambda d: d["date"].dt.to_period("M"))
-         .groupby("ym")["e"].mean()
-         .sort_index())
-    if len(s) <= lag + 1:
-        return np.nan, np.nan, int(len(s))
-    out = acorr_ljungbox(s.values, lags=[lag], return_df=True)
-    return float(out["lb_stat"].iloc[0]), float(out["lb_pvalue"].iloc[0]), int(len(s))
-
-
 def per_region_diagnostics(df: pd.DataFrame) -> pd.DataFrame:
-    """RMSE/MAE/MASE + three Ljung-Box variants per (model, region):
-       LB(1..365)   cumulative on daily residuals — sensitive to weather persistence
-       LB@365       single-lag at 365 days only — direct annual-seasonality test
-       LB(12)/mo    cumulative on monthly-mean residuals — long-range structure
-    """
+    """Cumulative Ljung-Box tests per (model, region)."""
     rows = []
     for model in MODEL_ORDER:
         for region in sorted(df["region"].unique()):
@@ -134,82 +78,50 @@ def per_region_diagnostics(df: pd.DataFrame) -> pd.DataFrame:
             actual = sub["actual"].values.astype(float)
             resid  = (sub["actual"] - sub["forecast"]).values.astype(float)
             mask   = np.isfinite(resid) & np.isfinite(actual)
-            if mask.sum() < LB_LAG + 5:
+            if mask.sum() < max(LB_LAGS) + 5:
                 continue
-            dates  = sub["date"].values
             actual = actual[mask]
             resid  = resid[mask]
-            dates  = pd.Series(dates[mask])
 
-            rmse = float(np.sqrt(np.mean(resid ** 2)))
-            mae  = float(np.mean(np.abs(resid)))
-            mase = mase_from_residuals(actual, resid, m=SEASONAL_M)
+            lb = acorr_ljungbox(resid, lags=LB_LAGS, return_df=True)
+            lb_by_lag = {
+                lag: (
+                    float(lb.loc[lag, "lb_stat"]),
+                    float(lb.loc[lag, "lb_pvalue"]),
+                )
+                for lag in LB_LAGS
+            }
 
-            lb = acorr_ljungbox(resid, lags=[LB_LAG], return_df=True)
-            lb_stat = float(lb["lb_stat"].iloc[0])
-            lb_p    = float(lb["lb_pvalue"].iloc[0])
-
-            sl_stat, sl_p           = single_lag_test(resid, LB_LAG)
-            mo_stat, mo_p, n_mo     = monthly_lb_test(dates, resid, lag=12)
-
-            rows.append({
+            row = {
                 "model":      model,
                 "region":     region,
                 "n":          int(mask.sum()),
-                "RMSE":       rmse,
-                "MAE":        mae,
-                "MASE":       mase,
-                "LB_stat":    lb_stat,
-                "LB_p":       lb_p,
-                "SL365_stat": sl_stat,
-                "SL365_p":    sl_p,
-                "MOLB_stat":  mo_stat,
-                "MOLB_p":     mo_p,
-                "n_months":   n_mo,
-            })
+            }
+            for lag, (stat, p_value) in lb_by_lag.items():
+                row[f"LB{lag}_stat"] = stat
+                row[f"LB{lag}_p"] = p_value
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
 def per_model_summary(detail: pd.DataFrame) -> pd.DataFrame:
     """Aggregate detail rows to one row per model.
 
-    RMSE/MAE: sample-size-weighted root-mean-square / mean across regions.
-    MASE:     sample-size-weighted mean across regions.
-    LB stats: median across regions.
-    LB p:     median across regions (use min for the strictest reading).
+    Test statistics and p-values are medians across regions.
     """
     out = []
     for model in MODEL_ORDER:
         sub = detail[detail["model"] == model]
         if sub.empty:
             continue
-        w = sub["n"].values.astype(float)
-        rmse = float(np.sqrt(np.sum(w * sub["RMSE"].values ** 2) / w.sum()))
-        mae  = float(np.sum(w * sub["MAE"].values) / w.sum())
-        mase_vals = sub["MASE"].values.astype(float)
-        valid     = np.isfinite(mase_vals)
-        mase = (float(np.sum(w[valid] * mase_vals[valid]) / w[valid].sum())
-                if valid.any() else np.nan)
-        lb_stat_med = float(np.median(sub["LB_stat"].values))
-        lb_p_med    = float(np.median(sub["LB_p"].values))
-        lb_p_min    = float(np.min(sub["LB_p"].values))
-        sl_stat_med = float(np.median(sub["SL365_stat"].values))
-        sl_p_med    = float(np.median(sub["SL365_p"].values))
-        mo_stat_med = float(np.median(sub["MOLB_stat"].values))
-        mo_p_med    = float(np.median(sub["MOLB_p"].values))
-        out.append({
+        row = {
             "model":      model,
-            "RMSE":       rmse,
-            "MAE":        mae,
-            "MASE":       mase,
-            "LB_stat":    lb_stat_med,
-            "LB_p_med":   lb_p_med,
-            "LB_p_min":   lb_p_min,
-            "SL365_stat": sl_stat_med,
-            "SL365_p":    sl_p_med,
-            "MOLB_stat":  mo_stat_med,
-            "MOLB_p":     mo_p_med,
-        })
+            "n_regions":  int(len(sub)),
+        }
+        for lag in LB_LAGS:
+            row[f"LB{lag}_stat"] = float(np.median(sub[f"LB{lag}_stat"].values))
+            row[f"LB{lag}_p"] = float(np.median(sub[f"LB{lag}_p"].values))
+        out.append(row)
     return pd.DataFrame(out)
 
 
@@ -218,26 +130,27 @@ def _p_str(p):
     return ("< 0.0001" if p < 1e-4 else f"{p:.4f}") + stars(p)
 
 
+def _decision(*p_values: float) -> str:
+    finite = [p for p in p_values if np.isfinite(p)]
+    if not finite:
+        return "n/a"
+    return "Reject" if min(finite) < 0.05 else "No reject"
+
+
 def draw_table(summary: pd.DataFrame, out_path: Path) -> None:
-    headers = ["Model", "RMSE", "MAE", "MASE",
-               f"LB({LB_LAG})", "p", f"r²·n @365", "p", "LB(12) mo.", "p"]
+    headers = ["Model", "LB(7) p", "LB(30) p", "LB(90) p", "LB(365) p"]
     cell_text = []
     for _, r in summary.iterrows():
         cell_text.append([
             LABELS.get(r["model"], r["model"]),
-            f"{r['RMSE']:.3f}",
-            f"{r['MAE']:.3f}",
-            f"{r['MASE']:.3f}" if np.isfinite(r["MASE"]) else "—",
-            f"{r['LB_stat']:,.0f}",
-            _p_str(r["LB_p_med"]),
-            f"{r['SL365_stat']:.2f}" if np.isfinite(r["SL365_stat"]) else "—",
-            _p_str(r["SL365_p"]),
-            f"{r['MOLB_stat']:,.1f}" if np.isfinite(r["MOLB_stat"]) else "—",
-            _p_str(r["MOLB_p"]),
+            _p_str(r["LB7_p"]),
+            _p_str(r["LB30_p"]),
+            _p_str(r["LB90_p"]),
+            _p_str(r["LB365_p"]),
         ])
 
     n_rows = len(cell_text)
-    fig, ax = plt.subplots(figsize=(13.5, 0.55 + 0.34 * n_rows))
+    fig, ax = plt.subplots(figsize=(7.4, 0.55 + 0.34 * n_rows))
     ax.axis("off")
     tbl = ax.table(cellText=cell_text, colLabels=headers,
                    loc="center", cellLoc="center")
@@ -258,14 +171,6 @@ def draw_table(summary: pd.DataFrame, out_path: Path) -> None:
                 cell.visible_edges = "B"
             ha = "left" if col == 0 else "right"
             cell.set_text_props(ha=ha, fontfamily="Times New Roman")
-
-    fig.text(0.5, 0.01,
-             f"Daily residual diagnostics ε(t) = actual(t) − forecast(t).  "
-             f"LB({LB_LAG}) cumulative on daily residuals.  "
-             "r²·n @365 single-lag χ²(1) test at lag 365 (annual seasonality only).  "
-             "LB(12) on monthly-mean residuals.  Stats are median across 8 regions.  "
-             "* p<0.05  ** p<0.01  *** p<0.001",
-             ha="center", fontsize=7.5)
 
     fig.savefig(out_path, dpi=DPI, bbox_inches="tight", facecolor="white")
     plt.close(fig)
@@ -290,23 +195,20 @@ def draw_per_region_table(detail: pd.DataFrame, out_path: Path) -> None:
         for model, r in sub.iterrows():
             rows.append({
                 "model":   LABELS.get(model, model),
-                "rmse":    f"{r['RMSE']:.3f}",
-                "mae":     f"{r['MAE']:.3f}",
-                "mase":    f"{r['MASE']:.3f}" if np.isfinite(r["MASE"]) else "—",
-                "lb_stat": f"{r['LB_stat']:,.0f}",
-                "lb_p":    _p_str(r["LB_p"]),
-                "sl_stat": f"{r['SL365_stat']:.2f}" if np.isfinite(r["SL365_stat"]) else "—",
-                "sl_p":    _p_str(r["SL365_p"]),
-                "mo_stat": f"{r['MOLB_stat']:,.1f}" if np.isfinite(r["MOLB_stat"]) else "—",
-                "mo_p":    _p_str(r["MOLB_p"]),
+                "lb7_p":   _p_str(r["LB7_p"]),
+                "lb30_p":  _p_str(r["LB30_p"]),
+                "lb90_p":  _p_str(r["LB90_p"]),
+                "lb365_p": _p_str(r["LB365_p"]),
+                "decision": _decision(r["LB7_p"], r["LB30_p"], r["LB90_p"],
+                                      r["LB365_p"]),
             })
         blocks.append((REGION_NAMES.get(region, str(region)), rows))
 
-    headers = ["Site", "Model", "RMSE", "MAE", "MASE",
-               f"LB({LB_LAG})", "p", "r²·n @365", "p", "LB(12) mo.", "p"]
-    col_keys = ["site", "model", "rmse", "mae", "mase",
-                "lb_stat", "lb_p", "sl_stat", "sl_p", "mo_stat", "mo_p"]
-    col_x    = [0.00, 0.16, 0.30, 0.38, 0.46, 0.54, 0.62, 0.71, 0.79, 0.87, 0.95]
+    headers = ["Site", "Model", "LB(7) p", "LB(30) p",
+               "LB(90) p", "LB(365) p", "Decision"]
+    col_keys = ["site", "model", "lb7_p", "lb30_p",
+                "lb90_p", "lb365_p", "decision"]
+    col_x    = [0.00, 0.20, 0.39, 0.52, 0.65, 0.78, 0.93]
 
     n_data = sum(len(rows) for _, rows in blocks)
     n_blocks = len(blocks)
@@ -316,7 +218,7 @@ def draw_per_region_table(detail: pd.DataFrame, out_path: Path) -> None:
     foot_h = 0.32
     # extra small gap between region blocks
     gap_h  = 0.06
-    fig_w  = 14.5
+    fig_w  = 11.0
     fig_h  = (hdr_h + row_h * n_data + gap_h * max(0, n_blocks - 1)
               + foot_h + 0.05)
 
@@ -374,16 +276,7 @@ def draw_per_region_table(detail: pd.DataFrame, out_path: Path) -> None:
             hline_partial(col_x[1] - 0.005, 1.0, ay(cursor_y - gap_h * 0.5), 0.3)
             cursor_y -= gap_h
 
-    # Footer
     y_foot = row_h * 0.15
-    hline(ay(y_foot + foot_h * 0.92), 0.5)
-    txt(0.0, ay(y_foot + foot_h * 0.45),
-        "Daily residual diagnostics  ε(t) = actual(t) − forecast(t).  "
-        f"LB({LB_LAG}) cumulative on daily residuals (sensitive to weather "
-        "persistence).  r²·n @365 single-lag χ²(1) at lag 365 (annual seasonality).  "
-        "LB(12) on monthly-mean residuals (long-range structure).  "
-        "* p<0.05  ** p<0.01  *** p<0.001",
-        fontsize=7.5)
     hline(ay(y_foot - 0.01), 1.2)
 
     fig.tight_layout(pad=0.1)
@@ -401,7 +294,9 @@ def main():
     summary = per_model_summary(detail)
 
     detail_csv = OUTPUT_DIR / "csv_residual_lb_by_region.csv"
-    detail.to_csv(detail_csv, index=False)
+    detail_out = detail.copy()
+    detail_out["model"] = detail_out["model"].map(lambda m: LABELS.get(m, m))
+    detail_out.to_csv(detail_csv, index=False)
     print(f"  -> {detail_csv.name}")
 
     draw_table(summary, OUTPUT_DIR / "T06_residual_lb_AvgT.png")

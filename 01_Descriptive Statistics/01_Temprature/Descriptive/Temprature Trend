@@ -12,11 +12,12 @@ from pathlib import Path
 mpl.rcParams['font.family'] = 'serif'
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 DATA_PATH = ROOT / "02_Data" / "01_Temprature" / "region_avg.csv"
-THESIS_GRAPH_DIR = ROOT / "04_Thesis Graphs"
+THESIS_GRAPH_DIR = ROOT / "99_Thesis Graphs" / "01_Temprature"
 THESIS_GRAPH_DIR.mkdir(parents=True, exist_ok=True)
 OUT_PNG   = THESIS_GRAPH_DIR / "temp_annual_mean.png"
+START_DATE = "1980-01-01"
 
 REGION_NAMES = {
     11: "Île-de-France",
@@ -31,6 +32,7 @@ REGION_NAMES = {
 
 # ── Load and compute annual means ─────────────────────────────────────────────
 df = pd.read_csv(DATA_PATH, parse_dates=["date"])
+df = df[df["date"] >= START_DATE].copy()
 df = df[df["region_code"].isin(REGION_NAMES.keys())].copy()
 df["year"] = df["date"].dt.year
 df["region_name"] = df["region_code"].map(REGION_NAMES)
@@ -72,5 +74,4 @@ for i, region in enumerate(regions):
 
 plt.tight_layout(h_pad=2.5, w_pad=1.5)
 plt.savefig(OUT_PNG, dpi=220, bbox_inches="tight", facecolor="white")
-plt.show()
 print(f"Saved to: {OUT_PNG}")

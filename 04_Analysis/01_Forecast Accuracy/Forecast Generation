@@ -5,8 +5,8 @@ Sections 1-4 of the original replication script are copied verbatim.
 Metrics (5), statistical tests (6), and results output (8) are removed.
 
 Fixes applied vs. original:
-  [F1] _CompatUnpickler  — handles pandas StringDtype pickle incompatibility
-       across pandas versions (affects HBA, Alaton, and potentially others).
+  [F1] _CompatUnpickler  — handles pandas StringDtype and NumPy 2.x pickle
+       incompatibilities across package versions (affects several PKLs).
   [F2] load_arma / ARMA_DIR — points to 13_ARIMAF folder and arimaf_model_*
        filename pattern used by AR.py (ARMA + Fourier exog regressors).
   [F3] forecast_arma — ARIMAF PKL stores absolute-temperature forecasts in
@@ -44,15 +44,12 @@ PAPER_KNN_DIR    = PKL_ROOT / "08_KNN" / "KNN_rolling_exports"
 PAPER_SVM_DIR    = PKL_ROOT / "09_SVM" / "SVM_rolling_exports"
 ARMA_DIR         = PKL_ROOT / "13_ARIMAF"
 
-OUTPUT_CSV = Path(
-    r"C:\\Users\\U434016\\Downloads\\Masters_2026"
-    r"\\04_Analysis\\01_Forecast Accuracy\\bk_forecasts.csv"
-)
+OUTPUT_CSV = Path(__file__).resolve().parent / "bk_forecasts.csv"
 
 OOS_START, OOS_END = 2011, 2024
 TEST_YEARS  = list(range(OOS_START, OOS_END + 1))
 N_HARMONICS = 3
-MODEL_ORDER = ["HBA", "Alaton", "Benth", "ARMA", "XGB", "WaveletFNN", "LSTM", "FeedForwardNN", "KNN", "SVM"]
+MODEL_ORDER = ["HBA", "Alaton", "Benth", "ARMA", "XGB", "LSTM", "FeedForwardNN", "KNN", "SVM", "RF"]
 FEATURE_COLS = [
     "dayofyear", "pdtn_doy", "de_trend_seas", "dts_doyavge", "dts_doyvar",
     "yday", "IIdays_ago", "IIIdays_ago", "IVdays_ago",
@@ -72,8 +69,32 @@ FEATURE_COLS = [
 ]
 
 # ===========================================================================
-# [F1] COMPAT UNPICKLER — fixes pandas StringDtype across pandas versions
+# [F1] COMPAT UNPICKLER — fixes pandas/NumPy pickle version mismatches
 # ===========================================================================
+
+def _compat_numpy_frombuffer(buf, dtype, shape, order, *extra):
+    """
+    NumPy 2.x can pickle arrays through numpy._core.numeric._frombuffer with
+    an extra axis-order argument. NumPy 1.x only accepts four arguments.
+    """
+    if not extra:
+        import numpy.core.numeric as _np_numeric
+        return _np_numeric._frombuffer(buf, dtype, shape, order)
+
+    arr = np.frombuffer(buf, dtype=dtype)
+
+    if order == "K":
+        axis_order = extra[0]
+        if isinstance(axis_order, tuple) and len(axis_order) == len(shape):
+            try:
+                stored_shape = tuple(shape[i] for i in axis_order)
+                return arr.reshape(stored_shape, order="C").transpose(np.argsort(axis_order))
+            except ValueError:
+                pass
+        order = "C"
+
+    return arr.reshape(shape, order=order)
+
 
 class _CompatUnpickler(pickle.Unpickler):
     """
@@ -83,6 +104,9 @@ class _CompatUnpickler(pickle.Unpickler):
     loaded under a newer pandas release that changed the StringDtype internals.
     The unpickler intercepts the StringDtype constructor call and falls back
     to the default (no-arg) form when the saved kwargs are rejected.
+
+    Also handles NumPy 2.x pickles loaded under NumPy 1.x:
+        TypeError: _frombuffer() takes 4 positional arguments but 5 were given
     """
     def find_class(self, module, name):
         if module == "pandas.core.arrays.string_" and name == "StringDtype":
@@ -93,6 +117,8 @@ class _CompatUnpickler(pickle.Unpickler):
                 except (TypeError, NotImplementedError):
                     return pd.StringDtype()
             return _make_string_dtype
+        if module in {"numpy._core.numeric", "numpy.core.numeric"} and name == "_frombuffer":
+            return _compat_numpy_frombuffer
         return super().find_class(module, name)
 
 
@@ -276,7 +302,7 @@ def load_alaton(region, calib_year):
     return _compat_load(ALATON_DIR / f"alaton_model_{region}_calib_{calib_year}.pkl")
 
 def load_benth(region, calib_year):
-    return _compat_load(BENTH_DIR / f"ou_levy_model_{region}_calib_{calib_year}.pkl")
+    return _compat_load(BENTH_DIR / f"ou_brownian_model_{region}_calib_{calib_year}.pkl")
 
 def load_paper_xgb(region, calib_year):
     candidates = [
@@ -310,10 +336,6 @@ def load_paper_rf(region, calib_year):
 def load_arma(region, calib_year):
     pkl_path = ARMA_DIR / f"arimaf_model_{region}_calib_{calib_year}.pkl"
     return _compat_load(pkl_path)
-
-def load_wavelet_fnn(region, calib_year):
-    pkl_path = WAVELET_FNN_DIR / f"wavelet_fnn_region_{region}_calib_{calib_year}_predict_{calib_year + 1}.pkl"
-    with open(pkl_path, "rb") as f: return pickle.load(f)
 
 def load_lstm(region, calib_year):
     for p in [LSTM_DIR / f"lstm_region_{region}_calib_{calib_year}.pkl",
@@ -370,6 +392,18 @@ def alaton_seasonal_mean(t_idx, A, B, C, phi):
 
 def benth_seasonal_mean(doy, a0, a1, t0):
     return a0 + a1 * np.cos((2 * np.pi / 365.0) * (doy - t0))
+
+def _benth_theta_at(t_val, theta_coefs, I1, J1, omega):
+    t = float(t_val)
+    val = float(theta_coefs[0]) + float(theta_coefs[1]) * t
+    idx = 2
+    for k in range(1, I1 + 1):
+        val += float(theta_coefs[idx]) * np.sin(k * omega * t)
+        idx += 1
+    for k in range(1, J1 + 1):
+        val += float(theta_coefs[idx]) * np.cos(k * omega * t)
+        idx += 1
+    return val
 
 def forecast_hba(hba_params, test_dates):
     df_calib = hba_params.get("df_calib", hba_params.get("df"))
@@ -442,6 +476,37 @@ def forecast_arma(arma_params, test_dates):
     return out
 
 def forecast_benth(benth_params, df_train, test_dates):
+    if "theta_coefs" in benth_params:
+        theta_coefs = np.asarray(benth_params["theta_coefs"], dtype=float)
+        I1 = int(benth_params["I1"])
+        J1 = int(benth_params["J1"])
+        omega = float(benth_params.get("omega", 2.0 * np.pi / 365.0))
+        rho = float(benth_params.get("rho", np.nan))
+        if not np.isfinite(rho):
+            alpha = float(benth_params.get("alpha", np.nan))
+            rho = float(np.exp(-alpha)) if np.isfinite(alpha) else np.nan
+        if not np.isfinite(rho):
+            return np.full(len(test_dates), np.nan)
+
+        if "t_end" in benth_params and np.isfinite(benth_params.get("t_end", np.nan)):
+            t_end = float(benth_params["t_end"])
+        else:
+            df_calib = benth_params.get("df_calib")
+            if df_calib is None or "t" not in df_calib.columns:
+                return np.full(len(test_dates), np.nan)
+            t_end = float(df_calib["t"].iloc[-1])
+
+        T_prev = float(df_train.iloc[-1]["T"])
+        de_prev = T_prev - _benth_theta_at(t_end, theta_coefs, I1, J1, omega)
+        forecasts = np.empty(len(test_dates), dtype=float)
+        for i in range(len(test_dates)):
+            t_curr = t_end + i + 1
+            theta_curr = _benth_theta_at(t_curr, theta_coefs, I1, J1, omega)
+            de_curr = rho * de_prev
+            forecasts[i] = theta_curr + de_curr
+            de_prev = de_curr
+        return forecasts
+
     if all(k in benth_params for k in ["a0","a1","t0","slope","intercept"]):
         a0,a1,t0 = float(benth_params["a0"]),float(benth_params["a1"]),float(benth_params["t0"])
         slope,intercept = float(benth_params["slope"]),float(benth_params["intercept"])
@@ -730,10 +795,7 @@ def _run_arma_only_update():
 
 
 def main():
-    if ARMA_ONLY:
-        _run_arma_only_update()
-        return
-
+    
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     print("=" * 70)
     print("  generate_bk_forecasts.py")
@@ -808,10 +870,6 @@ def main():
             f_benth  = _safe_forecast("Benth",  lambda: forecast_benth(benth_params, df_train, test_dates))  if benth_params  else np.full(365, np.nan)
             f_arma   = _safe_forecast("ARMA",   lambda: forecast_arma(arma_payload, test_dates))             if arma_payload  else np.full(365, np.nan)
             f_xgb    = _safe_forecast("XGB",    lambda: forecast_paper_xgb(xgb_payload, test_dates, extended_calib_ctx)) if (xgb_payload and extended_calib_ctx) else np.full(365, np.nan)
-            if wavelet_payload and extended_calib_ctx:
-                f_wavelet = _safe_forecast("WaveletFNN", lambda: forecast_wavelet_fnn(wavelet_payload, test_dates, extended_calib_ctx))
-            else:
-                f_wavelet = np.full(365, np.nan)
             f_lstm = _safe_forecast("LSTM",          lambda: forecast_lstm(lstm_payload, test_dates, calib_ctx))           if lstm_payload else np.full(365, np.nan)
             f_ffnn = _safe_forecast("FeedForwardNN", lambda: forecast_feedforward_nn(ffnn_payload, test_dates, ffnn_calib_ctx)) if ffnn_payload else np.full(365, np.nan)
             f_knn  = _safe_forecast("KNN", lambda: forecast_paper_xgb(knn_payload, test_dates, extended_calib_ctx)) if (knn_payload and extended_calib_ctx) else np.full(365, np.nan)

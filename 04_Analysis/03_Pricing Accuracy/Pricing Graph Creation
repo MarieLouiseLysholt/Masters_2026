@@ -43,7 +43,7 @@ MODEL_ORDER = [
 ]
 
 LABELS = {
-    "HBA":           "HBA",
+    "HBA":           "Naïve",
     "Alaton":        "Alaton",
     "Benth":         "Benth",
     "ARMA":          "ARMA",
@@ -51,12 +51,13 @@ LABELS = {
     "LSTM":          "LSTM",
     "FeedForwardNN": "Feed Forward NN",
     "KNN":           "KNN",
-    "SVM":           "SVM",
+    "SVM":           "SVR",
 }
 
 INDEX_ORDER    = ["HDD", "CDD", "CAT"]
 CONTRACT_ORDER = ["call", "put"]
 HORIZON_ORDER  = ["H1", "H2"]
+HORIZON_LABELS = {"H1": "Q1", "H2": "Q2"}
 
 DPI = 260
 
@@ -247,7 +248,7 @@ def _add_section_banners(ax, tbl, fig, sections, fontsize=9,
 def render_table1(summary: pd.DataFrame) -> None:
     """
     One PNG per index (HDD, CDD, CAT). Single wide table.
-    Rows: models (listed once). Columns: Call (H1 Bias|MAE|RMSE | H2 Bias|MAE|RMSE)
+    Rows: models (listed once). Columns: Call (Q1 Bias|MAE|RMSE | Q2 Bias|MAE|RMSE)
     then Put (same). Section banner ("Call" / "Put") above each half.
     """
     indices   = [i for i in INDEX_ORDER    if i in summary["index"].unique()]
@@ -263,7 +264,7 @@ def render_table1(summary: pd.DataFrame) -> None:
     for _ in contracts:
         for hor in horizons:
             for met in metrics_per_horizon:
-                col_labels.append(f"{hor}\n{met}")
+                col_labels.append(f"{HORIZON_LABELS.get(hor, hor)}\n{met}")
 
     sections = [
         (ct.capitalize(),
@@ -317,7 +318,7 @@ def render_long_tables(summary: pd.DataFrame) -> None:
     """
     One PNG per contract type (call, put). Single wide table.
     Rows: models. Columns grouped by index (HDD | CDD | CAT), each with
-    H1 Bias|MAE|RMSE | H2 Bias|MAE|RMSE. Section banner above each index.
+    Q1 Bias|MAE|RMSE | Q2 Bias|MAE|RMSE. Section banner above each index.
     """
     indices   = [i for i in INDEX_ORDER    if i in summary["index"].unique()]
     contracts = [c for c in CONTRACT_ORDER if c in summary["contract"].unique()]
@@ -332,7 +333,7 @@ def render_long_tables(summary: pd.DataFrame) -> None:
     for _ in indices:
         for hor in horizons:
             for met in metrics_per_horizon:
-                col_labels.append(f"{hor}\n{met}")
+                col_labels.append(f"{HORIZON_LABELS.get(hor, hor)}\n{met}")
 
     sections = [
         (idx, list(range(i * cols_per_index, (i + 1) * cols_per_index)))
@@ -391,7 +392,7 @@ def print_console(summary: pd.DataFrame) -> None:
     for _, r in summary.iterrows():
         print(
             f"  {r['label']:<18} {r['index']:<5} {r['contract']:<6} "
-            f"{r['horizon']:<4} {int(r['N']):>4} "
+            f"{HORIZON_LABELS.get(r['horizon'], r['horizon']):<4} {int(r['N']):>4} "
             f"{r['Bias']:>+8.3f} {r['MAE']:>8.3f} {r['RMSE']:>8.3f}"
         )
     print("=" * 76)
