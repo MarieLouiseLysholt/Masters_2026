@@ -6,3 +6,6 @@
 *.npy
 Source Control -Git
 *.pkl
+*.pkl
+*.csv
+.DS_Store
