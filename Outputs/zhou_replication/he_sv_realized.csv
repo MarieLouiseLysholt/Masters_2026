@@ -1,8 +1,0 @@
-model,he_sv_realized,he_sv_real_std,n_regions
-HBA,-0.2076,0.243,8
-Alaton,-0.2569,0.3132,8
-Benth,-0.2222,0.2522,8
-XGB,-0.2028,0.2304,8
-WaveletFNN,-0.4065,0.3873,8
-LSTM,-0.0056,0.0719,8
-FeedForwardNN,-0.0072,0.0462,8

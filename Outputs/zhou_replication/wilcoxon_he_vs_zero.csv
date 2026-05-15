@@ -1,8 +1,0 @@
-horizon,model,n,stat,p_value,significant
-mid90day,HBA,80,1369.0,0.8857,False
-mid90day,Alaton,80,790.0,0.9998,False
-mid90day,Benth,80,1336.0,0.8835,False
-mid90day,XGB,80,1286.0,0.9454,False
-mid90day,WaveletFNN,80,1464.5,0.7721,False
-mid90day,LSTM,80,822.5,0.9999,False
-mid90day,FeedForwardNN,80,1005.5,0.9984,False

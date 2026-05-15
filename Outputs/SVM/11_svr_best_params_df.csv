@@ -1,6 +1,0 @@
-,C,degree,epsilon,gamma,kernel,tol,model
-11_fold1,1.0,1,0.7,scale,poly,0.0001,SVM_SVR
-11_fold2,1.0,1,0.7,scale,poly,0.0005,SVM_SVR
-11_fold3,1.0,1,0.1,auto,poly,0.0005,SVM_SVR
-11_fold4,1.0,1,0.7,auto,poly,0.0001,SVM_SVR
-11_fold5,1.0,1,1.0,auto,poly,0.0001,SVM_SVR

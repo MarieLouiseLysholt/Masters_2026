@@ -1,6 +1,0 @@
-model,location,mape,r2,horizon,fold
-K-Nearest_Neighbors_Regression,11,0.16351938776315134,0.4321886447149813,1,1
-K-Nearest_Neighbors_Regression,11,0.1415632081760403,0.5206115712419779,1,2
-K-Nearest_Neighbors_Regression,11,0.1518491324723702,0.5243334358345026,1,3
-K-Nearest_Neighbors_Regression,11,0.14903391538295857,0.4712544704530387,1,4
-K-Nearest_Neighbors_Regression,11,0.14776946749369607,0.45967143671414623,1,5
