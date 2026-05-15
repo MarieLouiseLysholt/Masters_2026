@@ -1,0 +1,430 @@
+"""
+pricing_bias_table.py
+----------------------
+Reads pricing_results.csv (output of pricing.py) and produces two
+publication-ready B&W tables (Times New Roman).
+
+Table 1 — Model × contract, one figure per horizon
+    Panels : index × contract
+    Rows   : models
+    Columns: N | Bias | MAE | RMSE
+
+Table 2 — Model × index × horizon, one figure per contract type
+    Rows   : models
+    Columns: (index, horizon) combinations, each with Bias | MAE | RMSE
+
+Output:
+    pricing_bias_summary.csv          — full summary
+    pricing_bias_table_{H}.png        — Table 1 per horizon
+    pricing_index_horizon_{ct}.png    — Table 2 per contract type
+
+Usage:
+    python pricing_bias_table.py
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# ── Config ────────────────────────────────────────────────────────────────────
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT       = Path(__file__).resolve().parents[2]
+INPUT_CSV  = SCRIPT_DIR / "pricing_results.csv"
+OUTPUT_CSV = SCRIPT_DIR / "pricing_bias_summary.csv"
+OUTPUT_DIR = ROOT / "99_Thesis Graphs" / "03_Results" / "03_Pricing Accuracy"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+MODEL_ORDER = [
+    "HBA", "Alaton", "Benth", "ARMA",
+    "XGB", "LSTM", "FeedForwardNN", "KNN", "SVM",
+]
+
+LABELS = {
+    "HBA":           "Naïve",
+    "Alaton":        "Alaton",
+    "Benth":         "Benth",
+    "ARMA":          "ARMA",
+    "XGB":           "XGBoost",
+    "LSTM":          "LSTM",
+    "FeedForwardNN": "Feed Forward NN",
+    "KNN":           "KNN",
+    "SVM":           "SVR",
+}
+
+INDEX_ORDER    = ["HDD", "CDD", "CAT"]
+CONTRACT_ORDER = ["call", "put"]
+HORIZON_ORDER  = ["H1", "H2"]
+HORIZON_LABELS = {"H1": "Q1", "H2": "Q2"}
+
+DPI = 260
+
+plt.rcParams.update({
+    "font.family":       "serif",
+    "font.serif":        ["Times New Roman", "Times", "DejaVu Serif"],
+    "font.size":         9,
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+    "axes.grid":         False,
+    "figure.facecolor":  "white",
+    "axes.facecolor":    "white",
+})
+
+
+# ============================================================================
+# LOAD
+# ============================================================================
+
+def load(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df = df.dropna(subset=["pricing_error"])
+    print(f"Loaded {len(df):,} priced rows from {path.name}")
+    print(f"  Models  : {sorted(df['model'].unique())}")
+    print(f"  Indices : {sorted(df['index'].unique())}")
+    print(f"  Horizons: {sorted(df['horizon'].unique())}")
+    return df
+
+
+# ============================================================================
+# SUMMARISE
+# ============================================================================
+
+def summarise(df: pd.DataFrame) -> pd.DataFrame:
+    models    = [m for m in MODEL_ORDER if m in df["model"].unique()]
+    models   += [m for m in df["model"].unique() if m not in MODEL_ORDER]
+    indices   = [i for i in INDEX_ORDER   if i in df["index"].unique()]
+    contracts = [c for c in CONTRACT_ORDER if c in df["contract"].unique()]
+    horizons  = [h for h in HORIZON_ORDER  if h in df["horizon"].unique()]
+
+    rows = []
+    for model in models:
+        for idx in indices:
+            for ct in contracts:
+                for hor in horizons:
+                    sub = df[
+                        (df["model"]    == model) &
+                        (df["index"]    == idx)   &
+                        (df["contract"] == ct)    &
+                        (df["horizon"]  == hor)
+                    ]["pricing_error"].dropna()
+
+                    if len(sub) == 0:
+                        continue
+
+                    e = sub.values.astype(float)
+                    rows.append({
+                        "model"   : model,
+                        "label"   : LABELS.get(model, model),
+                        "index"   : idx,
+                        "contract": ct,
+                        "horizon" : hor,
+                        "N"       : len(e),
+                        "Bias"    : round(float(e.mean()), 3),
+                        "MAE"     : round(float(np.abs(e).mean()), 3),
+                        "RMSE"    : round(float(np.sqrt((e**2).mean())), 3),
+                    })
+    return pd.DataFrame(rows)
+
+
+# ============================================================================
+# SHARED TABLE DRAWING HELPER
+# ============================================================================
+
+def _fmt(v, dec=3):
+    try:
+        if pd.isna(v) or not np.isfinite(float(v)):
+            return "—"
+        return f"{float(v):.{dec}f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _draw_econ_table(ax, cell_text, col_labels, row_labels,
+                     fontsize=9,
+                     col_width_scale=1.0, row_height_scale=1.5,
+                     header_top_edge=True):
+    """
+    Plain econometric-literature B&W table: top rule, mid rule under header,
+    bottom rule. No shading, no bold, no titles, no footnotes.
+    Matches Forecast Accuracy_v2 styling.
+
+    header_top_edge=False suppresses the rule above the column-header row.
+    Use this when section banners draw their own top rule + cmidrules above.
+    """
+    ax.axis("off")
+    n_rows = len(cell_text)
+
+    tbl = ax.table(
+        cellText  = cell_text,
+        colLabels = col_labels,
+        rowLabels = row_labels,
+        loc       = "center",
+        cellLoc   = "center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(fontsize)
+    tbl.scale(col_width_scale, row_height_scale)
+
+    # When header_top_edge=False, suppress ALL header edges — the banner
+    # helper draws per-section cmidrule above + per-section midrule below.
+    header_edges = "TB" if header_top_edge else ""
+
+    for (row, col), cell in tbl.get_celld().items():
+        cell.set_facecolor("white")
+        cell.set_edgecolor("black")
+        cell.set_linewidth(0.8)
+        cell.visible_edges = ""
+
+        if row == 0:                       # header row
+            cell.visible_edges = header_edges
+            cell.set_text_props(fontweight="normal",
+                                ha="left" if col == -1 else "center",
+                                fontfamily="Times New Roman")
+        else:
+            if row == n_rows:              # last data row → bottom rule
+                cell.visible_edges = "B"
+            ha = "left" if col == -1 else "right"
+            cell.set_text_props(ha=ha, fontweight="normal",
+                                fontfamily="Times New Roman")
+    return tbl
+
+
+def _add_section_banners(ax, tbl, fig, sections, fontsize=9,
+                         cmidrule_offset=0.012, banner_offset=0.022,
+                         rule_inset=0.006):
+    """
+    Draw small section banners above an existing matplotlib table.
+    sections: list of (label, [col_indices]) — col_indices are 0-based data
+    columns (excluding row-label col=-1) that the section spans.
+
+    Layout (axes-fraction y-coords, measured upward from header top):
+      banner_offset   — section labels (Call / Put / HDD / ...)
+      cmidrule_offset — partial rule under each section label (cmidrule)
+    rule_inset trims both ends of each per-section rule (cmidrule above and
+    midrule below the column headers), creating a visible gap between
+    adjacent sections — same idea as LaTeX \\cmidrule(lr).
+    """
+    fig.canvas.draw()
+    cells = tbl.get_celld()
+    if (0, 0) not in cells:
+        return
+    y_top = cells[(0, 0)].get_y() + cells[(0, 0)].get_height()
+    cmidrule_y = y_top + cmidrule_offset
+    banner_y   = y_top + banner_offset
+
+    header_bottom = cells[(0, 0)].get_y()  # y of mid-rule line below headers
+
+    for label, cols in sections:
+        if not cols:
+            continue
+        x_starts = [cells[(0, c)].get_x() for c in cols]
+        widths   = [cells[(0, c)].get_width() for c in cols]
+        x0_full = min(x_starts)
+        x1_full = max(x_starts[i] + widths[i] for i in range(len(cols)))
+        xc = (x0_full + x1_full) / 2
+        # Trim both ends so adjacent sections show a visible gap
+        x0 = x0_full + rule_inset
+        x1 = x1_full - rule_inset
+
+        ax.text(xc, banner_y, label, ha="center", va="bottom",
+                fontsize=fontsize, fontfamily="Times New Roman",
+                transform=ax.transAxes)
+        # Cmidrule above column headers (under banner label)
+        ax.plot([x0, x1], [cmidrule_y, cmidrule_y],
+                color="black", linewidth=0.7,
+                transform=ax.transAxes, clip_on=False)
+        # Mid rule below column headers (per-section)
+        ax.plot([x0, x1], [header_bottom, header_bottom],
+                color="black", linewidth=0.7,
+                transform=ax.transAxes, clip_on=False)
+
+
+# ============================================================================
+# TABLE 1 — Model × contract per horizon
+# ============================================================================
+
+def render_table1(summary: pd.DataFrame) -> None:
+    """
+    One PNG per index (HDD, CDD, CAT). Single wide table.
+    Rows: models (listed once). Columns: Call (Q1 Bias|MAE|RMSE | Q2 Bias|MAE|RMSE)
+    then Put (same). Section banner ("Call" / "Put") above each half.
+    """
+    indices   = [i for i in INDEX_ORDER    if i in summary["index"].unique()]
+    contracts = [c for c in CONTRACT_ORDER if c in summary["contract"].unique()]
+    horizons  = [h for h in HORIZON_ORDER  if h in summary["horizon"].unique()]
+    models    = [m for m in MODEL_ORDER    if m in summary["model"].unique()]
+    row_labels = [LABELS.get(m, m) for m in models]
+
+    metrics_per_horizon = ("Bias", "MAE", "RMSE")
+    cols_per_contract   = len(horizons) * len(metrics_per_horizon)
+
+    col_labels = []
+    for _ in contracts:
+        for hor in horizons:
+            for met in metrics_per_horizon:
+                col_labels.append(f"{HORIZON_LABELS.get(hor, hor)}\n{met}")
+
+    sections = [
+        (ct.capitalize(),
+         list(range(i * cols_per_contract, (i + 1) * cols_per_contract)))
+        for i, ct in enumerate(contracts)
+    ]
+
+    for idx in indices:
+        cell_text = []
+        for m in models:
+            row = []
+            for ct in contracts:
+                for hor in horizons:
+                    sub = summary[
+                        (summary["model"]    == m)   &
+                        (summary["index"]    == idx) &
+                        (summary["contract"] == ct)  &
+                        (summary["horizon"]  == hor)
+                    ]
+                    if sub.empty:
+                        row += ["—", "—", "—"]
+                    else:
+                        r = sub.iloc[0]
+                        row += [_fmt(r["Bias"], 3),
+                                _fmt(r["MAE"],  3),
+                                _fmt(r["RMSE"], 3)]
+            cell_text.append(row)
+
+        n_cols = len(col_labels)
+        fig_w = max(11, 0.85 * n_cols)
+        fig_h = max(3.0, 0.42 * len(models))
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+        tbl = _draw_econ_table(ax, cell_text, col_labels, row_labels,
+                               fontsize=8,
+                               col_width_scale=0.95, row_height_scale=1.25,
+                               header_top_edge=False)
+        _add_section_banners(ax, tbl, fig, sections, fontsize=10)
+
+        out = OUTPUT_DIR / f"pricing_bias_table_{idx}.png"
+        fig.savefig(out, dpi=DPI, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+        print(f"  -> {out.name}")
+
+
+# ============================================================================
+# LONG PER-CONTRACT TABLES — HDD | CDD | CAT side-by-side
+# ============================================================================
+
+def render_long_tables(summary: pd.DataFrame) -> None:
+    """
+    One PNG per contract type (call, put). Single wide table.
+    Rows: models. Columns grouped by index (HDD | CDD | CAT), each with
+    Q1 Bias|MAE|RMSE | Q2 Bias|MAE|RMSE. Section banner above each index.
+    """
+    indices   = [i for i in INDEX_ORDER    if i in summary["index"].unique()]
+    contracts = [c for c in CONTRACT_ORDER if c in summary["contract"].unique()]
+    horizons  = [h for h in HORIZON_ORDER  if h in summary["horizon"].unique()]
+    models    = [m for m in MODEL_ORDER    if m in summary["model"].unique()]
+    row_labels = [LABELS.get(m, m) for m in models]
+
+    metrics_per_horizon = ("Bias", "MAE", "RMSE")
+    cols_per_index      = len(horizons) * len(metrics_per_horizon)
+
+    col_labels = []
+    for _ in indices:
+        for hor in horizons:
+            for met in metrics_per_horizon:
+                col_labels.append(f"{HORIZON_LABELS.get(hor, hor)}\n{met}")
+
+    sections = [
+        (idx, list(range(i * cols_per_index, (i + 1) * cols_per_index)))
+        for i, idx in enumerate(indices)
+    ]
+
+    for ct in contracts:
+        cell_text = []
+        for m in models:
+            row = []
+            for idx in indices:
+                for hor in horizons:
+                    sub = summary[
+                        (summary["model"]    == m)   &
+                        (summary["index"]    == idx) &
+                        (summary["contract"] == ct)  &
+                        (summary["horizon"]  == hor)
+                    ]
+                    if sub.empty:
+                        row += ["—", "—", "—"]
+                    else:
+                        r = sub.iloc[0]
+                        row += [_fmt(r["Bias"], 3),
+                                _fmt(r["MAE"],  3),
+                                _fmt(r["RMSE"], 3)]
+            cell_text.append(row)
+
+        n_cols = len(col_labels)
+        fig_w = max(14, 0.82 * n_cols)
+        fig_h = max(3.0, 0.42 * len(models))
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+        tbl = _draw_econ_table(ax, cell_text, col_labels, row_labels,
+                               fontsize=7.5,
+                               col_width_scale=0.95, row_height_scale=1.25,
+                               header_top_edge=False)
+        _add_section_banners(ax, tbl, fig, sections, fontsize=10)
+
+        out = OUTPUT_DIR / f"pricing_bias_long_{ct}.png"
+        fig.savefig(out, dpi=DPI, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+        print(f"  -> {out.name}")
+
+
+# ============================================================================
+# CONSOLE PRINT
+# ============================================================================
+
+def print_console(summary: pd.DataFrame) -> None:
+    print("\n" + "=" * 76)
+    print("  PRICING BIAS SUMMARY")
+    print("=" * 76)
+    print(f"  {'Model':<18} {'Idx':<5} {'CT':<6} {'Hor':<4} "
+          f"{'N':>4} {'Bias':>8} {'MAE':>8} {'RMSE':>8}")
+    print("  " + "-" * 63)
+    for _, r in summary.iterrows():
+        print(
+            f"  {r['label']:<18} {r['index']:<5} {r['contract']:<6} "
+            f"{HORIZON_LABELS.get(r['horizon'], r['horizon']):<4} {int(r['N']):>4} "
+            f"{r['Bias']:>+8.3f} {r['MAE']:>8.3f} {r['RMSE']:>8.3f}"
+        )
+    print("=" * 76)
+    print("  Bias > 0 = systematic overpricing")
+    print("  Bias < 0 = systematic underpricing")
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    print("=" * 60)
+    print("  Pricing Bias Summary Tables")
+    print("=" * 60)
+
+    df      = load(INPUT_CSV)
+    summary = summarise(df)
+
+    summary.to_csv(OUTPUT_CSV, index=False)
+    print(f"\nSummary CSV -> {OUTPUT_CSV}")
+
+    print_console(summary)
+
+    print("\nRendering per-index tables (Call/Put banners) ...")
+    render_table1(summary)
+
+    print("\nRendering long per-contract tables (HDD/CDD/CAT banners) ...")
+    render_long_tables(summary)
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()

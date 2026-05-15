@@ -1,0 +1,77 @@
+"""
+Mean annual temperature time series – all 8 NUTS-2 regions
+One subplot per region, all in a single PNG
+"""
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import numpy as np
+from pathlib import Path
+
+mpl.rcParams['font.family'] = 'serif'
+
+# ── Config ────────────────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parents[3]
+DATA_PATH = ROOT / "02_Data" / "01_Temprature" / "region_avg.csv"
+THESIS_GRAPH_DIR = ROOT / "99_Thesis Graphs" / "01_Temprature"
+THESIS_GRAPH_DIR.mkdir(parents=True, exist_ok=True)
+OUT_PNG   = THESIS_GRAPH_DIR / "temp_annual_mean.png"
+START_DATE = "1980-01-01"
+
+REGION_NAMES = {
+    11: "Île-de-France",
+    24: "Centre-Val de Loire",
+    27: "Bourgogne-Franche-Comté",
+    28: "Normandie",
+    32: "Hauts-de-France",
+    44: "Grand Est",
+    52: "Pays de la Loire",
+    53: "Bretagne",
+}
+
+# ── Load and compute annual means ─────────────────────────────────────────────
+df = pd.read_csv(DATA_PATH, parse_dates=["date"])
+df = df[df["date"] >= START_DATE].copy()
+df = df[df["region_code"].isin(REGION_NAMES.keys())].copy()
+df["year"] = df["date"].dt.year
+df["region_name"] = df["region_code"].map(REGION_NAMES)
+
+annual = (
+    df.groupby(["year", "region_name"])["daily_avg_temperature"]
+    .mean()
+    .reset_index()
+)
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+regions = list(REGION_NAMES.values())
+ncols   = 4
+nrows   = 2
+
+fig, axes = plt.subplots(nrows, ncols, figsize=(14, 5.5), sharey=True)
+axes = axes.flatten()
+
+for i, region in enumerate(regions):
+    ax   = axes[i]
+    data = annual[annual["region_name"] == region].sort_values("year")
+
+    ax.plot(data["year"], data["daily_avg_temperature"],
+            color="#1a237e", linewidth=1.2)
+
+    # Linear trend line
+    z = np.polyfit(data["year"], data["daily_avg_temperature"], 1)
+    p = np.poly1d(z)
+    ax.plot(data["year"], p(data["year"]),
+            color="#d65f5f", linewidth=1.0, linestyle="--", alpha=0.8)
+
+    ax.set_title(region, fontsize=8.5, pad=4)
+    ax.tick_params(labelsize=7)
+    ax.set_xlabel("Year", fontsize=7.5)
+    ax.set_ylabel("°C", fontsize=7.5)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.xaxis.set_major_locator(plt.MaxNLocator(5, integer=True))
+
+plt.tight_layout(h_pad=2.5, w_pad=1.5)
+plt.savefig(OUT_PNG, dpi=220, bbox_inches="tight", facecolor="white")
+print(f"Saved to: {OUT_PNG}")

@@ -1,0 +1,146 @@
+"""
+Quick re-test: Bourgogne (FR27) and Hauts-de-France (FR32)
+using 1990-2014 calibration window.
+
+Run this standalone — just update DATA_PATH if needed.
+Prints missingness, OU estimates, JB, and Hurst on eps(t).
+"""
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import scipy.stats as stats
+import warnings
+warnings.filterwarnings("ignore")
+
+# ── Update this path if needed ────────────────────────────────────────────────
+DATA_PATH = Path(__file__).resolve().parents[1] / "02_Data" / "01_Temprature" / "region_avg.csv"
+
+CALIB_START = "1990-01-01"
+CALIB_END   = "2014-12-31"
+
+TARGET = {"FR27": "Bourgogne-Franche-Comte", "FR32": "Hauts-de-France"}
+
+# ── Load ──────────────────────────────────────────────────────────────────────
+df_raw = (
+    pd.read_csv(DATA_PATH, parse_dates=["date"])
+      .pivot(index="date", columns="region_code", values="daily_avg_temperature")
+      .sort_index()
+)
+
+col_map = {}
+for col in df_raw.columns:
+    nuts = f"FR{int(col):02d}"
+    if nuts in TARGET:
+        col_map[col] = nuts
+
+full_idx = pd.date_range(CALIB_START, CALIB_END, freq="D")
+
+# ── Model functions ───────────────────────────────────────────────────────────
+def fit_seasonal_mean(series):
+    t     = np.arange(len(series))
+    omega = 2 * np.pi / 365.25
+    X     = np.column_stack([np.ones(len(t)), t,
+                              np.sin(omega * t), np.cos(omega * t)])
+    coeffs, *_ = np.linalg.lstsq(X, series.values, rcond=None)
+    return pd.Series(X @ coeffs, index=series.index)
+
+def fit_ar1(T_tilde):
+    X     = T_tilde.values
+    alpha = np.dot(X[:-1], X[1:]) / np.dot(X[:-1], X[:-1])
+    u     = X[1:] - alpha * X[:-1]
+    kappa = -np.log(np.clip(alpha, 1e-9, 1 - 1e-9))
+    return alpha, kappa, pd.Series(u, index=T_tilde.index[1:])
+
+def fit_seasonal_vol(u):
+    doy   = u.index.dayofyear
+    sigma = np.ones(len(u))
+    for d in range(1, 366):
+        mask = doy == d
+        vals = u.values[mask]
+        if len(vals) >= 2:
+            s = np.sqrt(np.mean(vals ** 2))
+            if s > 0:
+                sigma[mask] = s
+    return pd.Series(u.values / sigma, index=u.index), sigma
+
+def jb_test(x):
+    n = len(x); mu = np.mean(x); sd = np.std(x, ddof=1)
+    g1 = np.mean(((x - mu) / sd) ** 3)
+    g2 = np.mean(((x - mu) / sd) ** 4)
+    jb = (n / 6) * (g1 ** 2 + (g2 - 3) ** 2 / 4)
+    return jb, 1 - stats.chi2.cdf(jb, 2), g1, g2
+
+def hurst(x, k_min=10, k_max_frac=0.1, n_points=25):
+    n     = len(x)
+    k_max = max(k_min + 1, int(n * k_max_frac))
+    ks    = np.unique(np.round(
+        np.exp(np.linspace(np.log(k_min), np.log(k_max), n_points))
+    ).astype(int))
+    ln_k, ln_f = [], []
+    for k in ks[ks >= k_min]:
+        N = n // k
+        if N < 10: continue
+        xi = x[:N * k].reshape(N, k).mean(axis=1)
+        fk = np.sqrt(np.mean(xi ** 2))
+        if fk > 0:
+            ln_k.append(np.log(k)); ln_f.append(np.log(fk))
+    if len(ln_k) < 4:
+        return np.nan
+    slope, *_ = stats.linregress(ln_k, ln_f)
+    return slope + 1.0
+
+def fmt_p(p): return "< 0.0001" if p < 0.0001 else f"{p:.4f}"
+def stars(p): return "***" if p<0.001 else "**" if p<0.01 else "*" if p<0.05 else ""
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+print(f"\n=== Re-test with calibration {CALIB_START[:4]}-{CALIB_END[:4]} ===\n")
+
+for raw_col, nuts in sorted(col_map.items(), key=lambda x: x[1]):
+    name   = TARGET[nuts]
+    series = df_raw[raw_col].reindex(full_idx)
+
+    # Missingness report
+    n_miss = series.isna().sum()
+    pct    = 100 * n_miss / len(series)
+    yearly = series.isna().groupby(series.index.year).sum()
+    bad_yrs = yearly[yearly > 0]
+
+    print(f"{nuts} — {name}")
+    print(f"  Calibration: {CALIB_START[:4]}-{CALIB_END[:4]}  "
+          f"({len(series):,} days)")
+    print(f"  Missing: {n_miss:,} days ({pct:.2f}%)")
+    if len(bad_yrs) > 0:
+        print(f"  Years with missing data:")
+        for yr, cnt in bad_yrs.sort_values(ascending=False).items():
+            print(f"    {yr}: {cnt} days")
+    else:
+        print(f"  No missing days in this window.")
+
+    # Only fit model if missingness is low enough
+    if pct > 5:
+        print(f"  WARNING: {pct:.1f}% missing — OU estimates unreliable.\n")
+        continue
+
+    # Drop remaining NaNs and fit
+    series_clean = series.dropna()
+    S            = fit_seasonal_mean(series_clean)
+    T_tilde      = series_clean - S
+    alpha, kappa, u = fit_ar1(T_tilde)
+    eps, sigma   = fit_seasonal_vol(u)
+
+    jb, jb_p, skew, kurt = jb_test(eps.values)
+    H                    = hurst(eps.values)
+    bm_ok                = (not np.isnan(H)) and abs(H - 0.5) < 0.10
+
+    print(f"\n  OU estimates:")
+    print(f"    alpha = {alpha:.4f}   kappa = {kappa:.4f}")
+    print(f"  Residual diagnostics on eps(t):")
+    print(f"    Skewness = {skew:.4f}   Kurtosis = {kurt:.4f}")
+    print(f"    JB = {jb:.2f}   p = {fmt_p(jb_p)}{stars(jb_p)}")
+    print(f"    H(eps) = {H:.4f}   BM justified: {'Yes' if bm_ok else 'No'}")
+    print()
+
+print("Compare alpha to 1970-2014 estimates:")
+print("  FR27: was 0.9333 (kappa 0.069) — should drop toward ~0.80 if gap-driven")
+print("  FR32: was 0.9163 (kappa 0.087) — same expectation")

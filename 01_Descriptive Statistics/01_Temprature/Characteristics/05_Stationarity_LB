@@ -1,0 +1,175 @@
+"""
+ADF + KPSS + Ljung-Box(365) — daily temperature per region.
+Murat et al. (2018) report ADF (rejects unit root), KPSS (cannot reject
+stationarity), and the Ljung-Box statistic at lag 365 to confirm strong
+annual seasonal dependence.
+
+Output: Table_Stationarity_LB.png  (academic table style, horizontal lines only)
+"""
+
+import sys
+import warnings
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from statsmodels.tsa.stattools import adfuller, kpss
+from statsmodels.stats.diagnostic import acorr_ljungbox
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, OSError):
+    pass
+warnings.filterwarnings("ignore")
+
+
+def _find_root(start, target="02_Data"):
+    c = Path(start).resolve()
+    for _ in range(12):
+        if (c / target).exists():
+            return c
+        c = c.parent
+    raise FileNotFoundError
+
+
+ROOT      = _find_root(Path(__file__).resolve().parent)
+DATA_PATH = ROOT / "02_Data" / "01_Temprature" / "region_avg.csv"
+OUT_DIR   = ROOT / "99_Thesis Graphs" / "04_Data Tests"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+START_DATE = pd.Timestamp("1980-01-01")
+
+REGION_NAMES = {
+    11: "Île-de-France",           24: "Centre-Val de Loire",
+    27: "Bourgogne-Franche-Comté", 28: "Normandie",
+    32: "Hauts-de-France",         44: "Grand Est",
+    52: "Pays de la Loire",        53: "Bretagne",
+}
+
+LB_LAG = 365
+
+matplotlib.rcParams.update({
+    "font.family": "serif",
+    "font.serif":  ["Times New Roman", "Times", "DejaVu Serif"],
+})
+
+
+def stars(p):
+    if p < 0.001: return "***"
+    if p < 0.01:  return "**"
+    if p < 0.05:  return "*"
+    return ""
+
+
+raw = pd.read_csv(DATA_PATH, parse_dates=["date"]).sort_values("date")
+raw = raw[raw["date"] >= START_DATE].copy()
+regions = sorted(raw["region_code"].unique())
+
+rows = []
+adf_cv5  = None
+kpss_cv5 = None
+
+for region in regions:
+    temp = (raw[raw["region_code"] == region]
+            .dropna(subset=["daily_avg_temperature"])
+            .sort_values("date")["daily_avg_temperature"]
+            .values.astype(float))
+
+    adf_stat, adf_p, adf_lags, _, adf_cvs, *_ = adfuller(
+        temp, regression="c", autolag="BIC"
+    )
+    kpss_stat, kpss_p, kpss_bw, kpss_cvs = kpss(temp, regression="c", nlags="auto")
+
+    lb = acorr_ljungbox(temp, lags=[LB_LAG], return_df=True)
+    lb_stat = float(lb["lb_stat"].iloc[0])
+    lb_p    = float(lb["lb_pvalue"].iloc[0])
+
+    adf_cv5  = adf_cvs["5%"]
+    kpss_cv5 = kpss_cvs["5%"]
+
+    rows.append({
+        "region":   REGION_NAMES[region],
+        "adf_str":  f"{adf_stat:.4f}{stars(adf_p)}",
+        "adf_p":    f"{adf_p:.4f}",
+        "lags":     str(adf_lags),
+        "kpss_str": f"{kpss_stat:.4f}",
+        "bw":       str(kpss_bw),
+        "lb_str":   (f"{lb_stat:,.0f}{stars(lb_p)}"),
+        "lb_p":     ("< 0.0001" if lb_p < 1e-4 else f"{lb_p:.4f}"),
+    })
+
+# ── Layout ─────────────────────────────────────────────────────────────────────
+headers  = ["Region", "ADF stat.", "p-value", "Lags (BIC)",
+            "KPSS stat.", "BW (NW)", f"LB({LB_LAG})", "p-value"]
+col_keys = ["region", "adf_str", "adf_p", "lags",
+            "kpss_str", "bw", "lb_str", "lb_p"]
+col_x    = [0.00, 0.24, 0.36, 0.46, 0.55, 0.66, 0.76, 0.90]
+
+fig_w  = 11.5
+row_h  = 0.30
+hdr_h  = 0.34
+foot_h = 0.36
+n_data = len(rows)
+fig_h  = hdr_h + row_h * n_data + foot_h + 0.05
+
+fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+ax.set_xlim(0, 1)
+ax.set_ylim(0, fig_h)
+ax.axis("off")
+
+BLACK = "#000000"
+
+
+def hline(y, lw):
+    ax.add_line(Line2D([0, 1], [y, y], lw=lw, color=BLACK,
+                       solid_capstyle="butt", transform=ax.transAxes))
+
+
+def txt(fx, y, text, bold=False, fontsize=8.5):
+    ax.text(fx + 0.005, y, text, fontsize=fontsize,
+            fontweight="bold" if bold else "normal",
+            ha="left", va="center", color=BLACK,
+            transform=ax.transAxes)
+
+
+def ay(y_data):
+    return y_data / fig_h
+
+
+hline(ay(fig_h), 1.2)
+
+y_hdr = fig_h - hdr_h
+for label, fx in zip(headers, col_x):
+    txt(fx, ay(y_hdr + hdr_h * 0.5), label, bold=True)
+
+hline(ay(y_hdr), 0.7)
+
+for i, row in enumerate(rows):
+    y_row = y_hdr - row_h * (i + 1)
+    y_mid = ay(y_row + row_h * 0.5)
+    for fx, key in zip(col_x, col_keys):
+        txt(fx, y_mid, row[key])
+
+y_foot = row_h * 0.15
+hline(ay(y_foot + foot_h * 0.92), 0.5)
+
+y_foot_mid = ay(y_foot + foot_h * 0.55)
+txt(col_x[0], y_foot_mid, "Critical value (5%)", fontsize=8.5)
+txt(col_x[1], y_foot_mid, f"{adf_cv5:.4f}",  fontsize=8.5)
+txt(col_x[4], y_foot_mid, f"{kpss_cv5:.4f}", fontsize=8.5)
+
+y_note = ay(y_foot + foot_h * 0.20)
+txt(col_x[0], y_note,
+    f"ADF H₀: unit root.  KPSS H₀: stationary.  "
+    f"Ljung-Box H₀: no autocorrelation up to lag {LB_LAG}.  "
+    "* p<0.05  ** p<0.01  *** p<0.001",
+    fontsize=7.5)
+
+hline(ay(y_foot - 0.01), 1.2)
+
+fig.tight_layout(pad=0.1)
+out = OUT_DIR / "Table_Stationarity_LB.png"
+plt.savefig(out, dpi=300, facecolor="white", bbox_inches="tight")
+plt.close()
+print(f"Saved: {out}")

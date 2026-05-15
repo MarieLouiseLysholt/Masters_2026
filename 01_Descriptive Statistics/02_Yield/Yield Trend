@@ -1,0 +1,79 @@
+"""
+Yield over time – all 8 NUTS-2 regions
+Shows regional yield trends and common down years
+"""
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+from pathlib import Path
+
+mpl.rcParams['font.family'] = 'serif'
+
+# ── Config ────────────────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parents[1]
+DATA_PATH = ROOT / "02_Data" / "02_Wheat" / "ble_tendre_hiver_yield_2000_2024_regions_mainland.csv"
+THESIS_GRAPH_DIR = ROOT / "04_Thesis Graphs"
+THESIS_GRAPH_DIR.mkdir(parents=True, exist_ok=True)
+OUT_PNG   = THESIS_GRAPH_DIR / "yield_over_time.png"
+
+REGION_NAMES = {
+    11: "Île-de-France",
+    24: "Centre-Val de Loire",
+    27: "Bourgogne-Franche-Comté",
+    28: "Normandie",
+    32: "Hauts-de-France",
+    44: "Grand Est",
+    52: "Pays de la Loire",
+    53: "Bretagne",
+}
+
+# ── Load ──────────────────────────────────────────────────────────────────────
+df = pd.read_csv(DATA_PATH)
+df = df[df["reg"].isin(REGION_NAMES.keys())].copy()
+df["region_name"] = df["reg"].map(REGION_NAMES)
+
+pivot = df.pivot(index="year", columns="region_name", values="yield")
+pivot = pivot.reindex(columns=list(REGION_NAMES.values()))
+
+# Average yield across all regions (to highlight systemic down years)
+pivot["Average"] = pivot.mean(axis=1)
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(11, 5))
+
+colors = [
+    "#4878CF", "#6ACC65", "#D65F5F", "#B47CC7",
+    "#C4AD66", "#77BEDB", "#F7A859", "#D9534F"
+]
+
+for i, region in enumerate(REGION_NAMES.values()):
+    ax.plot(pivot.index, pivot[region], color=colors[i],
+            linewidth=1.2, alpha=0.7, label=region)
+
+# Average as bold black line
+ax.plot(pivot.index, pivot["Average"], color="black",
+        linewidth=2.0, linestyle="--", label="Average", zorder=5)
+
+# Shade notable down years — adjust based on actual data
+down_years = pivot["Average"].nsmallest(3).index.tolist()
+for yr in down_years:
+    ax.axvline(yr, color="gray", linewidth=0.8, linestyle=":", alpha=0.7)
+    ax.text(yr + 0.1, ax.get_ylim()[0], str(yr),
+            fontsize=7, color="gray", va="bottom")
+
+ax.set_xlabel("Year", fontsize=10)
+ax.set_ylabel("Yield (q/ha)", fontsize=10)
+ax.set_xticks(pivot.index)
+ax.set_xticklabels(pivot.index, rotation=45, ha="right", fontsize=8)
+ax.tick_params(axis="y", labelsize=8)
+ax.spines["top"].set_visible(False)
+ax.spines["right"].set_visible(False)
+
+ax.legend(loc="lower right", fontsize=7.5, frameon=False,
+          ncol=2, columnspacing=1)
+
+plt.tight_layout()
+plt.savefig(OUT_PNG, dpi=220, bbox_inches="tight", facecolor="white")
+plt.show()
+print(f"Saved to: {OUT_PNG}")

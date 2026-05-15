@@ -1,0 +1,543 @@
+"""
+Alaton (2002) rolling PKL exporter — faithful to the paper + gap-robust.
+
+Paper: Alaton, Djehiche & Stillberger (2002)
+       "On modelling and pricing weather derivatives"
+       Applied Mathematical Finance, 9(1), 1-20.
+
+Methodological corrections vs original script
+---------------------------------------------
+
+1. Tm via alatonTmfunc(t, *popt) directly  [previous fix]
+   The old alatmeanT() helper reconstructed Tm via arctan(a4/a3)-pi which
+   flips the seasonal cycle when a3 < 0 (common in French regions).
+   Tm is now always the raw curve_fit output — no phase reconstruction.
+
+2. Global a via Eq. 3.26  [previous fix]
+   Single ratio across all valid observations, not per-month then averaged.
+
+3. Sigma Estimator 2 Euler form  [previous fix]
+   Residual uses (1-â) coefficient per Eq. 3.17, not exp(-â).
+   Denominator is N_mu - 2 per Eq. 3.19.
+
+4. Plain .shift(1) for sigma1sqd_prev  [previous fix]
+   Not groupby shift — carries monthly sigma correctly across month boundaries.
+
+5. Calendar-based t-index  [new — borrowed from Benth's dayofyear logic]
+   Original code: t = np.arange(1, len(calib_df)+1)
+   Every missing calendar day shrinks the row count, shifting all subsequent
+   t values earlier than their true calendar position. With 3,818 missing days
+   in region 27 this produces a 24-day Tm peak shift, making the fitted
+   seasonal curve systematically wrong and causing a and sigma2 to fail.
+   Fix: t = (date - first_date_of_full_series).days + 1
+   This gives each observation its correct calendar position regardless of
+   surrounding gaps — the same philosophy as Benth's use of dayofyear.
+
+6. Consecutive-day mask for a and sigma2  [new]
+   .shift(1) on the cleaned dataframe pairs observations across gaps. A gap
+   of 8 days (as in region 27) produces a pair where tavgcel-1 is 9 days
+   before TAVG_imptd, not 1. The martingale estimator (Eq. 3.26) assumes
+   daily consecutive observations — a single cross-gap pair where the
+   numerator and denominator have opposite signs makes log() return NaN for
+   the entire a estimate, which is exactly what is observed in regions 27/32.
+   Fix: mask to rows where (date - prev_date) == 1 day before any
+   computation that uses shift(1) pairs.
+"""
+
+import warnings
+warnings.simplefilter("ignore")
+
+import pandas as pd
+import numpy as np
+import os
+import pickle
+from pathlib import Path
+from scipy.optimize import curve_fit
+import datetime
+from scipy import stats
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# --------------------------------------------------------------------------- #
+# Paths
+# --------------------------------------------------------------------------- #
+ROOT       = Path(__file__).resolve().parents[1]
+TEMP_DIR   = ROOT / "02_Data" / "01_Temprature"
+MODEL_DIR  = Path(__file__).resolve().parent
+PKL_ROOT   = MODEL_DIR / "01_PKL Files"
+pkl_folder = PKL_ROOT / "02_Alaton"
+pkl_folder.mkdir(parents=True, exist_ok=True)
+
+tdy   = datetime.datetime.today().strftime('%Y-%m-%d')
+start = datetime.datetime.now()
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+REGIONS       = [11, 24, 27, 28, 32, 44, 52, 53]
+CALIB_YEARS   = range(2010, 2024)
+MIN_CALIB_OBS = 1000
+MAX_LAG       = 60
+ROLLING_START = pd.Timestamp('1980-01-01')
+
+
+# --------------------------------------------------------------------------- #
+# Functions
+# --------------------------------------------------------------------------- #
+
+def alatonTmfunc(t, a1, a2, a3, a4):
+    """
+    Eq. 3.9 — deterministic mean temperature fitted form.
+        Yt = a1 + a2*t + a3*sin(wt) + a4*cos(wt)
+    Derived params (Eqs. 3.11-3.14) stored for reference only:
+        A = a1, B = a2, C = sqrt(a3^2+a4^2), phi = arctan(a4/a3) - pi
+    Tm is ALWAYS evaluated via this function. Never via the C/phi form.
+    """
+    w = (2 * np.pi) / 365
+    return a1 + a2 * t + a3 * np.sin(w * t) + a4 * np.cos(w * t)
+
+
+def compute_acf(x, max_lag=60):
+    x  = np.asarray(x, dtype=float)
+    x  = x[np.isfinite(x)]
+    if len(x) == 0:
+        return np.full(max_lag + 1, np.nan)
+    xc    = x - x.mean()
+    denom = np.dot(xc, xc)
+    if denom == 0:
+        out    = np.zeros(max_lag + 1)
+        out[0] = 1.0
+        return out
+    n   = len(xc)
+    acf = [1.0]
+    for k in range(1, max_lag + 1):
+        acf.append(np.dot(xc[:n - k], xc[k:]) / denom if k < n else np.nan)
+    return np.array(acf)
+
+
+def remove_feb29(df):
+    return df[~((df.index.month == 2) & (df.index.day == 29))].copy()
+
+
+# --------------------------------------------------------------------------- #
+# Load data
+# --------------------------------------------------------------------------- #
+raw = pd.read_csv(TEMP_DIR / "region_temp_extended.csv", parse_dates=['date'])
+
+summary_rows = []
+all_popt_df  = pd.DataFrame()
+diag_year    = min(CALIB_YEARS)
+diag_store   = []
+
+# --------------------------------------------------------------------------- #
+# Main loop
+# --------------------------------------------------------------------------- #
+for region in REGIONS:
+    print(region)
+
+    subset_data = (
+        raw[raw['region_code'] == region]
+        .set_index('date')
+        [['TAVG_imptd']]
+        .dropna()
+        .sort_index()
+    )
+
+    if subset_data.empty:
+        print(f'  No data for region {region}, skipping.')
+        continue
+
+    subset_data = remove_feb29(subset_data)
+    subset_data = subset_data.loc[ROLLING_START:].copy()
+
+    if subset_data.empty:
+        print(f'  No data from {ROLLING_START.date()} forward for region {region}, skipping.')
+        continue
+
+    subset_data['month']     = subset_data.index.month
+    subset_data['dayofyear'] = subset_data.index.dayofyear
+    subset_data['name']      = region
+
+    # ------------------------------------------------------------------- #
+    # FIX 5 — Calendar-based t-index
+    #
+    # t = (date - first_date_of_series).days + 1
+    #
+    # This gives every observation its correct position in continuous
+    # calendar time regardless of surrounding gaps. A missing day simply
+    # leaves a gap in t values rather than shifting all subsequent rows.
+    # Borrowed from Benth's use of dayofyear — same philosophy, extended
+    # to a continuous index to preserve the linear trend term B*t.
+    #
+    # Downstream OOS forecasting: continue from
+    #   t_oos = (oos_date - t_origin).days + 1
+    # where t_origin = subset_data.index.min() stored in the PKL.
+    # ------------------------------------------------------------------- #
+    t_origin = subset_data.index.min()
+    subset_data['t'] = (
+        (subset_data.index - t_origin).days + 1
+    ).astype(float)
+
+    for calib_year in CALIB_YEARS:
+
+        calib_end = pd.Timestamp(f'{calib_year}-12-31')
+        calib_df  = subset_data.loc[:calib_end].copy()
+
+        if len(calib_df) < MIN_CALIB_OBS:
+            print(f'  {calib_year}: insufficient data, skipping.')
+            continue
+
+        # ------------------------------------------------------------------- #
+        # Step 1 — Fit deterministic mean (Eqs. 3.9–3.14)
+        # ------------------------------------------------------------------- #
+        t_arr    = calib_df['t'].values
+        y_arr    = calib_df['TAVG_imptd'].values
+        fin_mask = np.isfinite(y_arr)
+
+        try:
+            popt, _ = curve_fit(
+                alatonTmfunc,
+                t_arr[fin_mask],
+                y_arr[fin_mask],
+                maxfev=10000,
+            )
+        except RuntimeError:
+            print(f'  {calib_year}: curve_fit failed, skipping.')
+            continue
+
+        a1_f, a2_f, a3_f, a4_f = popt
+        A   = a1_f
+        B   = a2_f
+        C   = np.sqrt(a3_f ** 2 + a4_f ** 2)
+        phi = np.arctan(a4_f / a3_f) - np.pi   # Eq. 3.14 — reference only
+
+        # Working dataframe
+        s = calib_df.copy()
+
+        # Tm via direct evaluation — never via C/phi reconstruction (Fix 1)
+        s['Tm'] = alatonTmfunc(s['t'].values, *popt)
+        s['Tm-1']      = s['Tm'].shift(1)
+        s['tavgcel-1'] = s['TAVG_imptd'].shift(1)
+
+        # ------------------------------------------------------------------- #
+        # FIX 6 — Consecutive-day mask
+        #
+        # Mark rows where the previous observation is exactly 1 calendar day
+        # earlier. Only these rows represent true daily consecutive pairs as
+        # assumed by Eq. 3.26 (martingale estimator) and Eq. 3.17 (Euler SDE).
+        # Cross-gap pairs are excluded from a and sigma2 estimation.
+        # ------------------------------------------------------------------- #
+        s = s.reset_index()   # bring 'date' into a column for diff
+        s['prev_date']      = s['date'].shift(1)
+        s['is_consecutive'] = (
+            (s['date'] - s['prev_date']).dt.days == 1
+        )
+        s = s.set_index('date')
+
+        # ------------------------------------------------------------------- #
+        # Step 2 — Sigma Estimator 1 (Eq. 3.16)
+        # Only use consecutive pairs for the day-to-day diff
+        # ------------------------------------------------------------------- #
+        s['1daydiff'] = np.where(
+            s['is_consecutive'],
+            s['TAVG_imptd'] - s['TAVG_imptd'].shift(1),
+            np.nan
+        )
+        s['1daydiffsqrd'] = s['1daydiff'] ** 2
+
+        sigma1sqd = (
+            s.groupby('month')['1daydiffsqrd'].sum()
+            / s.groupby('month')['1daydiffsqrd'].count()
+        )
+        sigma1 = np.sqrt(sigma1sqd)
+
+        s = (
+            s.reset_index()
+             .merge(sigma1.rename('sigma1'),       on='month', how='left')
+             .merge(sigma1sqd.rename('sigma1sqd'), on='month', how='left')
+             .set_index('date')
+        )
+
+        # ------------------------------------------------------------------- #
+        # Step 3 — Yi-1 weights (Eq. 3.27)
+        # Plain .shift(1) — not groupby — so sigma crosses month boundaries.
+        # sigma1sqd_prev is set to NaN for non-consecutive rows via the mask.
+        # ------------------------------------------------------------------- #
+        s['sigma1sqd_prev'] = np.where(
+            s['is_consecutive'],
+            s['sigma1sqd'].shift(1),
+            np.nan
+        )
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            s['Yi-1'] = (s['Tm-1'] - s['tavgcel-1']) / s['sigma1sqd_prev']
+
+        # ------------------------------------------------------------------- #
+        # Step 4 — Global mean-reversion â (Eq. 3.26)
+        # Restricted to consecutive pairs only (Fix 6).
+        # ------------------------------------------------------------------- #
+        consec = s[s['is_consecutive']].dropna(
+            subset=['Yi-1', 'TAVG_imptd', 'Tm', 'tavgcel-1', 'Tm-1']
+        )
+        num_a = (consec['Yi-1'] * (consec['TAVG_imptd'] - consec['Tm'])).sum()
+        den_a = (consec['Yi-1'] * (consec['tavgcel-1']  - consec['Tm-1'])).sum()
+
+        if (pd.notna(num_a) and pd.notna(den_a)
+                and den_a != 0
+                and np.isfinite(num_a / den_a)
+                and (num_a / den_a) > 0):
+            a_est = float(-np.log(num_a / den_a))
+        else:
+            a_est = np.nan
+
+        # ------------------------------------------------------------------- #
+        # Step 5 — Sigma Estimator 2 (Eqs. 3.17–3.19)
+        # Restricted to consecutive pairs (Fix 6).
+        # Euler residual with (1-â) coefficient per Eq. 3.17.
+        # Denominator N_mu - 2 per Eq. 3.19.
+        # ------------------------------------------------------------------- #
+        if pd.notna(a_est):
+            s['resid2'] = np.where(
+                s['is_consecutive'],
+                (s['TAVG_imptd']
+                 - (s['Tm'] - s['Tm-1'])        # Tm_j - Tm_{j-1}
+                 - a_est       * s['Tm-1']       # â * Tm_{j-1}
+                 - (1 - a_est) * s['tavgcel-1']),# (1-â) * T_{j-1}
+                np.nan
+            )
+
+            def _sigma2(grp):
+                r = grp['resid2'].dropna()
+                n = len(r)
+                if n <= 2:
+                    return np.nan
+                return np.sqrt((r ** 2).sum() / (n - 2))
+
+            alatsigma2 = s.groupby('month').apply(_sigma2)
+        else:
+            alatsigma2 = pd.Series(
+                np.nan, index=pd.Index(range(1, 13), name='month')
+            )
+
+        # ------------------------------------------------------------------- #
+        # Step 6 — Monthly sigma = mean(Est1, Est2) (Table 1)
+        # ------------------------------------------------------------------- #
+        sigma_df = pd.concat([
+            sigma1.rename('Estimation1'),
+            alatsigma2.rename('Estimation2'),
+        ], axis=1)
+        sigma_df['avg_sigma'] = (
+            sigma_df['Estimation1'] + sigma_df['Estimation2']
+        ) / 2
+        sigma_monthly = sigma_df['avg_sigma'].dropna().to_dict()
+
+        # ------------------------------------------------------------------- #
+        # Diagnostics
+        # ------------------------------------------------------------------- #
+        df_calib      = s.copy()
+        df_calib['X'] = df_calib['TAVG_imptd'] - df_calib['Tm']
+        df_calib['sigma'] = df_calib.index.month.map(sigma_monthly)
+
+        T_v  = df_calib['TAVG_imptd'].values
+        Tm_v = df_calib['Tm'].values
+
+        cond_mean = np.full(len(T_v), np.nan)
+        if pd.notna(a_est) and a_est > 0:
+            # Exact conditional mean E[Ti|Ti-1] = (Ti-1 - Tmi-1)*exp(-a) + Tmi
+            # Used for diagnostic standardisation only — not for calibration
+            cond_mean[1:] = np.exp(-a_est) * (T_v[:-1] - Tm_v[:-1]) + Tm_v[1:]
+            cstd = (df_calib['sigma'].values
+                    * np.sqrt((1 - np.exp(-2 * a_est)) / (2 * a_est)))
+            # Zero out non-consecutive pairs in diagnostics too
+            consec_mask = df_calib['is_consecutive'].values
+            cond_mean[~consec_mask] = np.nan
+            with np.errstate(divide='ignore', invalid='ignore'):
+                df_calib['resid'] = (T_v - cond_mean) / cstd
+        else:
+            df_calib['resid'] = np.nan
+
+        e = df_calib['resid'].replace([np.inf, -np.inf], np.nan).dropna().values
+
+        if len(e) >= 8 and np.isfinite(e.std()) and e.std() > 0:
+            _, ks_p = stats.kstest(
+                e, lambda x: stats.norm.cdf(x, e.mean(), e.std())
+            )
+        else:
+            ks_p = np.nan
+
+        ci_bound = 1.96 / np.sqrt(len(T_v)) if len(T_v) > 0 else np.nan
+        acf_X    = compute_acf(df_calib['X'].dropna().values, MAX_LAG)
+        acf_e    = (compute_acf(e, MAX_LAG)
+                    if len(e) > 0 else np.full(MAX_LAG + 1, np.nan))
+
+        # ------------------------------------------------------------------- #
+        # PKL export
+        # t_origin stored so OOS scripts can compute:
+        #   t_oos = (oos_date - t_origin).days + 1
+        # and call alatonTmfunc(t_oos, *pkl['popt'])
+        # ------------------------------------------------------------------- #
+        n_gaps = int((~s['is_consecutive']).sum())
+
+        export_model = {
+            'popt'         : popt,       # use for all Tm evaluation
+            'A'            : A,
+            'B'            : B,
+            'C'            : C,
+            'phi'          : phi,
+            'a'            : a_est,
+            'sigma_monthly': sigma_monthly,
+            'df'           : subset_data.copy(),
+            'df_calib'     : df_calib.copy(),
+            'sig1'         : sigma1.to_dict(),
+            'sig2'         : alatsigma2.dropna().to_dict(),
+            'model_name'   : 'Alaton (2002)',
+            'calib_end'    : f'{calib_year}-12-31',
+            't_origin'     : t_origin,   # needed for OOS t computation
+            'n_gaps'       : n_gaps,     # number of non-consecutive pairs excluded
+            'e'            : e,
+            'ks_p'         : ks_p,
+            'acf_X'        : acf_X,
+            'acf_e'        : acf_e,
+            'ci_bound'     : ci_bound,
+            'region_code'  : region,
+        }
+
+        pkl_path = os.path.join(
+            pkl_folder,
+            f'alaton_model_{region}_calib_{calib_year}.pkl',
+        )
+        with open(pkl_path, 'wb') as f:
+            pickle.dump(export_model, f)
+
+        sigma_arr = (np.array(list(sigma_monthly.values()))
+                     if sigma_monthly else np.array([]))
+        summary_rows.append({
+            'region'              : region,
+            'calib_year'          : calib_year,
+            'A'                   : A,
+            'B_C_per_decade'      : B * 365 * 10,
+            'C'                   : C,
+            'phi'                 : phi,
+            'a'                   : a_est,
+            'half_life_days'      : (np.log(2) / a_est
+                                     if pd.notna(a_est) and a_est > 0
+                                     else np.nan),
+            'sigma_min'           : sigma_arr.min() if len(sigma_arr) else np.nan,
+            'sigma_max'           : sigma_arr.max() if len(sigma_arr) else np.nan,
+            'n_gaps'              : n_gaps,
+            'ks_p'                : ks_p,
+            'normal_rejected_5pct': (ks_p < 0.05) if pd.notna(ks_p) else np.nan,
+            'pkl_path'            : pkl_path,
+        })
+
+        popt_row = pd.DataFrame(
+            [[a1_f, a2_f, a3_f, a4_f]], columns=[0, 1, 2, 3]
+        )
+        popt_row[['name', 'calib_year', 'A', 'B', 'C', 'phi', 'a']] = [
+            region, calib_year, A, B, C, phi, a_est
+        ]
+        all_popt_df = pd.concat([all_popt_df, popt_row], axis=0)
+
+        sigma_min = sigma_arr.min() if len(sigma_arr) else np.nan
+        sigma_max = sigma_arr.max() if len(sigma_arr) else np.nan
+        print(
+            f'  {calib_year}: '
+            f'N_calib={len(df_calib):,}  '
+            f'gaps={n_gaps}  '
+            f'a={a_est:.4f}  '
+            f'trend={B * 365 * 10:.3f} C/dec  '
+            f'sigma=[{sigma_min:.3f},{sigma_max:.3f}]  '
+            f'-> {pkl_path}'
+        )
+
+        if calib_year == diag_year:
+            diag_store.append((
+                region, df_calib.copy(),
+                sigma1.to_dict(), sigma_monthly,
+                e, ks_p, acf_X, acf_e, ci_bound,
+            ))
+
+# --------------------------------------------------------------------------- #
+# Save CSVs
+# --------------------------------------------------------------------------- #
+all_popt_df.to_csv(MODEL_DIR / f'alaton_oos_popt_df_{tdy}.csv', index=False)
+pd.DataFrame(summary_rows).to_csv(
+    MODEL_DIR / 'alaton_model_summary.csv', index=False
+)
+
+# --------------------------------------------------------------------------- #
+# Diagnostics figure
+# --------------------------------------------------------------------------- #
+if diag_store:
+    n    = len(diag_store)
+    fig, axes = plt.subplots(4, n, figsize=(3.0 * n, 13))
+    if n == 1:
+        axes = axes.reshape(4, 1)
+    fig.suptitle(
+        f'Alaton (2002) — gap-robust calibration diagnostics ({diag_year})',
+        fontsize=12, fontweight='bold', y=1.005,
+    )
+    lags        = np.arange(MAX_LAG + 1)
+    months      = np.arange(1, 13)
+    month_names = list('JFMAMJJASOND')
+
+    for col, (region, df_calib, sig1_dict, sigma_monthly,
+              e, ks_p, acf_X, acf_e, ci_bound) in enumerate(diag_store):
+
+        ax = axes[0, col]
+        ax.bar(np.arange(12) - 0.16, [sig1_dict.get(m, 0) for m in months],
+               width=0.32, alpha=0.6, label='Est1')
+        ax.bar(np.arange(12) + 0.16, [sigma_monthly.get(m, 0) for m in months],
+               width=0.32, alpha=0.8, label='Mean')
+        ax.set_title(f'R{region}', fontsize=9, fontweight='bold')
+        ax.set_xticks(np.arange(12))
+        ax.set_xticklabels(month_names, fontsize=6)
+        if col == 0:
+            ax.set_ylabel('sigma', fontsize=8)
+            ax.legend(fontsize=5, frameon=False)
+
+        ax = axes[1, col]
+        if len(e) > 0:
+            ax.hist(e, bins=60, density=True, alpha=0.4)
+            xg = np.linspace(np.percentile(e, 0.5), np.percentile(e, 99.5), 300)
+            if np.isfinite(e.std()) and e.std() > 0:
+                ax.plot(xg, stats.norm.pdf(xg, e.mean(), e.std()), lw=1.5)
+        ax.set_yscale('log')
+        ax.set_ylim(1e-4, 2)
+        ax.text(0.97, 0.97,
+                f'KS p={ks_p:.3f}' if pd.notna(ks_p) else 'KS p=nan',
+                transform=ax.transAxes, ha='right', va='top', fontsize=6,
+                bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
+        if col == 0:
+            ax.set_ylabel('Density (log)', fontsize=8)
+
+        ax = axes[2, col]
+        ax.bar(lags[1:], acf_X[1:], width=0.8)
+        if pd.notna(ci_bound):
+            ax.axhline(ci_bound,  ls='--', lw=0.8)
+            ax.axhline(-ci_bound, ls='--', lw=0.8)
+        ax.axhline(0, lw=0.4, color='k')
+        if col == 0:
+            ax.set_ylabel('ACF(X)', fontsize=8)
+
+        ax = axes[3, col]
+        ax.bar(lags[1:], acf_e[1:], width=0.8)
+        if pd.notna(ci_bound):
+            ax.axhline(ci_bound,  ls='--', lw=0.8)
+            ax.axhline(-ci_bound, ls='--', lw=0.8)
+        ax.axhline(0, lw=0.4, color='k')
+        ax.set_xlabel('Lag', fontsize=7)
+        if col == 0:
+            ax.set_ylabel('ACF(e)', fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(
+        MODEL_DIR / 'alaton_model_diagnostics.png',
+        bbox_inches='tight', dpi=150,
+    )
+    plt.close(fig)
+
+print('Time taken', datetime.datetime.now() - start)
+print(f'Wrote PKLs to: {pkl_folder}')

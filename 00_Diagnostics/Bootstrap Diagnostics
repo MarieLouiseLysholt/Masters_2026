@@ -1,0 +1,719 @@
+"""
+bootstrap_diagnostics.py
+-------------------------
+Diagnostic checks for generate_paths.py bootstrap implementation.
+
+Checks:
+  1. Pool diversity      — distinct years contributing per (model, region, month, OOS year)
+  2. Residual centering  — pool mean per (model, region, month) — should be near zero
+  3. Residual stationarity — pool residual mean by year within each month
+                             (drift = model bias changing over time)
+  4. Date contiguity     — gaps in pool date sequence that would corrupt run_length
+  5. Block length sanity — compare realised Marchand mean block vs
+                           expected autocorrelation decay length
+  6. Feb 29 alignment    — check forecast_dates vs actual in leap years
+  7. Non-finite coverage — fraction of residuals that are NaN/inf per model
+
+Outputs:
+  diagnostics_summary.csv   — one row per (model, region, OOS year, month)
+  diagnostics_flags.csv     — rows that triggered a warning
+  plots/diag_*.png          — visualisations
+
+Run from the same directory as generate_paths.py.
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from pathlib import Path
+from scipy import stats as scipy_stats
+
+# ── Config — must match generate_paths.py ────────────────────────────────────
+REGIONS   = [11, 24, 27, 28, 32, 44, 52, 53]
+OOS_YEARS = list(range(2015, 2025))
+MODELS    = [
+    "HBA", "Alaton", "Benth", "ARMA",
+    "XGB", "LSTM", "FeedForwardNN", "KNN", "SVM",
+]
+
+ROOT         = Path(__file__).resolve().parents[1]
+FORECASTS_CSV = ROOT / "04_Analysis" / "01_Forecast Accuracy" / "bk_forecasts.csv"
+OUTPUT_DIR   = Path(__file__).resolve().parent / "bootstrap_diagnostics"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+PLOT_DIR     = OUTPUT_DIR / "plots"
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Warning thresholds
+MIN_DISTINCT_YEARS  = 5     # flag if fewer than this many years in pool for a month
+MAX_ABS_POOL_MEAN   = 0.5   # flag if |pool mean| > this (°C) — centering concern
+MAX_DRIFT_RANGE     = 1.0   # flag if yearly mean range within a month > this (°C)
+MAX_GAP_DAYS        = 1     # flag date gaps larger than this in pool sequence
+AUTOCORR_LAG_TARGET = 5     # expected residual autocorrelation decay (days)
+
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.size": 9,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+})
+
+
+# ============================================================================
+# LOAD DATA
+# ============================================================================
+
+def load_forecasts() -> pd.DataFrame:
+    df = pd.read_csv(FORECASTS_CSV, parse_dates=["date"])
+    df.columns = df.columns.str.lower().str.strip()
+    df = df[df["model"].isin(MODELS)].copy()
+    df["residual"] = df["actual"] - df["forecast"]
+    df["month"]    = df["date"].dt.month
+    df["year"]     = df["date"].dt.year
+    df["day"]      = df["date"].dt.day
+    feb29 = (df["month"] == 2) & (df["day"] == 29)
+    df = df[~feb29].copy()
+    print(f"Loaded {len(df):,} rows  |  "
+          f"models: {sorted(df['model'].unique())}")
+    return df
+
+
+# ============================================================================
+# CHECK 1 — POOL DIVERSITY
+# ============================================================================
+
+def check_pool_diversity(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each (model, region, OOS year, month), count how many distinct
+    prior years contribute residuals to the pool.
+    Flag if below MIN_DISTINCT_YEARS.
+    """
+    rows = []
+    for model in MODELS:
+        for region in REGIONS:
+            sub = df[(df["model"] == model) & (df["region"] == region)]
+            if sub.empty:
+                continue
+            for oos_year in OOS_YEARS:
+                pool = sub[
+                    (sub["year"] < oos_year) &
+                    np.isfinite(sub["residual"])
+                ]
+                for month in range(1, 13):
+                    m_pool = pool[pool["month"] == month]
+                    distinct_years = m_pool["year"].nunique()
+                    n_residuals    = len(m_pool)
+                    rows.append({
+                        "model"         : model,
+                        "region"        : region,
+                        "oos_year"      : oos_year,
+                        "month"         : month,
+                        "distinct_years": distinct_years,
+                        "n_residuals"   : n_residuals,
+                        "flag_thin_pool": distinct_years < MIN_DISTINCT_YEARS,
+                    })
+    return pd.DataFrame(rows)
+
+
+# ============================================================================
+# CHECK 2 — RESIDUAL CENTERING
+# ============================================================================
+
+def check_residual_centering(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each (model, region, month), compute the mean residual across
+    ALL prior years pooled. This is what gets added to every bootstrap
+    path — if it is non-zero the paths are biased.
+    """
+    rows = []
+    for model in MODELS:
+        for region in REGIONS:
+            sub = df[(df["model"] == model) & (df["region"] == region)]
+            if sub.empty:
+                continue
+            finite = sub[np.isfinite(sub["residual"])]
+            for month in range(1, 13):
+                m = finite[finite["month"] == month]["residual"]
+                if len(m) == 0:
+                    continue
+                pool_mean = float(m.mean())
+                pool_std  = float(m.std())
+                rows.append({
+                    "model"            : model,
+                    "region"           : region,
+                    "month"            : month,
+                    "pool_mean"        : round(pool_mean, 4),
+                    "pool_std"         : round(pool_std,  4),
+                    "flag_large_bias"  : abs(pool_mean) > MAX_ABS_POOL_MEAN,
+                })
+    return pd.DataFrame(rows)
+
+
+# ============================================================================
+# CHECK 3 — RESIDUAL STATIONARITY (drift across years)
+# ============================================================================
+
+def check_stationarity(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each (model, region, month), compute mean residual per year.
+    A large range across years indicates non-stationarity — model
+    bias is changing over time, violating the exchangeability assumption.
+    Also runs a Kruskal-Wallis test across years for each month.
+    """
+    rows = []
+    for model in MODELS:
+        for region in REGIONS:
+            sub = df[(df["model"] == model) & (df["region"] == region)]
+            if sub.empty:
+                continue
+            finite = sub[np.isfinite(sub["residual"])]
+            for month in range(1, 13):
+                m = finite[finite["month"] == month]
+                if m["year"].nunique() < 3:
+                    continue
+                yearly_means = m.groupby("year")["residual"].mean()
+                drift_range  = float(yearly_means.max() - yearly_means.min())
+
+                # Kruskal-Wallis across years
+                groups = [
+                    grp["residual"].values
+                    for _, grp in m.groupby("year")
+                    if len(grp) >= 3
+                ]
+                if len(groups) >= 2:
+                    try:
+                        _, kw_p = scipy_stats.kruskal(*groups)
+                    except Exception:
+                        kw_p = np.nan
+                else:
+                    kw_p = np.nan
+
+                rows.append({
+                    "model"          : model,
+                    "region"         : region,
+                    "month"          : month,
+                    "drift_range_C"  : round(drift_range, 4),
+                    "kruskal_p"      : round(kw_p, 4) if np.isfinite(kw_p) else np.nan,
+                    "flag_drift"     : drift_range > MAX_DRIFT_RANGE,
+                    "flag_kw"        : (np.isfinite(kw_p) and kw_p < 0.05),
+                })
+    return pd.DataFrame(rows)
+
+
+# ============================================================================
+# CHECK 4 — DATE CONTIGUITY IN POOL
+# ============================================================================
+
+def check_date_contiguity(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each (model, region), check whether the pool date sequence
+    has gaps larger than MAX_GAP_DAYS. Gaps corrupt run_length
+    because the precomputation assumes consecutive indices are
+    consecutive calendar days.
+    """
+    rows = []
+    for model in MODELS:
+        for region in REGIONS:
+            sub = (
+                df[(df["model"] == model) & (df["region"] == region)]
+                .sort_values("date")
+            )
+            if sub.empty:
+                continue
+            dates  = pd.DatetimeIndex(sub["date"].values)
+            diffs  = (dates[1:] - dates[:-1]).days
+            max_gap   = int(diffs.max()) if len(diffs) > 0 else 0
+            n_gaps    = int((diffs > MAX_GAP_DAYS).sum())
+            gap_dates = dates[1:][diffs > MAX_GAP_DAYS].tolist()
+            rows.append({
+                "model"      : model,
+                "region"     : region,
+                "max_gap_days": max_gap,
+                "n_gaps"     : n_gaps,
+                "gap_dates"  : str(gap_dates[:5]) if gap_dates else "none",
+                "flag_gap"   : n_gaps > 0,
+            })
+    return pd.DataFrame(rows)
+
+
+# ============================================================================
+# CHECK 5 — BLOCK LENGTH VS AUTOCORRELATION DECAY
+# ============================================================================
+
+def check_autocorrelation(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each (model, region), estimate the lag at which residual
+    autocorrelation first drops below 0.1 (approximate decorrelation
+    scale). Compare with expected Marchand mean block length (~11.8d).
+    A mismatch suggests blocks are longer than the autocorrelation
+    structure justifies, producing overly narrow bootstrap bands.
+    """
+    rows = []
+    for model in MODELS:
+        for region in REGIONS:
+            sub = (
+                df[(df["model"] == model) & (df["region"] == region)]
+                .sort_values("date")
+            )
+            if sub.empty:
+                continue
+            resid = sub["residual"].values.astype(float)
+            finite = resid[np.isfinite(resid)]
+            if len(finite) < 50:
+                continue
+
+            # Compute autocorrelation up to lag 30
+            acf_vals = []
+            mean = finite.mean()
+            var  = np.var(finite)
+            if var < 1e-10:
+                continue
+            centered = finite - mean
+            for lag in range(1, 31):
+                if len(centered) <= lag:
+                    break
+                acf = float(np.mean(centered[lag:] * centered[:-lag]) / var)
+                acf_vals.append(acf)
+
+            # Find first lag where ACF drops below 0.1
+            decay_lag = next(
+                (i + 1 for i, a in enumerate(acf_vals) if abs(a) < 0.1),
+                30
+            )
+
+            rows.append({
+                "model"      : model,
+                "region"     : region,
+                "acf_decay_lag": decay_lag,
+                "acf_lag1"   : round(acf_vals[0], 3) if acf_vals else np.nan,
+                "acf_lag5"   : round(acf_vals[4], 3) if len(acf_vals) >= 5 else np.nan,
+                "acf_lag10"  : round(acf_vals[9], 3) if len(acf_vals) >= 10 else np.nan,
+                "flag_long_block": decay_lag < 5,
+            })
+    return pd.DataFrame(rows)
+
+
+# ============================================================================
+# CHECK 6 — NON-FINITE COVERAGE
+# ============================================================================
+
+def check_nonfinite(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fraction of residuals that are NaN or inf per (model, region).
+    High fractions indicate PKL issues upstream.
+    """
+    rows = []
+    for model in MODELS:
+        for region in REGIONS:
+            sub = df[(df["model"] == model) & (df["region"] == region)]
+            if sub.empty:
+                continue
+            n_total   = len(sub)
+            n_nonfinite = int((~np.isfinite(sub["residual"])).sum())
+            rows.append({
+                "model"          : model,
+                "region"         : region,
+                "n_total"        : n_total,
+                "n_nonfinite"    : n_nonfinite,
+                "pct_nonfinite"  : round(100 * n_nonfinite / n_total, 2),
+                "flag_high_nan"  : n_nonfinite / n_total > 0.05,
+            })
+    return pd.DataFrame(rows)
+
+
+# ============================================================================
+# PLOTS
+# ============================================================================
+
+def plot_residual_centering(df_centering: pd.DataFrame) -> None:
+    """Heatmap of pool mean residual by model × month."""
+    month_names = ["Jan","Feb","Mar","Apr","May","Jun",
+                   "Jul","Aug","Sep","Oct","Nov","Dec"]
+
+    for region in REGIONS:
+        sub = df_centering[df_centering["region"] == region]
+        if sub.empty:
+            continue
+
+        pivot = sub.pivot_table(
+            index="model", columns="month", values="pool_mean"
+        )
+        pivot.columns = month_names[:len(pivot.columns)]
+
+        fig, ax = plt.subplots(figsize=(13, max(3, len(MODELS) * 0.5)))
+        im = ax.imshow(pivot.values, aspect="auto", cmap="RdBu_r",
+                       vmin=-1.5, vmax=1.5)
+        plt.colorbar(im, ax=ax, label="Pool mean residual (°C)")
+        ax.set_xticks(range(len(pivot.columns)))
+        ax.set_xticklabels(pivot.columns, fontsize=8)
+        ax.set_yticks(range(len(pivot.index)))
+        ax.set_yticklabels(pivot.index, fontsize=8)
+        ax.set_title(
+            f"Pool mean residual (°C) — Region {region}\n"
+            f"Values near 0 = no centering issue  |  "
+            f"Red/blue = bootstrap paths are biased",
+            fontsize=9
+        )
+
+        # Annotate cells
+        for i in range(len(pivot.index)):
+            for j in range(len(pivot.columns)):
+                val = pivot.values[i, j]
+                if np.isfinite(val):
+                    ax.text(j, i, f"{val:.2f}", ha="center", va="center",
+                            fontsize=6,
+                            color="white" if abs(val) > 0.8 else "black")
+
+        plt.tight_layout()
+        fig.savefig(PLOT_DIR / f"diag_centering_region{region}.png",
+                    dpi=150, bbox_inches="tight")
+        plt.close()
+
+
+def plot_stationarity(df: pd.DataFrame, region: int) -> None:
+    """
+    For one region, show residual yearly mean by month for each model.
+    """
+    sub = df[(df["region"] == region) & np.isfinite(df["residual"])]
+    if sub.empty:
+        return
+
+    models_present = [m for m in MODELS if m in sub["model"].unique()]
+    n = len(models_present)
+    fig, axes = plt.subplots(
+        (n + 1) // 2, 2,
+        figsize=(13, max(4, n * 1.8)),
+        sharey=False
+    )
+    axes = np.atleast_1d(axes).flatten()
+
+    month_names = ["Jan","Feb","Mar","Apr","May","Jun",
+                   "Jul","Aug","Sep","Oct","Nov","Dec"]
+
+    for i, model in enumerate(models_present):
+        ax = axes[i]
+        m_sub = sub[sub["model"] == model]
+        pivot = m_sub.groupby(["year", "month"])["residual"].mean().unstack()
+        for month in range(1, 13):
+            if month not in pivot.columns:
+                continue
+            vals = pivot[month].dropna()
+            ax.plot(vals.index, vals.values, lw=0.8, alpha=0.7,
+                    label=month_names[month - 1])
+        ax.axhline(0, color="black", lw=0.7, linestyle="--")
+        ax.set_title(model, fontsize=9)
+        ax.set_xlabel("Year", fontsize=7)
+        ax.set_ylabel("Mean residual (°C)", fontsize=7)
+        ax.tick_params(labelsize=7)
+
+    for j in range(len(models_present), len(axes)):
+        axes[j].set_visible(False)
+
+    # Shared legend
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower right", ncol=6,
+               fontsize=7, title="Month")
+    fig.suptitle(
+        f"Residual stationarity — Region {region}\n"
+        f"Yearly mean residual per month per model. "
+        f"Drift = non-stationarity = exchangeability violation.",
+        fontsize=9
+    )
+    plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+    fig.savefig(PLOT_DIR / f"diag_stationarity_region{region}.png",
+                dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def plot_autocorrelation(df_acf: pd.DataFrame, df_raw: pd.DataFrame) -> None:
+    """ACF of residuals for each model, first region only for brevity."""
+    region = REGIONS[0]
+    models_present = [m for m in MODELS
+                      if m in df_acf[df_acf["region"] == region]["model"].values]
+
+    n = len(models_present)
+    fig, axes = plt.subplots(
+        (n + 1) // 2, 2,
+        figsize=(13, max(4, n * 1.8))
+    )
+    axes = np.atleast_1d(axes).flatten()
+
+    for i, model in enumerate(models_present):
+        ax = axes[i]
+        sub = (
+            df_raw[(df_raw["model"] == model) &
+                   (df_raw["region"] == region)]
+            .sort_values("date")
+        )
+        resid = sub["residual"].values.astype(float)
+        finite = resid[np.isfinite(resid)]
+
+        mean     = finite.mean()
+        var      = np.var(finite)
+        centered = finite - mean
+        lags     = range(1, 31)
+        acf_vals = []
+        for lag in lags:
+            if len(centered) <= lag:
+                acf_vals.append(np.nan)
+            else:
+                acf_vals.append(
+                    float(np.mean(centered[lag:] * centered[:-lag]) / var)
+                )
+
+        ax.bar(list(lags), acf_vals, color="steelblue", alpha=0.7, width=0.8)
+        ax.axhline(0,   color="black", lw=0.7)
+        ax.axhline(0.1, color="red",   lw=0.8, linestyle="--",
+                   label="0.1 threshold")
+        ax.axhline(-0.1, color="red",  lw=0.8, linestyle="--")
+
+        # Confidence bands (±1.96/√n)
+        n_fin = len(finite)
+        ci = 1.96 / np.sqrt(n_fin)
+        ax.axhline(ci,  color="grey", lw=0.6, linestyle=":")
+        ax.axhline(-ci, color="grey", lw=0.6, linestyle=":")
+
+        row = df_acf[(df_acf["model"] == model) &
+                     (df_acf["region"] == region)]
+        decay = int(row["acf_decay_lag"].values[0]) if len(row) else "?"
+        ax.set_title(f"{model}  (decay lag ≈ {decay}d)", fontsize=9)
+        ax.set_xlabel("Lag (days)", fontsize=7)
+        ax.set_ylabel("ACF", fontsize=7)
+        ax.tick_params(labelsize=7)
+        ax.legend(fontsize=6)
+
+    for j in range(len(models_present), len(axes)):
+        axes[j].set_visible(False)
+
+    fig.suptitle(
+        f"Residual autocorrelation — Region {region}\n"
+        f"Marchand mean block ≈ 11.8d. "
+        f"If ACF decays before lag 5 but blocks average 12d, "
+        f"bootstrap bands will be too narrow.",
+        fontsize=9
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.savefig(PLOT_DIR / f"diag_acf_region{region}.png",
+                dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def plot_pool_diversity(df_diversity: pd.DataFrame) -> None:
+    """
+    For each model, heatmap of distinct pool years by OOS year × month.
+    Shows where the pool is thin.
+    """
+    month_names = ["Jan","Feb","Mar","Apr","May","Jun",
+                   "Jul","Aug","Sep","Oct","Nov","Dec"]
+
+    for model in MODELS:
+        sub = df_diversity[df_diversity["model"] == model]
+        if sub.empty:
+            continue
+
+        # Average across regions for the heatmap
+        pivot = sub.groupby(["oos_year", "month"])["distinct_years"].mean().unstack()
+        pivot.columns = month_names[:len(pivot.columns)]
+
+        fig, ax = plt.subplots(figsize=(13, 5))
+        im = ax.imshow(pivot.values, aspect="auto", cmap="YlOrRd_r",
+                       vmin=0, vmax=14)
+        plt.colorbar(im, ax=ax, label="Distinct pool years (avg across regions)")
+        ax.set_xticks(range(len(pivot.columns)))
+        ax.set_xticklabels(pivot.columns, fontsize=8)
+        ax.set_yticks(range(len(pivot.index)))
+        ax.set_yticklabels(pivot.index.astype(int), fontsize=8)
+        ax.set_title(
+            f"Pool diversity — {model}\n"
+            f"Number of distinct years contributing residuals. "
+            f"Red = thin pool (< {MIN_DISTINCT_YEARS} years).",
+            fontsize=9
+        )
+
+        # Annotate
+        for i in range(len(pivot.index)):
+            for j in range(len(pivot.columns)):
+                val = pivot.values[i, j]
+                if np.isfinite(val):
+                    ax.text(j, i, f"{val:.0f}", ha="center", va="center",
+                            fontsize=7,
+                            color="white" if val < 3 else "black")
+
+        plt.tight_layout()
+        fig.savefig(PLOT_DIR / f"diag_diversity_{model}.png",
+                    dpi=150, bbox_inches="tight")
+        plt.close()
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    print("=" * 65)
+    print("Bootstrap Diagnostics")
+    print("=" * 65)
+
+    df = load_forecasts()
+
+    # ── Check 1: Pool diversity ───────────────────────────────────────────────
+    print("\n[1/6] Pool diversity ...")
+    df_diversity = check_pool_diversity(df)
+    thin = df_diversity[df_diversity["flag_thin_pool"]]
+    print(f"  Thin pool flags : {len(thin):,} / {len(df_diversity):,} "
+          f"({100*len(thin)/len(df_diversity):.1f}%)")
+    if len(thin):
+        worst = (thin.groupby(["model", "oos_year"])["month"]
+                 .count().sort_values(ascending=False).head(10))
+        print(f"  Worst cases (model, OOS year, #thin months):")
+        for (m, y), cnt in worst.items():
+            print(f"    {m}  {y}  →  {cnt} months with "
+                  f"< {MIN_DISTINCT_YEARS} distinct years")
+
+    # ── Check 2: Residual centering ───────────────────────────────────────────
+    print("\n[2/6] Residual centering ...")
+    df_centering = check_residual_centering(df)
+    biased = df_centering[df_centering["flag_large_bias"]]
+    print(f"  Large bias flags: {len(biased):,} / {len(df_centering):,}")
+    if len(biased):
+        worst = (biased.sort_values("pool_mean", key=abs, ascending=False)
+                 .head(10)[["model", "region", "month", "pool_mean"]])
+        print("  Largest biases:")
+        print(worst.to_string(index=False))
+
+    # ── Check 3: Stationarity ─────────────────────────────────────────────────
+    print("\n[3/6] Residual stationarity ...")
+    df_stat = check_stationarity(df)
+    drifting = df_stat[df_stat["flag_drift"] | df_stat["flag_kw"]]
+    print(f"  Stationarity flags: {len(drifting):,} / {len(df_stat):,}")
+    if len(drifting):
+        worst = (drifting.sort_values("drift_range_C", ascending=False)
+                 .head(10)[["model", "region", "month",
+                             "drift_range_C", "kruskal_p"]])
+        print("  Largest drifts:")
+        print(worst.to_string(index=False))
+
+    # ── Check 4: Date contiguity ──────────────────────────────────────────────
+    print("\n[4/6] Date contiguity in pool ...")
+    df_gaps = check_date_contiguity(df)
+    gapped = df_gaps[df_gaps["flag_gap"]]
+    print(f"  Gap flags: {len(gapped):,} / {len(df_gaps):,}")
+    if len(gapped):
+        print(gapped[["model", "region", "n_gaps",
+                       "max_gap_days", "gap_dates"]].to_string(index=False))
+
+    # ── Check 5: Autocorrelation ──────────────────────────────────────────────
+    print("\n[5/6] Residual autocorrelation ...")
+    df_acf = check_autocorrelation(df)
+    print(f"  ACF decay summary (lag where |ACF| < 0.1):")
+    summary = (df_acf.groupby("model")["acf_decay_lag"]
+               .agg(["mean", "min", "max"])
+               .round(1))
+    print(summary.to_string())
+    fast_decay = df_acf[df_acf["flag_long_block"]]
+    if len(fast_decay):
+        print(f"\n  Models with fast ACF decay (< lag 5) — "
+              f"mean block of ~11.8d may over-preserve autocorrelation:")
+        print(fast_decay[["model", "region",
+                           "acf_decay_lag", "acf_lag1",
+                           "acf_lag5"]].to_string(index=False))
+
+    # ── Check 6: Non-finite ───────────────────────────────────────────────────
+    print("\n[6/6] Non-finite residuals ...")
+    df_nan = check_nonfinite(df)
+    high_nan = df_nan[df_nan["flag_high_nan"]]
+    print(f"  High NaN flags: {len(high_nan):,} / {len(df_nan):,}")
+    if len(high_nan):
+        print(high_nan[["model", "region",
+                         "n_nonfinite", "pct_nonfinite"]].to_string(
+            index=False))
+    else:
+        print("  No model-region combinations exceed 5% non-finite.")
+
+    # ── Plots ─────────────────────────────────────────────────────────────────
+    print("\nGenerating plots ...")
+    plot_residual_centering(df_centering)
+    for region in REGIONS:
+        plot_stationarity(df, region)
+    plot_autocorrelation(df_acf, df)
+    plot_pool_diversity(df_diversity)
+    print(f"  Plots saved → {PLOT_DIR}")
+
+    # ── Save CSVs ─────────────────────────────────────────────────────────────
+    df_diversity.to_csv(OUTPUT_DIR / "diag_pool_diversity.csv", index=False)
+    df_centering.to_csv(OUTPUT_DIR / "diag_centering.csv",      index=False)
+    df_stat.to_csv(     OUTPUT_DIR / "diag_stationarity.csv",   index=False)
+    df_gaps.to_csv(     OUTPUT_DIR / "diag_contiguity.csv",     index=False)
+    df_acf.to_csv(      OUTPUT_DIR / "diag_acf.csv",            index=False)
+    df_nan.to_csv(      OUTPUT_DIR / "diag_nonfinite.csv",      index=False)
+
+    # ── Combined flags ────────────────────────────────────────────────────────
+    flags = []
+    for _, r in df_centering[df_centering["flag_large_bias"]].iterrows():
+        flags.append({
+            "check": "centering",
+            "model": r.model, "region": r.region,
+            "detail": f"month={r.month}  pool_mean={r.pool_mean:.3f}°C"
+        })
+    for _, r in df_stat[df_stat["flag_drift"]].iterrows():
+        flags.append({
+            "check": "stationarity_drift",
+            "model": r.model, "region": r.region,
+            "detail": f"month={r.month}  drift_range={r.drift_range_C:.3f}°C"
+        })
+    for _, r in df_stat[df_stat["flag_kw"]].iterrows():
+        flags.append({
+            "check": "stationarity_kw",
+            "model": r.model, "region": r.region,
+            "detail": f"month={r.month}  kruskal_p={r.kruskal_p:.4f}"
+        })
+    for _, r in df_gaps[df_gaps["flag_gap"]].iterrows():
+        flags.append({
+            "check": "date_gap",
+            "model": r.model, "region": r.region,
+            "detail": f"n_gaps={r.n_gaps}  max_gap={r.max_gap_days}d"
+        })
+    for _, r in df_nan[df_nan["flag_high_nan"]].iterrows():
+        flags.append({
+            "check": "nonfinite",
+            "model": r.model, "region": r.region,
+            "detail": f"pct_nonfinite={r.pct_nonfinite:.1f}%"
+        })
+
+    pd.DataFrame(flags).to_csv(
+        OUTPUT_DIR / "diag_all_flags.csv", index=False
+    )
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print("\n" + "=" * 65)
+    print("DIAGNOSTIC SUMMARY")
+    print("=" * 65)
+    print(f"  Pool diversity flags  : {len(thin):>5,}  "
+          f"(OOS years 2015-2019 will have thin pools — expected)")
+    print(f"  Centering flags       : {len(biased):>5,}  "
+          f"(|pool mean| > {MAX_ABS_POOL_MEAN}°C — bootstrap bias)")
+    print(f"  Stationarity flags    : {len(drifting):>5,}  "
+          f"(drift > {MAX_DRIFT_RANGE}°C or Kruskal-Wallis p < 0.05)")
+    print(f"  Date gap flags        : {len(gapped):>5,}  "
+          f"(gaps corrupt run_length)")
+    print(f"  Non-finite flags      : {len(high_nan):>5,}  "
+          f"(> 5% NaN — upstream PKL issue)")
+    print(f"\n  All flags saved → {OUTPUT_DIR / 'diag_all_flags.csv'}")
+    print(f"  All CSVs saved  → {OUTPUT_DIR}")
+    print(f"  All plots saved → {PLOT_DIR}")
+    print()
+
+    return {
+        "diversity"   : df_diversity,
+        "centering"   : df_centering,
+        "stationarity": df_stat,
+        "contiguity"  : df_gaps,
+        "acf"         : df_acf,
+        "nonfinite"   : df_nan,
+        "flags"       : pd.DataFrame(flags),
+    }
+
+
+if __name__ == "__main__":
+    results = main()

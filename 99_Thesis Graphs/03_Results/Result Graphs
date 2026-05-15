@@ -1,0 +1,1720 @@
+"""
+thesis_figures.py
+=================
+B&W publication figures for weather derivative hedging thesis.
+Times New Roman, no titles, PNG output only.
+
+Aligned to updated hedging_effectiveness.py:
+  - Additive detrending (Möllmann et al. 2019)
+  - Fixed quadratic levels yield model (no AIC, no log)
+  - Contract (index, window) fixed ONCE per region on pre-OOS data
+  - TICK = 20 EUR
+  - Johnson (1960) OLS minimum-variance hedge ratio
+  - Common historical burn premium
+
+Column names in he_results_raw.csv
+-----------------------------------
+  model, region, oos_year, best_index, win_label, win_corr, instrument,
+  K, TTM, yield_r2, V, V_model, act_idx, act_pay, mean_rev_sim,
+  N_star, act_rev_u, act_rev_h, delta_rev, helped
+
+Figures
+-------
+  Hedging effectiveness
+    fig0  -- Contract selection table (index, window, rho per region)
+    fig1  -- ΔRev strip plot by model
+    fig2  -- ΔRev strip plot by region
+    fig2b -- ΔRev strip plot by year
+    fig3  -- Summary table (bare numbers)
+    fig4  -- Robustness bar chart
+    fig5  -- N* strip plot by model
+    fig6  -- Pooled ΔRev histogram
+    fig7  -- Regional ΔRev horizontal bar
+    fig8  -- Year × model ΔRev heatmap
+
+  Pricing
+    figp1 -- Pricing error strip plot by model
+    figp2 -- Model price vs realised payoff (small multiples)
+    figp3 -- Pricing error strip plot by year
+    figp4 -- Pricing error strip plot by index type
+    figp5 -- Pricing error strip plot by region
+
+  Bare numbers table
+    tab1  -- Key statistics table (all models)
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from pathlib import Path
+from scipy import stats as sp_stats
+
+# =============================================================================
+# PATHS
+# =============================================================================
+
+ROOT             = Path(__file__).resolve().parents[2]
+HEDGING_DIR      = ROOT / "04_Analysis" / "04_Hedging Effectiveness" / "outputs"
+PRICING_DIR      = ROOT / "04_Analysis" / "04_Pricing Accuracy"
+PLOT_DIR         = Path(__file__).resolve().parent
+HEDGING_PLOT_DIR = PLOT_DIR / "hedging"
+PRICING_PLOT_DIR = PLOT_DIR / "pricing"
+HEDGING_PLOT_DIR.mkdir(parents=True, exist_ok=True)
+PRICING_PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+RAW_CSV      = HEDGING_DIR / "he_results_raw.csv"
+SUMMARY_CSV  = HEDGING_DIR / "he_summary.csv"
+REGION_CSV   = HEDGING_DIR / "he_by_region.csv"
+PRICING_CSV  = PRICING_DIR / "pricing_results.csv"
+ROB_CSV      = HEDGING_DIR / "robustness_results.csv"
+
+MODELS = ["HBA", "Alaton", "Benth", "XGB", "WaveletFNN", "LSTM", "FeedForwardNN"]
+
+MODEL_LABELS = {
+    "HBA": "Naïve",
+}
+
+def _model_label(model):
+    return MODEL_LABELS.get(model, model)
+
+REGION_LABELS = {
+    11: "Île-de-France",
+    24: "Centre-Val de Loire",
+    27: "Bourgogne-FC",
+    28: "Normandie",
+    32: "Hauts-de-France",
+    44: "Grand Est",
+    52: "Pays de la Loire",
+    53: "Bretagne",
+}
+
+# =============================================================================
+# STYLE
+# =============================================================================
+
+plt.rcParams.update({
+    "font.family":       "serif",
+    "font.serif":        ["Times New Roman", "DejaVu Serif"],
+    "font.size":         10,
+    "axes.labelsize":    10,
+    "xtick.labelsize":   9,
+    "ytick.labelsize":   9,
+    "legend.fontsize":   9,
+    "legend.frameon":    True,
+    "legend.framealpha": 0.9,
+    "legend.edgecolor":  "black",
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+    "axes.linewidth":    0.8,
+    "axes.grid":         False,
+    "figure.dpi":        300,
+    "savefig.dpi":       300,
+    "savefig.facecolor": "white",
+})
+
+GREY       = "#d9d9d9"
+DOT_COLOR  = "#333333"
+MEAN_COLOR = "black"
+
+
+def _stars(p):
+    if pd.isna(p): return ""
+    if p < 0.01:   return "***"
+    if p < 0.05:   return "**"
+    if p < 0.10:   return "*"
+    return ""
+
+
+def _save(fig, name):
+    if name.startswith(("figp", "tab2", "tabp")):
+        path = PRICING_PLOT_DIR / name
+    else:
+        path = HEDGING_PLOT_DIR / name
+    fig.savefig(path, dpi=300, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"  Saved: {path.parent.name}/{path.name}")
+
+
+def _strip(ax, pos, values, jitter=0.12, dot_size=18, alpha=0.55):
+    """Jittered strip of observations + mean ± 95% CI diamond."""
+    n = len(values)
+    if n == 0:
+        return
+    np.random.seed(42)
+    x = np.random.uniform(pos - jitter, pos + jitter, size=n)
+    ax.scatter(x, values, s=dot_size, color=DOT_COLOR,
+               alpha=alpha if n >= 10 else 0.85,
+               linewidths=0, zorder=3)
+    mean_v = np.mean(values)
+    if n >= 5:
+        sd = np.std(values, ddof=1)
+        ax.plot([pos, pos], [mean_v - sd, mean_v + sd],
+                color="#cc0000", lw=2.5, zorder=5, solid_capstyle="butt")
+        # Cap ticks at SD endpoints
+        cap_w = jitter * 0.6
+        ax.plot([pos - cap_w, pos + cap_w], [mean_v - sd, mean_v - sd],
+                color="#cc0000", lw=1.8, zorder=5)
+        ax.plot([pos - cap_w, pos + cap_w], [mean_v + sd, mean_v + sd],
+                color="#cc0000", lw=1.8, zorder=5)
+    ax.scatter(pos, mean_v, s=80, color="white",
+               marker="D", zorder=6, linewidths=1.2,
+               edgecolors="black")
+
+
+H1_COLOR = "#2563eb"   # blue for H1 (Jan-Mar)
+H2_COLOR = "#16a34a"   # green for H2 (Apr-Jun)
+
+
+def _strip_horizon(ax, pos, values, horizons, jitter=0.12, dot_size=18, alpha=0.60):
+    """
+    Jittered strip where marker shape AND colour encode horizon:
+      H1 -> circle (o), dark grey
+      H2 -> triangle (^), mid grey
+    Mean ± 1 SD whisker in red on top.
+    """
+    n = len(values)
+    if n == 0:
+        return
+    np.random.seed(42)
+    x = np.random.uniform(pos - jitter, pos + jitter, size=n)
+
+    for marker, mask_val, col in [("o", "H1", H1_COLOR), ("^", "H2", H2_COLOR)]:
+        mask = np.array([h == mask_val for h in horizons])
+        if mask.any():
+            ax.scatter(x[mask], values[mask],
+                       s=dot_size, marker=marker, color=col,
+                       alpha=alpha if n >= 10 else 0.85,
+                       linewidths=0, zorder=3)
+
+    mean_v = np.mean(values)
+    if n >= 5:
+        sd    = np.std(values, ddof=1)
+        cap_w = jitter * 0.6
+        ax.plot([pos, pos], [mean_v - sd, mean_v + sd],
+                color="#cc0000", lw=2.5, zorder=5, solid_capstyle="butt")
+        ax.plot([pos - cap_w, pos + cap_w], [mean_v - sd, mean_v - sd],
+                color="#cc0000", lw=1.8, zorder=5)
+        ax.plot([pos - cap_w, pos + cap_w], [mean_v + sd, mean_v + sd],
+                color="#cc0000", lw=1.8, zorder=5)
+    ax.scatter(pos, mean_v, s=80, color="white",
+               marker="D", zorder=6, linewidths=1.2, edgecolors="black")
+
+
+def _strip_axis_horizon(ax, groups, data_list, horizon_list,
+                        ylabel, xlabel, zero_line=True, jitter=0.12):
+    """Like _strip_axis but passes horizon arrays to _strip_horizon."""
+    for i, (vals, horizons) in enumerate(zip(data_list, horizon_list), 1):
+        _strip_horizon(ax, i, vals, horizons, jitter=jitter)
+    if zero_line:
+        ax.axhline(0, color="black", lw=1.0, ls="--", alpha=0.6)
+    ax.set_xticks(range(1, len(groups) + 1))
+    ax.set_xticklabels(
+        groups,
+        rotation=30 if max(len(g) for g in groups) > 6 else 0,
+        ha="right" if max(len(g) for g in groups) > 6 else "center",
+    )
+    ax.set_ylabel(ylabel)
+    ax.set_xlabel(xlabel)
+    from matplotlib.lines import Line2D
+    ax.legend(handles=[
+        Line2D([0], [0], marker="o", color="w", markerfacecolor=H1_COLOR,
+               markersize=5, alpha=0.85, label="H1 (Jan–Mar)"),
+        Line2D([0], [0], marker="^", color="w", markerfacecolor=H2_COLOR,
+               markersize=5, alpha=0.85, label="H2 (Apr–Jun)"),
+        Line2D([0], [0], marker="D", color="#cc0000", markerfacecolor="white",
+               markeredgecolor="black", markeredgewidth=1.2,
+               markersize=6, label="Mean ± 1 SD"),
+    ], loc="upper right", frameon=True, fontsize=8)
+
+
+def _strip_axis(ax, groups, data_list, ylabel, xlabel,
+                zero_line=True, jitter=0.12):
+    for i, vals in enumerate(data_list, 1):
+        _strip(ax, i, vals, jitter=jitter)
+    if zero_line:
+        ax.axhline(0, color="black", lw=1.0, ls="--", alpha=0.6)
+    ax.set_xticks(range(1, len(groups) + 1))
+    ax.set_xticklabels(
+        groups,
+        rotation=30 if max(len(g) for g in groups) > 6 else 0,
+        ha="right" if max(len(g) for g in groups) > 6 else "center",
+    )
+    ax.set_ylabel(ylabel)
+    ax.set_xlabel(xlabel)
+    from matplotlib.lines import Line2D
+    ax.legend(handles=[
+        Line2D([0], [0], marker="o", color="w", markerfacecolor=DOT_COLOR,
+               markersize=5, alpha=0.7, label="Observation"),
+        Line2D([0], [0], marker="D", color="#cc0000", markerfacecolor="white", markeredgecolor="black", markeredgewidth=1.2,
+               markersize=6, label="Mean ± 1 SD"),
+    ], loc="upper right", frameon=True, fontsize=8)
+
+
+# =============================================================================
+# FIG 0 -- Contract selection table (fixed per region, pre-OOS data)
+# =============================================================================
+
+def fig0_contract_selection(df):
+    """
+    Summary table: for each region, show the contract selected on pre-OOS
+    data. Because the contract is fixed per region (not per year), we take
+    the mode across models for each region to show the most common selection.
+    Also shows mean |Spearman rho| and mean R² across models.
+    """
+    regions = sorted(df["region"].unique())
+    rows    = []
+
+    for r in regions:
+        sub = df[df["region"] == r]
+        # Mode of index type and window label across all model-year obs
+        idx_mode = sub["best_index"].mode().iloc[0]
+        win_mode = sub["win_label"].mode().iloc[0]
+        instr    = sub["instrument"].mode().iloc[0]
+        mean_rho = float(sub["win_corr"].mean())
+        mean_r2  = float(sub["yield_r2"].mean())
+        rows.append([
+            REGION_LABELS.get(r, str(r)),
+            idx_mode,
+            win_mode,
+            instr.capitalize(),
+            f"{mean_rho:+.3f}",
+            f"{mean_r2:.3f}",
+        ])
+
+    col_labels = ["Region", "Index", "Window",
+                  "Instrument", r"Spearman $\rho$", r"$R^2$"]
+    n_r = len(rows)
+    n_c = len(col_labels)
+
+    fig, ax = plt.subplots(figsize=(11, 0.48 * n_r + 1.2))
+    ax.set_axis_off()
+
+    tbl = ax.table(
+        cellText=[r[1:] for r in rows],
+        rowLabels=[r[0] for r in rows],
+        colLabels=col_labels[1:],
+        loc="center",
+        cellLoc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9.5)
+    tbl.scale(1.0, 1.7)
+
+    for j in range(n_c - 1):
+        c = tbl[0, j]
+        c.set_facecolor("black")
+        c.set_text_props(color="white", fontweight="bold")
+        c.set_edgecolor("white")
+
+    for i in range(n_r):
+        c = tbl[i + 1, -1]
+        c.set_facecolor("#e8e8e8")
+        c.set_text_props(fontweight="bold")
+        c.set_edgecolor("#aaaaaa")
+
+    for i in range(n_r):
+        bg = "white" if i % 2 == 0 else "#f5f5f5"
+        for j in range(n_c - 1):
+            c = tbl[i + 1, j]
+            c.set_facecolor(bg)
+            c.set_edgecolor("#cccccc")
+
+    _save(fig, "fig0_contract_selection.png")
+
+
+# =============================================================================
+# FIG 1 -- ΔRev by model
+# =============================================================================
+
+def fig1_delta_by_model(df):
+    models = [m for m in MODELS if m in df["model"].unique()]
+    data   = [df[df["model"] == m]["delta_rev"].values for m in models]
+
+    fig, ax = plt.subplots(figsize=(8.5, 4.5))
+    _strip_axis(ax, [_model_label(m) for m in models], data,
+                ylabel="$\\Delta Rev$ (EUR/ha)",
+                xlabel="Forecast model")
+    plt.tight_layout()
+    _save(fig, "fig1_delta_by_model.png")
+
+
+# =============================================================================
+# FIG 2 -- ΔRev by region
+# =============================================================================
+
+def fig2_delta_by_region(df):
+    regions = sorted(df["region"].unique())
+    data    = [df[df["region"] == r]["delta_rev"].values for r in regions]
+    labels  = [REGION_LABELS.get(r, str(r)) for r in regions]
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    _strip_axis(ax, labels, data,
+                ylabel="$\\Delta Rev$ (EUR/ha)",
+                xlabel="NUTS-2 region")
+    plt.tight_layout()
+    _save(fig, "fig2_delta_by_region.png")
+
+
+# =============================================================================
+# FIG 2B -- ΔRev by year
+# =============================================================================
+
+def fig2b_delta_by_year(df):
+    years = sorted(df["oos_year"].unique())
+    data  = [df[df["oos_year"] == y]["delta_rev"].values for y in years]
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    _strip_axis(ax, [str(y) for y in years], data,
+                ylabel="$\\Delta Rev$ (EUR/ha)",
+                xlabel="OOS year",
+                jitter=0.08)
+    plt.tight_layout()
+    _save(fig, "fig2b_delta_by_year.png")
+
+
+# =============================================================================
+# FIG 3 -- Summary table
+# =============================================================================
+
+def fig3_summary_table():
+    if not SUMMARY_CSV.exists():
+        print(f"  [SKIP] {SUMMARY_CSV.name} not found")
+        return
+    df = pd.read_csv(SUMMARY_CSV)
+    models = [m for m in MODELS if m in df["model"].values]
+    df = df.set_index("model").reindex(models).reset_index()
+
+    col_labels = [
+        r"Mean $\Delta Rev$",
+        r"Median $\Delta Rev$",
+        r"Wilcoxon $p$",
+        "Hit rate (%)",
+        r"Mean $N^*$",
+        r"$HE_{sv}$ (%)",
+    ]
+
+    cell_data = []
+    for _, row in df.iterrows():
+        p     = row.get("wilcoxon_p", np.nan)
+        stars = _stars(p)
+        cell_data.append([
+            f"{row.get('mean_delta',   np.nan):+.2f}{stars}",
+            f"{row.get('median_delta', np.nan):+.2f}",
+            f"{p:.3f}" if not pd.isna(p) else "—",
+            f"{row.get('hit_rate', np.nan):.1f}",
+            f"{row.get('mean_N',   np.nan):.4f}",
+            f"{row.get('HE_sv',    np.nan):+.2f}",
+        ])
+
+    n_r = len(models)
+    n_c = len(col_labels)
+
+    fig, ax = plt.subplots(figsize=(13, 0.52 * n_r + 1.8))
+    ax.set_axis_off()
+
+    tbl = ax.table(cellText=cell_data, rowLabels=[_model_label(m) for m in models],
+                   colLabels=col_labels, loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9)
+    tbl.scale(1.0, 1.7)
+
+    for j in range(n_c):
+        c = tbl[0, j]
+        c.set_facecolor("black")
+        c.set_text_props(color="white", fontweight="bold")
+        c.set_edgecolor("white")
+
+    for i in range(n_r):
+        c = tbl[i + 1, -1]
+        c.set_facecolor("#e8e8e8")
+        c.set_text_props(fontweight="bold")
+        c.set_edgecolor("#aaaaaa")
+
+    for i in range(n_r):
+        bg = "white" if i % 2 == 0 else "#f5f5f5"
+        for j in range(n_c):
+            c = tbl[i + 1, j]
+            c.set_facecolor(bg)
+            c.set_edgecolor("#cccccc")
+
+    _save(fig, "fig3_summary_table.png")
+
+
+# =============================================================================
+# FIG 4 -- Robustness
+# =============================================================================
+
+def fig4_robustness(df):
+    """
+    Data-driven vs fixed agronomic windows.
+    Reads robustness_results.csv if saved by hedging_effectiveness.py.
+    Falls back to data-driven only if not available.
+    """
+    rows = [{
+        "label":      "Data-driven\n(45 candidates)",
+        "mean_delta": float(df["delta_rev"].mean()),
+        "hit_rate":   float(df["helped"].mean()) * 100,
+    }]
+
+    if ROB_CSV.exists():
+        rob = pd.read_csv(ROB_CSV)
+        short = {
+            "Fixed Mar-May CDD": "Fixed\nMar–May CDD",
+            "Fixed May-Jun CDD": "Fixed\nMay–Jun CDD",
+            "Fixed Apr-Jul CDD": "Fixed\nApr–Jul CDD",
+        }
+        for win, label in short.items():
+            sub = rob[rob["window"] == win] if "window" in rob.columns else pd.DataFrame()
+            if sub.empty:
+                continue
+            rows.append({
+                "label":      label,
+                "mean_delta": float(sub["delta_rev"].mean()),
+                "hit_rate":   float(sub["helped"].mean()) * 100,
+            })
+    else:
+        print("  [NOTE] robustness_results.csv not found -- showing data-driven only")
+
+    rob_df = pd.DataFrame(rows)
+
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4.5))
+    for ax, (col, ylabel) in zip(axes, [
+        ("mean_delta", "$\\Delta Rev$ (EUR/ha)"),
+        ("hit_rate",   "Hit rate (%)"),
+    ]):
+        vals = rob_df[col].values
+        bars = ax.bar(rob_df["label"], vals,
+                      color=GREY, edgecolor="black", linewidth=0.8, width=0.55)
+        for bar, v in zip(bars, vals):
+            if v < 0:
+                bar.set_hatch("////")
+        ax.axhline(0, color="black", lw=1.0, ls="--", alpha=0.6)
+        span = max(abs(vals.max()), abs(vals.min())) or 1.0
+        for bar, v in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    v + span * 0.03 * (1 if v >= 0 else -1),
+                    f"{v:+.2f}" if col == "mean_delta" else f"{v:.1f}%",
+                    ha="center", va="bottom" if v >= 0 else "top", fontsize=8.5)
+        ax.set_ylabel(ylabel)
+        ax.tick_params(axis="x", labelsize=8)
+
+    plt.tight_layout()
+    _save(fig, "fig4_robustness.png")
+
+
+# =============================================================================
+# FIG 5 -- N* by model
+# =============================================================================
+
+def fig5_nstar_by_model(df):
+    models = [m for m in MODELS if m in df["model"].unique()]
+    data   = [df[df["model"] == m]["N_star"].values for m in models]
+
+    fig, ax = plt.subplots(figsize=(8.5, 4.0))
+    _strip_axis(ax, [_model_label(m) for m in models], data,
+                ylabel="$N^*$ (contracts/ha)",
+                xlabel="Forecast model",
+                zero_line=False)
+    plt.tight_layout()
+    _save(fig, "fig5_nstar_by_model.png")
+
+
+# =============================================================================
+# FIG 6 -- Pooled histogram
+# =============================================================================
+
+def fig6_pooled_histogram(df):
+    from scipy.stats import gaussian_kde, wilcoxon, ttest_1samp
+
+    d        = df["delta_rev"].values
+    mean_d   = float(np.mean(d))
+    median_d = float(np.median(d))
+    d_nz     = d[d != 0]
+
+    try:
+        _, w_p = wilcoxon(d_nz, alternative="two-sided")
+    except Exception:
+        w_p = np.nan
+    _, t_p = ttest_1samp(d, 0.0)
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    ax.hist(d, bins=30, color=GREY, edgecolor="black",
+            linewidth=0.6, density=True, zorder=2)
+    x_grid = np.linspace(d.min() * 1.05, d.max() * 1.05, 400)
+    ax.plot(x_grid, gaussian_kde(d)(x_grid), color="black", lw=1.5,
+            zorder=3, label="Kernel density")
+    ax.axvline(0,        color="black", lw=1.2, ls="--", alpha=0.7,
+               label="Zero reference")
+    ax.axvline(mean_d,   color="black", lw=1.2, ls="-",  alpha=0.9,
+               label=f"Mean = {mean_d:+.2f}")
+    ax.axvline(median_d, color="black", lw=1.0, ls=":",  alpha=0.7,
+               label=f"Median = {median_d:+.2f}")
+
+    ax.text(0.97, 0.95,
+            f"$n$ = {len(d)}\n"
+            f"Mean = {mean_d:+.2f} EUR/ha\n"
+            f"Median = {median_d:+.2f} EUR/ha\n"
+            f"$t$-test: $p$ = {t_p:.3f} {_stars(t_p)}\n"
+            f"Wilcoxon: $p$ = {w_p:.3f} {_stars(w_p)}",
+            transform=ax.transAxes, ha="right", va="top", fontsize=8.5,
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
+                      edgecolor="black", linewidth=0.8))
+    ax.legend(loc="upper left", fontsize=8.5)
+    ax.set_xlabel("$\\Delta Rev$ (EUR/ha)")
+    ax.set_ylabel("Density")
+    _save(fig, "fig6_pooled_histogram.png")
+
+
+# =============================================================================
+# FIG 7 -- Regional breakdown
+# =============================================================================
+
+def fig7_regional_breakdown():
+    if not REGION_CSV.exists():
+        print(f"  [SKIP] {REGION_CSV.name} not found")
+        return
+    reg_df = pd.read_csv(REGION_CSV)
+    agg = reg_df.groupby("region").agg(
+        mean_delta=("mean_delta", "mean"),
+    ).reset_index()
+    agg["region_name"] = agg["region"].map(REGION_LABELS)
+    agg = agg.sort_values("mean_delta")
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    bars = ax.barh(agg["region_name"], agg["mean_delta"],
+                   color=GREY, edgecolor="black", linewidth=0.8, height=0.6)
+    for bar, v in zip(bars, agg["mean_delta"]):
+        if v < 0:
+            bar.set_hatch("////")
+    ax.axvline(0, color="black", lw=1.0, ls="--", alpha=0.7)
+    ax.set_xlabel("Mean $\\Delta Rev$ (EUR/ha)")
+    ax.tick_params(axis="y", labelsize=8.5)
+    plt.tight_layout()
+    _save(fig, "fig7_regional_breakdown.png")
+
+
+# =============================================================================
+# FIG 8 -- Year × model heatmap
+# =============================================================================
+
+def fig8_year_heatmap(df):
+    models = [m for m in MODELS if m in df["model"].unique()]
+    years  = sorted(df["oos_year"].unique())
+    matrix = np.full((len(models), len(years)), np.nan)
+    for i, m in enumerate(models):
+        for j, y in enumerate(years):
+            sub = df[(df["model"] == m) & (df["oos_year"] == y)]
+            if len(sub) > 0:
+                matrix[i, j] = sub["delta_rev"].mean()
+
+    vmax = np.nanmax(np.abs(matrix))
+    fig, ax = plt.subplots(figsize=(8, 4.2))
+    im = ax.imshow(matrix, aspect="auto", cmap="RdYlGn", vmin=-vmax, vmax=vmax)
+    for i in range(len(models)):
+        for j in range(len(years)):
+            v = matrix[i, j]
+            if not np.isnan(v):
+                tc = "black" if abs(v) < vmax * 0.6 else "white"
+                ax.text(j, i, f"{v:+.0f}", ha="center", va="center",
+                        fontsize=7.5, color=tc)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+    cbar.set_label("Mean $\\Delta Rev$ (EUR/ha)", fontsize=9)
+    cbar.ax.tick_params(labelsize=8)
+    ax.set_xticks(range(len(years)))
+    ax.set_xticklabels(years, fontsize=9)
+    ax.set_yticks(range(len(models)))
+    ax.set_yticklabels([_model_label(m) for m in models], fontsize=9)
+    ax.set_xlabel("OOS year")
+    ax.set_ylabel("Model")
+    ax.set_xticks(np.arange(-0.5, len(years),  1), minor=True)
+    ax.set_yticks(np.arange(-0.5, len(models), 1), minor=True)
+    ax.grid(which="minor", color="white", linewidth=1.5)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    _save(fig, "fig8_year_heatmap.png")
+
+
+# =============================================================================
+# TAB 1 -- Bare numbers table
+# =============================================================================
+
+def tab1_bare_numbers():
+    if not SUMMARY_CSV.exists():
+        print(f"  [SKIP] {SUMMARY_CSV.name} not found")
+        return
+    summary = pd.read_csv(SUMMARY_CSV)
+    models  = [m for m in MODELS if m in summary["model"].values]
+    summary = summary.set_index("model").reindex(models)
+
+    rows = []
+    for m in models:
+        r = summary.loc[m]
+        p = r.get("wilcoxon_p", np.nan)
+        rows.append([
+            _model_label(m),
+            f"{r.get('mean_delta', np.nan):+.2f}",
+            f"{p:.3f}{_stars(p)}" if not pd.isna(p) else "—",
+            f"{r.get('hit_rate', np.nan):.1f}",
+            f"{r.get('mean_N', np.nan):.4f}",
+            f"{r.get('HE_sv', np.nan):+.2f}",
+        ])
+
+    headers = ["Model",
+               r"Mean $\Delta Rev$ (EUR/ha)",
+               r"Wilcoxon $p$",
+               "Hit rate (%)",
+               r"$N^*$",
+               r"$HE_{sv}$ (%)"]
+
+    n_r = len(rows)
+    n_c = len(headers)
+
+    fig, ax = plt.subplots(figsize=(12, 0.42 * n_r + 0.9))
+    ax.set_axis_off()
+
+    tbl = ax.table(
+        cellText=[r[1:] for r in rows],
+        rowLabels=[r[0] for r in rows],
+        colLabels=headers[1:],
+        loc="center",
+        cellLoc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9.5)
+    tbl.scale(1.0, 1.6)
+
+    for j in range(n_c - 1):
+        c = tbl[0, j]
+        c.set_facecolor("white")
+        c.set_text_props(fontweight="bold")
+        c.set_edgecolor("white")
+        c.visible_edges = "B"
+
+    for i in range(n_r):
+        c = tbl[i + 1, -1]
+        c.set_facecolor("white")
+        c.set_text_props(fontweight="bold")
+        c.visible_edges = "open"
+
+    for i in range(n_r):
+        for j in range(n_c - 1):
+            c = tbl[i + 1, j]
+            c.set_facecolor("white")
+            c.set_edgecolor("white")
+            c.visible_edges = "open"
+
+    ax.plot([0, 1], [0.88, 0.88], color="black", linewidth=1.2, transform=ax.transAxes, clip_on=False)
+    ax.plot([0, 1], [0.12, 0.12], color="black", linewidth=0.8, transform=ax.transAxes, clip_on=False)
+    ax.text(0.0, 0.04,
+            r"Stars: * $p<0.10$,  ** $p<0.05$,  *** $p<0.01$ "
+            r"(Wilcoxon signed-rank, H$_0$: $\Delta Rev = 0$).  "
+            r"$n = 48$ per model (8 regions $\times$ 6 OOS years).",
+            transform=ax.transAxes, fontsize=8, va="top")
+
+    _save(fig, "tab1_bare_numbers.png")
+
+
+# =============================================================================
+# PRICING FIGURES
+# =============================================================================
+
+def _load_pricing():
+    if not PRICING_CSV.exists():
+        print(f"  [SKIP] {PRICING_CSV.name} not found")
+        return None
+    return pd.read_csv(PRICING_CSV).dropna(subset=["pricing_error"])
+
+
+def tab2_pricing_accuracy():
+    """
+    Three stripped-down tables:
+      - By model    (pooled across regions, years, indices, contracts, horizons)
+      - By region   (pooled across models, years, indices, contracts, horizons)
+      - By year     (pooled across models, regions, indices, contracts, horizons)
+    Each shows: N, Mean bias, MAE, RMSE.
+    Completely minimal styling -- top and bottom rules only.
+    """
+    pr = _load_pricing()
+    if pr is None:
+        return
+
+    pr = pr.dropna(subset=["pricing_error"])
+
+    def _stats(series):
+        e = series.values
+        return len(e), float(e.mean()), float(np.abs(e).mean()), float(np.sqrt((e**2).mean()))
+
+    def _make_table(fig, ax, rows, col_labels, row_labels, note):
+        n_r = len(rows)
+        n_c = len(col_labels)
+        ax.set_axis_off()
+        tbl = ax.table(
+            cellText=rows,
+            rowLabels=row_labels,
+            colLabels=col_labels,
+            loc="center",
+            cellLoc="center",
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(9.5)
+        tbl.scale(1.0, 1.6)
+
+        for j in range(n_c):
+            c = tbl[0, j]
+            c.set_facecolor("white")
+            c.set_text_props(fontweight="bold")
+            c.set_edgecolor("white")
+            c.visible_edges = "B"
+
+        for i in range(n_r):
+            c = tbl[i + 1, -1]
+            c.set_facecolor("white")
+            c.set_text_props(fontweight="bold")
+            c.visible_edges = "open"
+            for j in range(n_c):
+                d = tbl[i + 1, j]
+                d.set_facecolor("white")
+                d.set_edgecolor("white")
+                d.visible_edges = "open"
+
+        ax.plot([0, 1], [0.88, 0.88], color="black", linewidth=1.2, transform=ax.transAxes, clip_on=False)
+        ax.plot([0, 1], [0.10, 0.10], color="black", linewidth=0.8, transform=ax.transAxes, clip_on=False)
+        ax.text(0.0, 0.04, note, transform=ax.transAxes, fontsize=7.5, va="top")
+
+    # ── By model ──────────────────────────────────────────────────────────
+    models = [m for m in MODELS if m in pr["model"].unique()]
+    rows, rlabels = [], []
+    for m in models:
+        n, bias, mae, rmse = _stats(pr[pr["model"] == m]["pricing_error"])
+        rows.append([str(n), f"{bias:+.1f}", f"{mae:.1f}", f"{rmse:.1f}"])
+        rlabels.append(_model_label(m))
+
+    col_labels = ["N", "Bias (EUR)", "MAE (EUR)", "RMSE (EUR)"]
+    fig, ax = plt.subplots(figsize=(8, 0.42 * len(models) + 0.9))
+    _make_table(fig, ax, rows, col_labels, rlabels,
+                "Pooled across 8 regions × 6 years × 3 indices × 2 contracts × 2 horizons. "
+                "Bias = mean(model price − realised payoff).")
+    _save(fig, "tab2a_pricing_by_model.png")
+
+    # ── By region ─────────────────────────────────────────────────────────
+    regions = sorted(pr["region"].unique())
+    rows, rlabels = [], []
+    for r in regions:
+        n, bias, mae, rmse = _stats(pr[pr["region"] == r]["pricing_error"])
+        rows.append([str(n), f"{bias:+.1f}", f"{mae:.1f}", f"{rmse:.1f}"])
+        rlabels.append(REGION_LABELS.get(r, str(r)))
+
+    fig, ax = plt.subplots(figsize=(8, 0.42 * len(regions) + 0.9))
+    _make_table(fig, ax, rows, col_labels, rlabels,
+                "Pooled across 7 models × 6 years × 3 indices × 2 contracts × 2 horizons.")
+    _save(fig, "tab2b_pricing_by_region.png")
+
+    # ── By year ───────────────────────────────────────────────────────────
+    years = sorted(pr["year"].unique())
+    rows, rlabels = [], []
+    for y in years:
+        n, bias, mae, rmse = _stats(pr[pr["year"] == y]["pricing_error"])
+        rows.append([str(n), f"{bias:+.1f}", f"{mae:.1f}", f"{rmse:.1f}"])
+        rlabels.append(str(y))
+
+    fig, ax = plt.subplots(figsize=(8, 0.42 * len(years) + 0.9))
+    _make_table(fig, ax, rows, col_labels, rlabels,
+                "Pooled across 7 models × 8 regions × 3 indices × 2 contracts × 2 horizons.")
+    _save(fig, "tab2c_pricing_by_year.png")
+
+
+def figp1_error_by_model():
+    pr = _load_pricing()
+    if pr is None:
+        return
+    models  = [m for m in MODELS if m in pr["model"].unique()]
+    data     = [pr[pr["model"] == m]["pricing_error"].values for m in models]
+    horizons = [pr[pr["model"] == m]["horizon"].values for m in models]
+    fig, ax  = plt.subplots(figsize=(8.5, 4.5))
+    _strip_axis_horizon(ax, [_model_label(m) for m in models], data, horizons,
+                        ylabel="Pricing error (EUR)",
+                        xlabel="Forecast model")
+    plt.tight_layout()
+    _save(fig, "figp1_error_by_model.png")
+
+
+def figp2_price_vs_payoff():
+    pr = _load_pricing()
+    if pr is None:
+        return
+    pr = pr.dropna(subset=["model_price", "realised_payoff"])
+
+    # Colour by contract type — dark filled = call, open white = put
+    CONTRACT_STYLE = {
+        "call": dict(facecolors="#333333", edgecolors="#333333",
+                     alpha=0.65, s=18, linewidths=0),
+        "put":  dict(facecolors="white",   edgecolors="#333333",
+                     alpha=0.85, s=18, linewidths=0.7),
+    }
+
+    models = [m for m in MODELS if m in pr["model"].unique()]
+    n      = len(models)
+    ncols  = 4
+    nrows  = (n + ncols - 1) // ncols
+    vmin   = 0.0
+    vmax   = max(pr["model_price"].max(), pr["realised_payoff"].max()) * 1.05
+
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(4.2 * ncols, 4.0 * nrows),
+                             squeeze=False)
+
+    for i, model in enumerate(models):
+        ax  = axes[i // ncols][i % ncols]
+        sub = pr[pr["model"] == model]
+
+        # Plot puts first (behind) then calls (on top)
+        for ct in ["put", "call"]:
+            grp = sub[sub["contract"] == ct] if "contract" in sub.columns else sub
+            if grp.empty:
+                continue
+            ax.scatter(grp["realised_payoff"], grp["model_price"],
+                       marker="o", zorder=3,
+                       label=ct.capitalize(),
+                       **CONTRACT_STYLE[ct])
+
+        ax.plot([vmin, vmax], [vmin, vmax],
+                color="black", lw=1.0, ls="--", alpha=0.5, zorder=2)
+
+        bias = float((sub["model_price"] - sub["realised_payoff"]).mean())
+        mae  = float((sub["model_price"] - sub["realised_payoff"]).abs().mean())
+        ax.text(0.97, 0.05,
+                f"Bias={bias:+.1f}\nMAE={mae:.1f}",
+                transform=ax.transAxes, ha="right", va="bottom", fontsize=7.5,
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                          edgecolor="black", linewidth=0.6))
+        ax.text(0.03, 0.97, _model_label(model), transform=ax.transAxes,
+                ha="left", va="top", fontsize=9, fontweight="bold")
+        ax.set_xlim(vmin, vmax)
+        ax.set_ylim(vmin, vmax)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("Realised payoff (EUR)", fontsize=8)
+        ax.set_ylabel("Model price (EUR)" if i % ncols == 0 else "", fontsize=8)
+
+    for j in range(len(models), nrows * ncols):
+        axes[j // ncols][j % ncols].set_visible(False)
+
+    # Shared legend — call (filled) vs put (open)
+    from matplotlib.lines import Line2D
+    legend_handles = [
+        Line2D([0], [0], marker="o", color="w",
+               markerfacecolor="#333333", markeredgecolor="#333333",
+               markersize=6, label="Call"),
+        Line2D([0], [0], marker="o", color="w",
+               markerfacecolor="white", markeredgecolor="#333333",
+               markersize=6, markeredgewidth=0.7, label="Put"),
+        Line2D([0], [0], color="black", lw=1.0, ls="--",
+               alpha=0.5, label="Fair pricing line"),
+    ]
+    fig.legend(handles=legend_handles,
+               loc="lower center", ncol=3, fontsize=8.5,
+               frameon=True, edgecolor="black",
+               bbox_to_anchor=(0.5, -0.02))
+
+    plt.tight_layout()
+    plt.subplots_adjust(bottom=0.12)
+    _save(fig, "figp2_price_vs_payoff.png")
+
+
+def figp3_error_by_year():
+    pr = _load_pricing()
+    if pr is None:
+        return
+    years    = sorted(pr["year"].unique())
+    data     = [pr[pr["year"] == y]["pricing_error"].values for y in years]
+    horizons = [pr[pr["year"] == y]["horizon"].values for y in years]
+    fig, ax  = plt.subplots(figsize=(7, 4.5))
+    _strip_axis_horizon(ax, [str(y) for y in years], data, horizons,
+                        ylabel="Pricing error (EUR)",
+                        xlabel="OOS year",
+                        jitter=0.08)
+    plt.tight_layout()
+    _save(fig, "figp3_error_by_year.png")
+
+
+def figp4_error_by_index():
+    """
+    Strip plots of pricing error by index type, split by call and put.
+    Six groups: CDD call, CDD put, HDD call, HDD put, CAT call, CAT put.
+    """
+    pr = _load_pricing()
+    if pr is None:
+        return
+
+    indices = [i for i in ["CDD", "HDD", "CAT"] if i in pr["index"].unique()]
+    has_contract = "contract" in pr.columns
+
+    if has_contract:
+        groups  = []
+        data    = []
+        labels  = []
+        subsets = []
+        for idx in indices:
+            for ct in ["call", "put"]:
+                sub = pr[(pr["index"] == idx) & (pr["contract"] == ct)]
+                if sub.empty:
+                    continue
+                groups.append((idx, ct))
+                data.append(sub["pricing_error"].values)
+                labels.append(f"{idx}\n{ct.capitalize()}")
+                subsets.append(sub)
+    else:
+        groups  = [(i, "") for i in indices]
+        data    = [pr[pr["index"] == i]["pricing_error"].values for i in indices]
+        labels  = indices
+        subsets = [pr[pr["index"] == i] for i in indices]
+
+    fig, ax = plt.subplots(figsize=(max(5.5, 1.4 * len(labels)), 4.5))
+
+    for i, (vals, label, pr_sub) in enumerate(zip(data, labels, subsets), 1):
+        # Shade alternate index type backgrounds lightly
+        if has_contract:
+            idx_pos = (i - 1) // 2
+            if idx_pos % 2 == 0:
+                ax.axvspan(i - 0.5, i + 0.5, color="0.93", zorder=0)
+        hor = pr_sub["horizon"].values if has_contract else np.array(["H1"] * len(vals))
+        _strip_horizon(ax, i, vals, hor, jitter=0.08)
+
+    ax.axhline(0, color="black", lw=1.0, ls="--", alpha=0.6)
+    ax.set_xticks(range(1, len(labels) + 1))
+    ax.set_xticklabels(labels, fontsize=8.5)
+    ax.set_ylabel("Pricing error (EUR)")
+    ax.set_xlabel("Index type and contract")
+
+    from matplotlib.lines import Line2D
+    ax.legend(handles=[
+        Line2D([0], [0], marker="o", color="w", markerfacecolor=DOT_COLOR,
+               markersize=5, alpha=0.7, label="H1 (Jan–Mar)"),
+        Line2D([0], [0], marker="^", color="w", markerfacecolor=DOT_COLOR,
+               markersize=5, alpha=0.7, label="H2 (Apr–Jun)"),
+        Line2D([0], [0], marker="D", color="#cc0000", markerfacecolor="white",
+               markeredgecolor="black", markeredgewidth=1.2,
+               markersize=6, label="Mean ± 1 SD"),
+    ], loc="upper right", frameon=True, fontsize=8)
+
+    plt.tight_layout()
+    _save(fig, "figp4_error_by_index.png")
+
+
+def figp5_error_by_region():
+    pr = _load_pricing()
+    if pr is None:
+        return
+    regions  = sorted(pr["region"].unique())
+    data     = [pr[pr["region"] == r]["pricing_error"].values for r in regions]
+    horizons = [pr[pr["region"] == r]["horizon"].values for r in regions]
+    labels   = [REGION_LABELS.get(r, str(r)) for r in regions]
+    fig, ax  = plt.subplots(figsize=(9, 4.5))
+    _strip_axis_horizon(ax, labels, data, horizons,
+                        ylabel="Pricing error (EUR)",
+                        xlabel="NUTS-2 region")
+    plt.tight_layout()
+    _save(fig, "figp5_error_by_region.png")
+
+
+def tabp_pricing_accuracy():
+    """
+    Tables split by H1 / H2 for model, region, and year groupings.
+    Each table has three column pairs: Bias, MAE, RMSE for H1 then H2.
+    """
+    pr = _load_pricing()
+    if pr is None:
+        return
+    pr = pr.dropna(subset=["pricing_error"])
+
+    has_horizon = "horizon" in pr.columns
+
+    def _stats(grp):
+        e = grp["pricing_error"].values
+        if len(e) == 0:
+            return ["-", "-", "-"]
+        return [f"{float(np.mean(e)):+.1f}",
+                f"{float(np.mean(np.abs(e))):.1f}",
+                f"{float(np.sqrt(np.mean(e**2))):.1f}"]
+
+    def _stats_h(grp, h):
+        return _stats(grp[grp["horizon"] == h]) if has_horizon else _stats(grp)
+
+    col_labels = ["Bias H1", "MAE H1", "RMSE H1",
+                  "Bias H2", "MAE H2", "RMSE H2"]
+
+    def _draw_table(ax, rows, note=""):
+        n_r = len(rows)
+        n_c = len(col_labels)
+        ax.set_axis_off()
+        tbl = ax.table(
+            cellText=[r[1:] for r in rows],
+            rowLabels=[r[0] for r in rows],
+            colLabels=col_labels,
+            loc="center",
+            cellLoc="center",
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(9)
+        tbl.scale(1.0, 1.6)
+
+        for j in range(n_c):
+            c = tbl[0, j]
+            c.set_facecolor("white")
+            c.set_text_props(fontweight="bold")
+            c.set_edgecolor("white")
+            c.visible_edges = "B"
+
+        for i in range(n_r):
+            c = tbl[i + 1, -1]
+            c.set_facecolor("white")
+            c.set_text_props(fontweight="bold")
+            c.visible_edges = "open"
+
+        for i in range(n_r):
+            for j in range(n_c):
+                c = tbl[i + 1, j]
+                # Light shade H2 columns to visually separate horizons
+                if j >= 3:
+                    c.set_facecolor("#f5f5f5")
+                else:
+                    c.set_facecolor("white")
+                c.set_edgecolor("white")
+                c.visible_edges = "open"
+
+        ax.plot([0, 1], [0.88, 0.88], color="black", linewidth=1.2,
+                transform=ax.transAxes, clip_on=False)
+        ax.plot([0, 1], [0.08, 0.08], color="black", linewidth=0.8,
+                transform=ax.transAxes, clip_on=False)
+
+        if note:
+            ax.text(0.0, 0.02, note, transform=ax.transAxes,
+                    fontsize=7.5, va="top")
+
+    note = ("Pricing error = model price minus realised payoff (EUR). "
+            "H1 = Jan–Mar (DOY 1–90); H2 = Apr–Jun (DOY 91–181). "
+            "Pooled across all indices and contract types.")
+
+    # --- by model ---
+    models = [m for m in MODELS if m in pr["model"].unique()]
+    m_rows = [[_model_label(m)] + _stats_h(pr[pr["model"] == m], "H1")
+                   + _stats_h(pr[pr["model"] == m], "H2")
+              for m in models]
+    fig1, ax1 = plt.subplots(figsize=(11, 0.42 * len(m_rows) + 0.8))
+    _draw_table(ax1, m_rows)
+    _save(fig1, "tabp1_pricing_by_model.png")
+
+    # --- by region ---
+    regions = sorted(pr["region"].unique())
+    r_rows = [[REGION_LABELS.get(r, str(r))]
+              + _stats_h(pr[pr["region"] == r], "H1")
+              + _stats_h(pr[pr["region"] == r], "H2")
+              for r in regions]
+    fig2, ax2 = plt.subplots(figsize=(11, 0.42 * len(r_rows) + 0.8))
+    _draw_table(ax2, r_rows)
+    _save(fig2, "tabp2_pricing_by_region.png")
+
+    # --- by year ---
+    years = sorted(pr["year"].unique())
+    y_rows = [[str(y)]
+              + _stats_h(pr[pr["year"] == y], "H1")
+              + _stats_h(pr[pr["year"] == y], "H2")
+              for y in years]
+    fig3, ax3 = plt.subplots(figsize=(11, 0.42 * len(y_rows) + 0.8))
+    _draw_table(ax3, y_rows, note=note)
+    _save(fig3, "tabp3_pricing_by_year.png")
+
+
+def tabhe_effectiveness():
+    """
+    Three minimal tables for hedging effectiveness results:
+      - By model   (pooled across 8 regions × 6 years)
+      - By region  (pooled across 7 models × 6 years)
+      - By year    (pooled across 7 models × 8 regions)
+    Columns: Mean ΔRev, Hit rate, HE_sv.
+    """
+    if not RAW_CSV.exists():
+        print(f"  [SKIP] {RAW_CSV.name} not found")
+        return
+    df = pd.read_csv(RAW_CSV)
+
+    def _stats(grp):
+        d    = grp["delta_rev"].values
+        hit  = grp["helped"].values
+        he_sv_vals = []
+        for _, rg in grp.groupby("region"):
+            tgt  = float(np.mean(rg["act_rev_u"].values))
+            sv_u = float(np.mean(np.minimum(rg["act_rev_u"].values - tgt, 0.0) ** 2))
+            sv_h = float(np.mean(np.minimum(rg["act_rev_h"].values - tgt, 0.0) ** 2))
+            if sv_u > 1e-8:
+                he_sv_vals.append(1 - sv_h / sv_u)
+        he_sv = f"{float(np.mean(he_sv_vals))*100:+.1f}%" if he_sv_vals else "-"
+        return [
+            f"{float(np.mean(d)):+.1f}",
+            f"{float(np.mean(hit))*100:.1f}%",
+            he_sv,
+        ]
+
+    col_labels = [r"Mean $\Delta Rev$ (EUR/ha)", "Hit rate", r"$HE_{sv}$"]
+    col_labels_model = [r"Mean $\Delta Rev$ (EUR/ha)", "Wilcoxon $p$",
+                        "Hit rate", r"$HE_{sv}$"]
+
+    def _draw_table(ax, rows, cols, note=""):
+        n_r = len(rows)
+        n_c = len(cols)
+        ax.set_axis_off()
+        tbl = ax.table(
+            cellText=[r[1:] for r in rows],
+            rowLabels=[r[0] for r in rows],
+            colLabels=cols,
+            loc="center",
+            cellLoc="center",
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(9)
+        tbl.scale(1.0, 1.6)
+
+        for j in range(n_c):
+            c = tbl[0, j]
+            c.set_facecolor("white")
+            c.set_text_props(fontweight="bold")
+            c.set_edgecolor("white")
+            c.visible_edges = "B"
+
+        for i in range(n_r):
+            c = tbl[i + 1, -1]
+            c.set_facecolor("white")
+            c.set_text_props(fontweight="bold")
+            c.visible_edges = "open"
+
+        for i in range(n_r):
+            for j in range(n_c):
+                c = tbl[i + 1, j]
+                c.set_facecolor("white")
+                c.set_edgecolor("white")
+                c.visible_edges = "open"
+
+        ax.plot([0, 1], [0.88, 0.88], color="black", linewidth=1.2,
+                transform=ax.transAxes, clip_on=False)
+        ax.plot([0, 1], [0.08, 0.08], color="black", linewidth=0.8,
+                transform=ax.transAxes, clip_on=False)
+
+        if note:
+            ax.text(0.0, 0.02, note, transform=ax.transAxes,
+                    fontsize=7.5, va="top")
+
+    note = (r"$\Delta Rev$ = realised hedged minus unhedged revenue (EUR/ha). "
+            "Hit rate = share of years where hedging improved revenue. "
+            r"$HE_{var}$ and $HE_{sv}$: variance and semivariance reduction, "
+            "computed per region then averaged.")
+
+    # --- by model ---
+    summary = pd.read_csv(SUMMARY_CSV).set_index("model") \
+              if SUMMARY_CSV.exists() else None
+
+    models = [m for m in MODELS if m in df["model"].unique()]
+    m_rows = []
+    for m in models:
+        s = _stats(df[df["model"] == m])
+        if summary is not None and m in summary.index:
+            p   = summary.loc[m, "wilcoxon_p"]
+            t_p = summary.loc[m, "t_pval"] if "t_pval" in summary.columns else np.nan
+            p_str = f"{p:.3f}{_stars(p)}" if not pd.isna(p) else "—"
+        else:
+            p_str = "—"
+        # Insert p-value after Mean ΔRev
+        m_rows.append([_model_label(m), s[0], p_str, s[1], s[2]])
+
+    fig1, ax1 = plt.subplots(figsize=(11, 0.42 * len(m_rows) + 0.8))
+    _draw_table(ax1, m_rows, col_labels_model)
+    _save(fig1, "tabhe1_by_model.png")
+
+    # --- by region ---
+    regions = sorted(df["region"].unique())
+    r_rows  = [[REGION_LABELS.get(r, str(r))] + _stats(df[df["region"] == r])
+               for r in regions]
+    fig2, ax2 = plt.subplots(figsize=(10, 0.42 * len(r_rows) + 0.8))
+    _draw_table(ax2, r_rows, col_labels)
+    _save(fig2, "tabhe2_by_region.png")
+
+    # --- by year ---
+    years  = sorted(df["oos_year"].unique())
+    y_rows = [[str(y)] + _stats(df[df["oos_year"] == y]) for y in years]
+    fig3, ax3 = plt.subplots(figsize=(10, 0.42 * len(y_rows) + 0.8))
+    _draw_table(ax3, y_rows, col_labels, note=note)
+    _save(fig3, "tabhe3_by_year.png")
+
+
+def fig_basis_risk():
+    """
+    Two outputs using the in-sample calibration period (2000-2018) only,
+    matching the data on which the yield model and contract were selected.
+
+    fig_basis_risk_bars.png   -- Adjusted R² per region (horizontal bar)
+    fig_basis_risk_scatter.png -- Scatter of detrended yield vs accumulated
+                                  index per region with fitted quadratic curve
+
+    Adjusted R² formula: 1 - (1 - R²) * (n-1) / (n-k-1)
+    Quadratic model has k=2 regressors (I and I²), so df_resid = n-3.
+    """
+    if not RAW_CSV.exists():
+        print(f"  [SKIP] {RAW_CSV.name} not found")
+        return
+
+    YIELD_CSV_PATH = ROOT / "EDA" / \
+        "ble_tendre_hiver_yield_2000_2024_regions_mainland.csv"
+    TEMP_CSV_PATH  = ROOT / "EDA" / "region_avg.csv"
+
+    if not YIELD_CSV_PATH.exists() or not TEMP_CSV_PATH.exists():
+        print("  [SKIP] Raw yield or temperature CSV not found")
+        return
+
+    CALIB_END = 2024    # full sample
+    YIELD_T0  = 2000
+
+    # Load yield
+    yld = pd.read_csv(YIELD_CSV_PATH)
+    yld.columns = [c.strip().lower() for c in yld.columns]
+    rcol = next(c for c in ["reg", "region_code", "region"] if c in yld.columns)
+    ycol = next(c for c in ["yield", "yield_t_ha", "rendement"] if c in yld.columns)
+    tcol = next(c for c in ["year", "annee"] if c in yld.columns)
+    yld  = yld.rename(columns={rcol: "region", ycol: "yield_t_ha", tcol: "year"})
+    yld["year"]       = yld["year"].astype(int)
+    yld["yield_t_ha"] = yld["yield_t_ha"].astype(float)
+    if yld["yield_t_ha"].median() > 20:
+        yld["yield_t_ha"] /= 10.0
+
+    # Load temperature
+    tmp = pd.read_csv(TEMP_CSV_PATH, parse_dates=["date"])
+    tmp.columns = tmp.columns.str.lower().str.strip()
+    rcol2 = next(c for c in ["region_code", "region", "reg"] if c in tmp.columns)
+    tcol2 = next(c for c in ["daily_avg_temperature", "temp", "temperature"]
+                 if c in tmp.columns)
+    tmp   = tmp.rename(columns={rcol2: "region", tcol2: "T"})
+    tmp   = tmp[~((tmp["date"].dt.month == 2) & (tmp["date"].dt.day == 29))].copy()
+    tmp["year"] = tmp["date"].dt.year
+
+    def _doy(ts):
+        d = ts.timetuple().tm_yday
+        if ts.is_leap_year and ts.month > 2:
+            d -= 1
+        return d
+    tmp["doy"] = tmp["date"].apply(lambda d: _doy(pd.Timestamp(d)))
+
+    def _acc_index(tmp_r, s, e, idx_type, base=10.0):
+        win = tmp_r[(tmp_r["doy"] >= s) & (tmp_r["doy"] <= e)].copy()
+        if idx_type == "CDD":
+            win["idx"] = np.maximum(win["T"] - base, 0.0)
+        elif idx_type == "HDD":
+            win["idx"] = np.maximum(base - win["T"], 0.0)
+        else:
+            win["idx"] = win["T"]
+        return win.groupby("year")["idx"].sum()
+
+    MONTH_WINDOWS = {
+        "Mar": (60, 90), "Apr": (91, 120), "May": (121, 151),
+        "Jun": (152, 181), "Jul": (182, 212),
+    }
+    def _label_to_doy(label):
+        parts = label.split("-")
+        s = MONTH_WINDOWS[parts[0].strip()][0]
+        e = MONTH_WINDOWS[parts[-1].strip()][1]
+        return s, e
+
+    df_raw = pd.read_csv(RAW_CSV)
+    contract_info = df_raw.groupby("region").agg(
+        best_index=("best_index", lambda x: x.mode().iloc[0]),
+        win_label=("win_label",   lambda x: x.mode().iloc[0]),
+    ).reset_index()
+
+    results = []
+
+    for _, row in contract_info.iterrows():
+        region   = int(row["region"])
+        idx_type = row["best_index"]
+        win_lbl  = row["win_label"]
+        try:
+            s, e = _label_to_doy(win_lbl)
+        except Exception:
+            continue
+
+        # Calibration period only
+        yld_r = yld[yld["region"] == region][["year", "yield_t_ha"]].dropna()
+        yld_r = yld_r[(yld_r["year"] >= 2000) & (yld_r["year"] <= CALIB_END)]
+        tmp_r = tmp[tmp["region"] == region]
+
+        if len(yld_r) < 6:
+            continue
+
+        # Additive detrend on calibration data
+        y_vals = yld_r["yield_t_ha"].values
+        t_vals = (yld_r["year"].values - YIELD_T0).astype(float)
+        X_tr   = np.column_stack([np.ones(len(y_vals)), t_vals])
+        coefs_tr, _, _, _ = np.linalg.lstsq(X_tr, y_vals, rcond=None)
+        y_bar     = float(np.mean(y_vals))
+        y_detrend = y_vals - X_tr @ coefs_tr + y_bar
+
+        # Accumulated index — calibration years only
+        idx_series = _acc_index(tmp_r, s, e, idx_type)
+        idx_series = idx_series[(idx_series.index >= 2000) &
+                                (idx_series.index <= CALIB_END)]
+
+        merged = pd.DataFrame({
+            "year":  yld_r["year"].values,
+            "y_det": y_detrend,
+        }).merge(idx_series.reset_index().rename(columns={"idx": "index"}),
+                 on="year", how="inner").dropna()
+
+        if len(merged) < 5:
+            continue
+
+        y = merged["y_det"].values
+        I = merged["index"].values
+        n = len(y)
+        k = 2   # I and I² — two regressors
+
+        # Fit quadratic
+        Xq = np.column_stack([np.ones(n), I, I**2])
+        c, _, _, _ = np.linalg.lstsq(Xq, y, rcond=None)
+        y_hat  = Xq @ c
+        ss_res = float(np.sum((y - y_hat)**2))
+        ss_tot = float(np.sum((y - np.mean(y))**2))
+        r2     = max(0.0, 1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+        # Adjusted R²
+        adj_r2 = 1 - (1 - r2) * (n - 1) / (n - k - 1) if n > k + 1 else r2
+
+        results.append({
+            "region":      region,
+            "region_name": REGION_LABELS.get(region, str(region)),
+            "adj_r2":      adj_r2,
+            "y_det":       y,
+            "index":       I,
+            "idx_type":    idx_type,
+            "win_lbl":     win_lbl,
+            "coefs":       c,
+            "n":           n,
+        })
+
+    if not results:
+        print("  [SKIP] No results computed")
+        return
+
+    # ── Fig A: Adjusted R² bar chart ─────────────────────────────────────
+    df_r2 = pd.DataFrame([{k: v for k, v in r.items()
+                           if k not in ("y_det", "index", "coefs")}
+                          for r in results]).sort_values("adj_r2")
+
+    fig1, ax = plt.subplots(figsize=(7, 5))
+    bars = ax.barh(df_r2["region_name"], df_r2["adj_r2"],
+                   color=GREY, edgecolor="black", linewidth=0.8, height=0.6)
+    for bar, v in zip(bars, df_r2["adj_r2"]):
+        ax.text(v + 0.003, bar.get_y() + bar.get_height() / 2,
+                f"{v:.3f}", va="center", ha="left", fontsize=8.5)
+    ax.set_xlabel(r"Adjusted $R^2$ (quadratic yield-temperature model, 2000–2024)")
+    ax.set_xlim(0, min(df_r2["adj_r2"].max() * 1.3, 1.0))
+    ax.tick_params(axis="y", labelsize=8.5)
+    ax.axvline(df_r2["adj_r2"].mean(), color="black", lw=1.0, ls="--", alpha=0.6,
+               label=f"Mean adj. $R^2$ = {df_r2['adj_r2'].mean():.3f}")
+    ax.legend(fontsize=8.5, loc="lower right")
+    plt.tight_layout()
+    _save(fig1, "fig_basis_risk_bars.png")
+
+    # ── Fig B: Scatter plots per region ──────────────────────────────────
+    n_reg  = len(results)
+    ncols  = 4
+    nrows  = (n_reg + ncols - 1) // ncols
+    fig2, axes = plt.subplots(nrows, ncols,
+                              figsize=(4.0 * ncols, 3.8 * nrows),
+                              squeeze=False)
+
+    for i, r in enumerate(sorted(results, key=lambda x: x["region"])):
+        ax  = axes[i // ncols][i % ncols]
+        y   = r["y_det"]
+        I   = r["index"]
+        c   = r["coefs"]
+
+        ax.scatter(I, y, s=22, color=DOT_COLOR, alpha=0.75,
+                   linewidths=0, zorder=3)
+
+        I_grid = np.linspace(I.min(), I.max(), 200)
+        y_fit  = c[0] + c[1] * I_grid + c[2] * I_grid**2
+        ax.plot(I_grid, y_fit, color="black", lw=1.4, zorder=4)
+
+        ax.text(0.97, 0.97,
+                f"adj. $R^2$ = {r['adj_r2']:.3f}",
+                transform=ax.transAxes, ha="right", va="top", fontsize=8.5,
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                          edgecolor="black", linewidth=0.6))
+        ax.text(0.03, 0.03,
+                f"{r['idx_type']} {r['win_lbl']}",
+                transform=ax.transAxes, ha="left", va="bottom",
+                fontsize=7.5, fontstyle="italic")
+
+        ax.set_title(r["region_name"], fontsize=9)
+        ax.set_xlabel(f"Accumulated {r['idx_type']}", fontsize=8)
+        ax.set_ylabel("Detrended yield (t/ha)", fontsize=8)
+
+    for j in range(n_reg, nrows * ncols):
+        axes[j // ncols][j % ncols].set_visible(False)
+
+    plt.tight_layout()
+    _save(fig2, "fig_basis_risk_scatter.png")
+    if not RAW_CSV.exists():
+        print(f"  [SKIP] {RAW_CSV.name} not found")
+        return
+
+    YIELD_CSV_PATH = ROOT / "EDA" / \
+        "ble_tendre_hiver_yield_2000_2024_regions_mainland.csv"
+    TEMP_CSV_PATH  = ROOT / "EDA" / "region_avg.csv"
+
+    if not YIELD_CSV_PATH.exists() or not TEMP_CSV_PATH.exists():
+        print("  [SKIP] Raw yield or temperature CSV not found")
+        return
+
+    import warnings
+
+    # Load yield
+    yld = pd.read_csv(YIELD_CSV_PATH)
+    yld.columns = [c.strip().lower() for c in yld.columns]
+    rcol = next(c for c in ["reg", "region_code", "region"] if c in yld.columns)
+    ycol = next(c for c in ["yield", "yield_t_ha", "rendement"] if c in yld.columns)
+    tcol = next(c for c in ["year", "annee"] if c in yld.columns)
+    yld  = yld.rename(columns={rcol: "region", ycol: "yield_t_ha", tcol: "year"})
+    yld["year"]       = yld["year"].astype(int)
+    yld["yield_t_ha"] = yld["yield_t_ha"].astype(float)
+    if yld["yield_t_ha"].median() > 20:
+        yld["yield_t_ha"] /= 10.0
+
+    # Load temperature
+    tmp = pd.read_csv(TEMP_CSV_PATH, parse_dates=["date"])
+    tmp.columns = tmp.columns.str.lower().str.strip()
+    rcol2 = next(c for c in ["region_code", "region", "reg"] if c in tmp.columns)
+    tcol2 = next(c for c in ["daily_avg_temperature", "temp", "temperature"]
+                 if c in tmp.columns)
+    tmp   = tmp.rename(columns={rcol2: "region", tcol2: "T"})
+    tmp   = tmp[~((tmp["date"].dt.month == 2) & (tmp["date"].dt.day == 29))].copy()
+    tmp["year"] = tmp["date"].dt.year
+
+    def _doy(ts):
+        d = ts.timetuple().tm_yday
+        if ts.is_leap_year and ts.month > 2:
+            d -= 1
+        return d
+    tmp["doy"] = tmp["date"].apply(lambda d: _doy(pd.Timestamp(d)))
+
+    def _acc_index(tmp_r, s, e, idx_type, base=10.0):
+        win = tmp_r[(tmp_r["doy"] >= s) & (tmp_r["doy"] <= e)].copy()
+        if idx_type == "CDD":
+            win["idx"] = np.maximum(win["T"] - base, 0.0)
+        elif idx_type == "HDD":
+            win["idx"] = np.maximum(base - win["T"], 0.0)
+        else:
+            win["idx"] = win["T"]
+        return win.groupby("year")["idx"].sum()
+
+    MONTH_WINDOWS = {
+        "Mar": (60, 90), "Apr": (91, 120), "May": (121, 151),
+        "Jun": (152, 181), "Jul": (182, 212),
+    }
+    def _label_to_doy(label):
+        parts = label.split("-")
+        s = MONTH_WINDOWS[parts[0].strip()][0]
+        e = MONTH_WINDOWS[parts[-1].strip()][1]
+        return s, e
+
+    df_raw = pd.read_csv(RAW_CSV)
+    contract_info = df_raw.groupby("region").agg(
+        best_index=("best_index", lambda x: x.mode().iloc[0]),
+        win_label=("win_label",   lambda x: x.mode().iloc[0]),
+        instrument=("instrument", lambda x: x.mode().iloc[0]),
+    ).reset_index()
+
+    YIELD_T0 = 2000
+    results  = []
+
+    for _, row in contract_info.iterrows():
+        region   = int(row["region"])
+        idx_type = row["best_index"]
+        win_lbl  = row["win_label"]
+        try:
+            s, e = _label_to_doy(win_lbl)
+        except Exception:
+            continue
+
+        yld_r = yld[yld["region"] == region][["year", "yield_t_ha"]].dropna()
+        yld_r = yld_r[(yld_r["year"] >= 2000) & (yld_r["year"] <= 2024)]
+        tmp_r = tmp[tmp["region"] == region]
+
+        y_vals = yld_r["yield_t_ha"].values
+        t_vals = (yld_r["year"].values - YIELD_T0).astype(float)
+        X_trend = np.column_stack([np.ones(len(y_vals)), t_vals])
+        coefs, _, _, _ = np.linalg.lstsq(X_trend, y_vals, rcond=None)
+        y_bar     = float(np.mean(y_vals))
+        y_detrend = y_vals - X_trend @ coefs + y_bar
+
+        idx_series = _acc_index(tmp_r, s, e, idx_type)
+        idx_series = idx_series[(idx_series.index >= 2000) &
+                                (idx_series.index <= 2024)]
+
+        merged = pd.DataFrame({
+            "year":  yld_r["year"].values,
+            "y_det": y_detrend,
+        }).merge(idx_series.reset_index().rename(columns={"idx": "index"}),
+                 on="year", how="inner").dropna()
+
+        if len(merged) < 5:
+            continue
+
+        y = merged["y_det"].values
+        I = merged["index"].values
+
+        Xq = np.column_stack([np.ones(len(y)), I, I**2])
+        c, _, _, _ = np.linalg.lstsq(Xq, y, rcond=None)
+        y_hat  = Xq @ c
+        ss_res = float(np.sum((y - y_hat)**2))
+        ss_tot = float(np.sum((y - np.mean(y))**2))
+        r2     = max(0.0, 1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+        results.append({
+            "region":      region,
+            "region_name": REGION_LABELS.get(region, str(region)),
+            "r2":          r2,
+            "y_det":       y,
+            "index":       I,
+            "idx_type":    idx_type,
+            "win_lbl":     win_lbl,
+            "coefs":       c,
+            "instrument":  row["instrument"],
+        })
+
+    if not results:
+        print("  [SKIP] No data computed for basis risk figure")
+        return
+
+    # ── Fig A: R² bar chart ───────────────────────────────────────────────
+    df_r2 = pd.DataFrame([{k: v for k, v in r.items()
+                           if k not in ("y_det", "index", "coefs")}
+                          for r in results]).sort_values("r2")
+
+    fig1, ax = plt.subplots(figsize=(7, 5))
+    bars = ax.barh(df_r2["region_name"], df_r2["r2"],
+                   color=GREY, edgecolor="black", linewidth=0.8, height=0.6)
+    for bar, v in zip(bars, df_r2["r2"]):
+        ax.text(v + 0.005, bar.get_y() + bar.get_height() / 2,
+                f"{v:.3f}", va="center", ha="left", fontsize=8.5)
+    ax.set_xlabel("$R^2$ (quadratic yield-temperature model, 2000–2024)")
+    ax.set_xlim(0, min(df_r2["r2"].max() * 1.3, 1.0))
+    ax.tick_params(axis="y", labelsize=8.5)
+    ax.axvline(df_r2["r2"].mean(), color="black", lw=1.0, ls="--", alpha=0.6,
+               label=f"Mean $R^2$ = {df_r2['r2'].mean():.3f}")
+    ax.legend(fontsize=8.5, loc="lower right")
+    plt.tight_layout()
+    _save(fig1, "fig_basis_risk_bars.png")
+
+    # ── Fig B: scatter plots per region ──────────────────────────────────
+    n      = len(results)
+    ncols  = 4
+    nrows  = (n + ncols - 1) // ncols
+    fig2, axes = plt.subplots(nrows, ncols,
+                              figsize=(4.0 * ncols, 3.8 * nrows),
+                              squeeze=False)
+
+    results_sorted = sorted(results, key=lambda x: x["region"])
+
+    for i, r in enumerate(results_sorted):
+        ax  = axes[i // ncols][i % ncols]
+        y   = r["y_det"]
+        I   = r["index"]
+        c   = r["coefs"]
+
+        ax.scatter(I, y, s=22, color=DOT_COLOR, alpha=0.7,
+                   linewidths=0, zorder=3)
+
+        # Fitted quadratic curve
+        I_grid = np.linspace(I.min(), I.max(), 200)
+        y_fit  = c[0] + c[1] * I_grid + c[2] * I_grid**2
+        ax.plot(I_grid, y_fit, color="black", lw=1.4, zorder=4)
+
+        ax.text(0.97, 0.97,
+                f"$R^2$ = {r['r2']:.3f}",
+                transform=ax.transAxes, ha="right", va="top",
+                fontsize=8.5,
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                          edgecolor="black", linewidth=0.6))
+
+        ax.text(0.03, 0.03,
+                f"{r['idx_type']} {r['win_lbl']}",
+                transform=ax.transAxes, ha="left", va="bottom",
+                fontsize=7.5, fontstyle="italic")
+
+        ax.set_title(r["region_name"], fontsize=9)
+        ax.set_xlabel(f"Accumulated {r['idx_type']}", fontsize=8)
+        ax.set_ylabel("Detrended yield (t/ha)", fontsize=8)
+
+    for j in range(len(results_sorted), nrows * ncols):
+        axes[j // ncols][j % ncols].set_visible(False)
+
+    plt.tight_layout()
+    _save(fig2, "fig_basis_risk_scatter.png")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  Thesis Figures")
+    print(f"  Output: {HEDGING_PLOT_DIR}  |  {PRICING_PLOT_DIR}")
+    print("=" * 60)
+
+    if RAW_CSV.exists():
+        df = pd.read_csv(RAW_CSV)
+        print(f"\n  {len(df)} obs  |  {df['model'].nunique()} models  |  "
+              f"{df['region'].nunique()} regions  |  {df['oos_year'].nunique()} years\n")
+    else:
+        df = None
+        print(f"\n  [SKIP] {RAW_CSV.name} not found -- RAW-dependent figures will be skipped\n")
+
+    def _skip_if_no_raw(fn):
+        def _wrapped():
+            if df is None:
+                print(f"[SKIP] {RAW_CSV.name} not found")
+                return
+            return fn(df)
+        return _wrapped
+
+    tasks = [
+        ("Fig 0  — Contract selection",       _skip_if_no_raw(fig0_contract_selection)),
+        ("Fig 1  — ΔRev by model",            _skip_if_no_raw(fig1_delta_by_model)),
+        ("Fig 2  — ΔRev by region",           _skip_if_no_raw(fig2_delta_by_region)),
+        ("Fig 2b — ΔRev by year",             _skip_if_no_raw(fig2b_delta_by_year)),
+        ("Fig 3  — Summary table",            fig3_summary_table),
+        ("Fig 4  — Robustness",               _skip_if_no_raw(fig4_robustness)),
+        ("Fig 5  — N* by model",              _skip_if_no_raw(fig5_nstar_by_model)),
+        ("Fig 6  — Pooled histogram",         _skip_if_no_raw(fig6_pooled_histogram)),
+        ("Fig 7  — Regional breakdown",       fig7_regional_breakdown),
+        ("Fig 8  — Year heatmap",             _skip_if_no_raw(fig8_year_heatmap)),
+        ("Tab 1  — Bare numbers",             tab1_bare_numbers),
+        ("Fig BR — Basis risk (R² and rho)",  fig_basis_risk),
+        ("Tab HE — HE tables by group",       tabhe_effectiveness),
+        ("Tab 2  — Pricing accuracy tables",   tab2_pricing_accuracy),
+        ("Fig P1 — Pricing error by model",   figp1_error_by_model),
+        ("Fig P2 — Price vs payoff",          figp2_price_vs_payoff),
+        ("Fig P3 — Pricing error by year",    figp3_error_by_year),
+        ("Fig P4 — Pricing error by index",   figp4_error_by_index),
+        ("Fig P5 — Pricing error by region",  figp5_error_by_region),
+        ("Tab P  — Pricing accuracy tables",  tabp_pricing_accuracy),
+    ]
+
+    for name, fn in tasks:
+        print(f"  {name} ...", end=" ", flush=True)
+        try:
+            fn()
+        except Exception as e:
+            print(f"\n  [ERROR] {name}: {e}")
+
+    print(f"\n  Hedging figures -> {HEDGING_PLOT_DIR}")
+    print(f"  Pricing figures -> {PRICING_PLOT_DIR}")
+    print("=" * 60)

@@ -1,0 +1,505 @@
+"""
+comprehensive_diagnostics.py
+----------------------------
+A single, comprehensive diagnostic report on bk_forecasts.csv covering:
+
+  Part 1: Per-model bias and error magnitude (identifies broken models)
+  Part 2: AR(1) structure of residuals (is there an exploitable signal?)
+  Part 3: Cross-segment pooled ACF vs horizon (horizon diffusion vs bug)
+  Part 4: Within-pool ACF decay profile (informs block length choice)
+  Part 5: Verdict on block bootstrap approach per model
+
+All results written to a consolidated CSV + PNG plots.
+
+Runs against existing bk_forecasts.csv -- does not regenerate any forecasts.
+
+Usage:
+    python comprehensive_diagnostics.py
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+ROOT          = Path(__file__).resolve().parents[1]
+SCRIPT_DIR    = Path(__file__).resolve().parent
+FORECASTS_CSV = ROOT / "04_Analysis" / "01_Forecast Accuracy" / "bk_forecasts.csv"
+OUT_DIR       = SCRIPT_DIR / "outputs"
+REGIONS       = [11, 24, 27, 28, 32, 44, 52, 53]
+
+MAX_HORIZON_ACF   = 30
+MAX_LAG_WITHIN    = 30
+MIN_PAIRS_FOR_ACF = 30
+MIN_POOL_SIZE     = 200
+
+
+# =============================================================================
+# SHARED UTILITIES
+# =============================================================================
+
+def load_all_forecasts(csv_path: str):
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Forecasts CSV not found: {csv_path}")
+    df = pd.read_csv(csv_path, parse_dates=["date"])
+    df.columns = df.columns.str.lower().str.strip()
+    df = df.sort_values(["model", "region", "date"]).reset_index(drop=True)
+    df["residual"] = df["actual"] - df["forecast"]
+    df["predict_year"] = df["date"].dt.year
+    df["month"] = df["date"].dt.month
+    feb29 = (df["date"].dt.month == 2) & (df["date"].dt.day == 29)
+    if feb29.sum() > 0:
+        df = df[~feb29].copy()
+    df = df.sort_values(["model", "region", "predict_year", "date"])
+    df["horizon"] = (
+        df.groupby(["model", "region", "predict_year"]).cumcount() + 1
+    )
+    return df
+
+
+def lag1_acf(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if len(x) < 20:
+        return np.nan
+    xc = x - x.mean()
+    var = np.mean(xc ** 2)
+    return float(np.mean(xc[:-1] * xc[1:]) / var) if var > 0 else 0.0
+
+
+def fit_ar1(x: np.ndarray) -> dict:
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if len(x) < 30:
+        return None
+    y = x[1:]
+    lag_x = x[:-1]
+    xm = lag_x.mean()
+    ym = y.mean()
+    var_x = np.mean((lag_x - xm) ** 2)
+    if var_x <= 0:
+        return None
+    phi = np.mean((lag_x - xm) * (y - ym)) / var_x
+    c = ym - phi * xm
+    eta = y - (c + phi * lag_x)
+    ss_tot = np.sum((y - ym) ** 2)
+    ss_res = np.sum(eta ** 2)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    var_red = 1.0 - np.var(eta) / np.var(x) if np.var(x) > 0 else np.nan
+    return {"phi": float(phi), "r2": float(r2),
+            "acf_innovation": lag1_acf(eta),
+            "var_reduction": float(var_red)}
+
+
+def print_section(title):
+    line = "=" * 78
+    print(f"\n{line}\n  {title}\n{line}")
+
+
+# =============================================================================
+# PART 1: BIAS AND ERROR MAGNITUDE
+# =============================================================================
+
+def part1_bias_errors(df: pd.DataFrame) -> pd.DataFrame:
+    print_section("PART 1 -- BIAS AND ERROR MAGNITUDE PER MODEL")
+
+    summary = (
+        df.groupby("model")
+          .agg(mean_residual=("residual", "mean"),
+               median_residual=("residual", "median"),
+               std_residual=("residual", "std"),
+               mae=("residual", lambda s: np.abs(s).mean()),
+               rmse=("residual", lambda s: np.sqrt((s ** 2).mean())),
+               n_obs=("residual", "count"))
+          .round(3)
+    )
+    print()
+    print(summary.to_string())
+
+    # Horizon-1 bias check (broken model signature)
+    h1 = df[df["horizon"] == 1]
+    h1_summary = (
+        h1.groupby("model")
+          .agg(h1_mean_resid=("residual", "mean"),
+               h1_abs_mean=("residual", lambda s: np.abs(s).mean()),
+               h1_std=("residual", "std"))
+          .round(3)
+    )
+    print("\n  First-day (horizon=1) residual summary:")
+    print(h1_summary.to_string())
+
+    print("""
+  Reading:
+    - |mean_residual| > 2 degC at h=1  -> severe systematic bias (broken model)
+    - |mean_residual| < 0.5 degC       -> reasonable unbiased forecast
+    - MAE > 5 degC                     -> model is producing near-climatological
+                                          or worse output
+""")
+
+    combined = summary.join(h1_summary)
+    return combined
+
+
+# =============================================================================
+# PART 2: AR(1) STRUCTURE
+# =============================================================================
+
+def part2_ar1_structure(df: pd.DataFrame) -> pd.DataFrame:
+    print_section("PART 2 -- AR(1) STRUCTURE OF RESIDUALS PER MODEL")
+
+    rows = []
+    for model in sorted(df["model"].unique().tolist()):
+        sub = df[df["model"] == model]
+        model_rows = []
+        for (region, year), seg in sub.groupby(["region", "predict_year"]):
+            res = seg.sort_values("date")["residual"].values
+            fit = fit_ar1(res)
+            if fit is not None:
+                model_rows.append({
+                    "model": model, "region": region, "year": year,
+                    **fit, "acf_residual": lag1_acf(res)
+                })
+        rows.extend(model_rows)
+
+    ar1_df = pd.DataFrame(rows)
+    if ar1_df.empty:
+        print("  No AR(1) fits possible.")
+        return ar1_df
+
+    summary = (
+        ar1_df.groupby("model")
+              .agg(phi=("phi", "median"),
+                   r2=("r2", "median"),
+                   acf_residual=("acf_residual", "median"),
+                   acf_innovation=("acf_innovation", "median"),
+                   var_reduction=("var_reduction", "median"))
+              .round(4)
+    )
+    print()
+    print(summary.to_string())
+    print("""
+  Reading:
+    - phi ~0.79, R^2 ~0.62, var_reduction ~62%: residuals are AR(1)-dominated.
+      This is consistent with long-horizon forecasts decaying to climatology
+      and residuals retaining the natural persistence of daily temperature
+      anomalies. Not a bug by itself.
+    - acf_innovation close to zero confirms AR(1) is the right model.
+""")
+    return ar1_df
+
+
+# =============================================================================
+# PART 3: POOLED ACF VS HORIZON
+# =============================================================================
+
+def part3_horizon_acf(df: pd.DataFrame) -> pd.DataFrame:
+    print_section("PART 3 -- POOLED LAG-1 ACF VS FORECAST HORIZON")
+
+    rows = []
+    for model in sorted(df["model"].unique().tolist()):
+        sub = df[df["model"] == model]
+        for h in range(1, MAX_HORIZON_ACF + 1):
+            a = sub[sub["horizon"] == h][["region", "predict_year", "residual"]] \
+                    .rename(columns={"residual": "r_h"})
+            b = sub[sub["horizon"] == h + 1][
+                    ["region", "predict_year", "residual"]
+                ].rename(columns={"residual": "r_h1"})
+            merged = a.merge(b, on=["region", "predict_year"], how="inner")
+            merged = merged[np.isfinite(merged["r_h"])
+                            & np.isfinite(merged["r_h1"])]
+            if len(merged) < MIN_PAIRS_FOR_ACF:
+                rows.append({"model": model, "horizon": h, "n": len(merged),
+                             "acf": np.nan})
+                continue
+            corr = np.corrcoef(merged["r_h"], merged["r_h1"])[0, 1]
+            rows.append({"model": model, "horizon": h,
+                         "n": len(merged), "acf": float(corr)})
+
+    h_df = pd.DataFrame(rows)
+    pivot = h_df.pivot(index="model", columns="horizon", values="acf")
+    show = [1, 2, 3, 5, 7, 10, 14, 21, 30]
+    print()
+    print(pivot[show].round(3).to_string())
+
+    print("""
+  Reading (per model):
+    ACF(h=1) LOW (<0.4) and rising with horizon     -> H1: horizon diffusion,
+                                                         model works fine at
+                                                         short horizon
+    ACF(h=1) HIGH (>0.7) and flat across horizons   -> H2: model is producing
+                                                         climatology-like output
+                                                         regardless of horizon
+                                                         (bug or by design)
+""")
+
+    # Verdict per model
+    print("  Verdict table:")
+    print(f"  {'Model':<16} {'ACF(h=1)':>10} {'ACF(h=30)':>11} "
+          f"{'Delta':>8}  {'Interpretation'}")
+    print("  " + "-" * 76)
+    verdicts = {}
+    for model in sorted(df["model"].unique().tolist()):
+        a1 = pivot.loc[model, 1] if 1 in pivot.columns else np.nan
+        a30 = pivot.loc[model, 30] if 30 in pivot.columns else np.nan
+        delta = a30 - a1 if np.isfinite(a1) and np.isfinite(a30) else np.nan
+        if not np.isfinite(a1) or not np.isfinite(a30):
+            v = "INSUFFICIENT DATA"
+        elif a1 < 0.4 and a30 > 0.6:
+            v = "H1 -- horizon diffusion (healthy)"
+        elif a1 > 0.7 and (not np.isfinite(delta) or delta < 0.15):
+            v = "H2 -- climatology-producing (bug or by design)"
+        elif a1 < 0.35:
+            v = "Short-horizon clean, modest long-horizon ACF"
+        else:
+            v = "Mixed / transitional"
+        verdicts[model] = v
+        print(f"  {model:<16} {a1:>10.3f} {a30:>11.3f} "
+              f"{delta:>+8.3f}  {v}")
+
+    return h_df, verdicts
+
+
+# =============================================================================
+# PART 4: WITHIN-POOL ACF DECAY (informs block length)
+# =============================================================================
+
+def part4_within_pool_acf(df: pd.DataFrame) -> pd.DataFrame:
+    print_section("PART 4 -- WITHIN-POOL ACF DECAY (block length informant)")
+
+    rows = []
+    # Use predict_year == max_year residuals to form large pool
+    max_year = df["predict_year"].max()
+    for model in sorted(df["model"].unique().tolist()):
+        sub = df[(df["model"] == model) & (df["predict_year"] <= max_year)]
+        # Pool residuals per region (chronological)
+        for region, seg in sub.groupby("region"):
+            res = seg.sort_values("date")["residual"].values
+            res = res[np.isfinite(res)]
+            if len(res) < MIN_POOL_SIZE:
+                continue
+            rc = res - res.mean()
+            var = np.mean(rc ** 2)
+            if var <= 0:
+                continue
+            for lag in range(1, MAX_LAG_WITHIN + 1):
+                if lag >= len(rc):
+                    break
+                cov = np.mean(rc[:-lag] * rc[lag:])
+                rows.append({
+                    "model": model, "region": region,
+                    "lag": lag, "acf": float(cov / var)
+                })
+
+    wp = pd.DataFrame(rows)
+    if wp.empty:
+        print("  No pools large enough.")
+        return wp
+
+    med = wp.groupby(["model", "lag"])["acf"].median().reset_index()
+    pivot = med.pivot(index="model", columns="lag", values="acf")
+    show = [1, 2, 3, 5, 7, 10, 14, 21, 30]
+    print()
+    print(pivot[show].round(3).to_string())
+
+    # First lag where median ACF drops below 2/sqrt(n) ~ 0.04 for n=2500
+    threshold = 0.05
+    print(f"\n  First lag where median ACF < {threshold}:")
+    first_insig = {}
+    for model in pivot.index:
+        row = pivot.loc[model]
+        first = next((lag for lag in row.index if abs(row[lag]) < threshold),
+                     None)
+        first_insig[model] = first
+        print(f"    {model:<16} : {first}")
+
+    return wp, first_insig
+
+
+# =============================================================================
+# PART 5: BLOCK BOOTSTRAP RECOMMENDATION
+# =============================================================================
+
+def part5_recommendation(bias_summary, verdicts, first_insig):
+    print_section("PART 5 -- BLOCK BOOTSTRAP RECOMMENDATION PER MODEL")
+
+    print(f"\n  {'Model':<16} {'h=1 bias':>10} {'H1/H2':>8} "
+          f"{'ACF<.05':>8}  {'Recommendation'}")
+    print("  " + "-" * 76)
+
+    for model in sorted(verdicts.keys()):
+        h1_bias = bias_summary.loc[model, "h1_mean_resid"] \
+            if model in bias_summary.index else np.nan
+        verdict = verdicts.get(model, "?")
+        tag = "H1" if "H1" in verdict else ("H2" if "H2" in verdict else "--")
+        fi = first_insig.get(model, None)
+        fi_str = str(fi) if fi else "none"
+
+        # Recommendation logic
+        if not np.isfinite(h1_bias):
+            rec = "MISSING DATA"
+        elif abs(h1_bias) > 3.0:
+            rec = "MODEL BROKEN -- exclude or fix before bootstrapping"
+        elif tag == "H2":
+            rec = (
+                "Climatology-like output; bootstrap is still valid for "
+                "paths but model forecast skill is ~climatology"
+            )
+        elif fi and fi <= 10:
+            rec = (
+                f"Marchand-style month-adaptive OK; "
+                f"ACF decays within {fi}d"
+            )
+        elif fi and fi <= 20:
+            rec = (
+                "Marchand-style month-adaptive OK (conservative given "
+                f"{fi}-day decorrelation)"
+            )
+        else:
+            rec = (
+                "Consider longer-than-month blocks or "
+                "AR(1)-prewhitened bootstrap"
+            )
+
+        print(f"  {model:<16} {h1_bias:>+10.2f} {tag:>8} "
+              f"{fi_str:>8}  {rec}")
+
+    print("""
+
+  Overall guidance on block-bootstrap methodology:
+
+  1. The Marchand-style month-adaptive block bootstrap (see generate_paths.py)
+     produces mean block lengths of ~12 days, which sits between the true
+     decorrelation time of the models' residuals and the structural cap of
+     31 days imposed by calendar months.
+
+  2. This is statistically conservative for most models (blocks extend
+     slightly beyond the point where ACF is significant) but preserves the
+     seasonal stratification that matters for weather-derivative pricing
+     across annual cumulative indices (CAT, HDD, CDD).
+
+  3. The alternative -- fitting AR(1) to residuals and bootstrapping
+     innovations -- would be tighter but relies on the AR(1) functional form
+     being correct, which the diagnostics above suggest is a reasonable but
+     not perfect approximation (acf_innovation ~0.14 is non-zero residual
+     structure beyond AR(1)).
+
+  4. For models flagged as H2 or with severe h=1 bias, the block bootstrap
+     output is only as good as the underlying forecast. A climatology-
+     producing model will yield climatology-scattered paths, which is
+     statistically valid but not informative.
+
+""")
+
+
+# =============================================================================
+# PLOTS
+# =============================================================================
+
+def plot_horizon_acf(h_df: pd.DataFrame, out_png: str):
+    fig, ax = plt.subplots(figsize=(11, 6))
+    colors = plt.get_cmap("tab10")
+    for i, model in enumerate(sorted(h_df["model"].unique().tolist())):
+        sub = h_df[h_df["model"] == model].sort_values("horizon")
+        ax.plot(sub["horizon"], sub["acf"], marker="o", ms=4,
+                label=model, color=colors(i % 10), lw=1.5)
+    ax.axhline(0.79, ls="--", color="#666", lw=1,
+               label="full-pool median (~0.79)")
+    ax.axhline(0, ls=":", color="#999", lw=0.8)
+    ax.set_xlabel("Forecast horizon (day within predict year)")
+    ax.set_ylabel("Pooled lag-1 residual ACF")
+    ax.set_title("Residual lag-1 ACF vs forecast horizon (cross-segment pooled)")
+    ax.set_xlim(0, MAX_HORIZON_ACF + 1)
+    ax.set_ylim(-0.1, 1.0)
+    ax.grid(alpha=0.3)
+    ax.legend(loc="lower right", fontsize=9)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def plot_within_pool_acf(wp: pd.DataFrame, out_png: str):
+    if wp.empty:
+        return
+    med = wp.groupby(["model", "lag"])["acf"].median().reset_index()
+    fig, ax = plt.subplots(figsize=(11, 6))
+    colors = plt.get_cmap("tab10")
+    for i, model in enumerate(sorted(med["model"].unique().tolist())):
+        sub = med[med["model"] == model].sort_values("lag")
+        ax.plot(sub["lag"], sub["acf"], marker="o", ms=4,
+                label=model, color=colors(i % 10), lw=1.5)
+    ax.axhline(0.05, ls="--", color="#666", lw=1,
+               label="approx white-noise band")
+    ax.axhline(0, ls=":", color="#999", lw=0.8)
+    ax.set_xlabel("Lag (days)")
+    ax.set_ylabel("Median within-pool ACF (across regions)")
+    ax.set_title("Within-pool residual autocorrelation decay per model")
+    ax.set_xlim(0, MAX_LAG_WITHIN + 1)
+    ax.set_ylim(-0.1, 1.0)
+    ax.grid(alpha=0.3)
+    ax.legend(loc="upper right", fontsize=9)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    print("#" * 78)
+    print("#  COMPREHENSIVE DIAGNOSTICS -- bk_forecasts.csv")
+    print(f"#  Source: {FORECASTS_CSV}")
+    print("#" * 78)
+
+    df = load_all_forecasts(FORECASTS_CSV)
+    print(f"\n  Rows loaded       : {len(df):,}")
+    print(f"  Models            : {sorted(df['model'].unique().tolist())}")
+    print(f"  Regions           : {sorted(df['region'].unique().tolist())}")
+    print(f"  Predict years     : {sorted(df['predict_year'].unique().tolist())}")
+
+    # Run all parts
+    bias_summary = part1_bias_errors(df)
+    ar1_df       = part2_ar1_structure(df)
+    h_df, verdicts = part3_horizon_acf(df)
+    wp, first_insig = part4_within_pool_acf(df)
+    part5_recommendation(bias_summary, verdicts, first_insig)
+
+    # Persist outputs
+    bias_summary.to_csv(os.path.join(OUT_DIR, "diag_1_bias.csv"))
+    if not ar1_df.empty:
+        ar1_df.to_csv(os.path.join(OUT_DIR, "diag_2_ar1.csv"), index=False)
+    h_df.to_csv(os.path.join(OUT_DIR, "diag_3_horizon_acf.csv"), index=False)
+    if not wp.empty:
+        wp.to_csv(os.path.join(OUT_DIR, "diag_4_within_pool_acf.csv"),
+                  index=False)
+
+    # Plots
+    plot_horizon_acf(h_df, os.path.join(OUT_DIR, "diag_horizon_acf.png"))
+    if not wp.empty:
+        plot_within_pool_acf(
+            wp, os.path.join(OUT_DIR, "diag_within_pool_acf.png"))
+
+    print_section("OUTPUTS WRITTEN")
+    print(f"""
+  CSVs:
+    {os.path.join(OUT_DIR, 'diag_1_bias.csv')}
+    {os.path.join(OUT_DIR, 'diag_2_ar1.csv')}
+    {os.path.join(OUT_DIR, 'diag_3_horizon_acf.csv')}
+    {os.path.join(OUT_DIR, 'diag_4_within_pool_acf.csv')}
+  Plots:
+    {os.path.join(OUT_DIR, 'diag_horizon_acf.png')}
+    {os.path.join(OUT_DIR, 'diag_within_pool_acf.png')}
+""")
+
+
+if __name__ == "__main__":
+    main()

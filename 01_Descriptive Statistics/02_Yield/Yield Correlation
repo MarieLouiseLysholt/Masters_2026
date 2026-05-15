@@ -1,0 +1,117 @@
+"""
+Correlation matrix of annual winter wheat yield across NUTS-2 regions
+Generates both CSV and PNG for thesis insertion
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+from pathlib import Path
+
+mpl.rcParams['font.family'] = 'serif'
+
+# ── Config ────────────────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
+THESIS_GRAPH_DIR = ROOT / "04_Thesis Graphs"
+THESIS_GRAPH_DIR.mkdir(parents=True, exist_ok=True)
+DATA_PATH = ROOT / "02_Data" / "02_Wheat" / "ble_tendre_hiver_yield_2000_2024_regions_mainland.csv"
+OUT_CSV   = SCRIPT_DIR / "yield_correlation.csv"
+OUT_PNG   = THESIS_GRAPH_DIR / "yield_correlation.png"
+
+REGION_NAMES = {
+    11: "Île-de-France",
+    24: "Centre-Val de Loire",
+    27: "Bourgogne-Franche-Comté",
+    28: "Normandie",
+    32: "Hauts-de-France",
+    44: "Grand Est",
+    52: "Pays de la Loire",
+    53: "Bretagne",
+}
+
+# Short labels for column headers
+SHORT_NAMES = {
+    "Île-de-France":           "Île",
+    "Centre-Val de Loire":     "Centre",
+    "Bourgogne-Franche-Comté": "Bourgogne",
+    "Normandie":               "Normandie",
+    "Hauts-de-France":         "Hauts",
+    "Grand Est":               "Grand Est",
+    "Pays de la Loire":        "Pays",
+    "Bretagne":                "Bretagne",
+}
+
+# ── Load and pivot ────────────────────────────────────────────────────────────
+df = pd.read_csv(DATA_PATH)
+df = df[df["reg"].isin(REGION_NAMES.keys())].copy()
+df["region_name"] = df["reg"].map(REGION_NAMES)
+
+pivot = (
+    df.pivot(index="year", columns="region_name", values="yield")
+    .reindex(columns=list(REGION_NAMES.values()))
+)
+
+# ── Correlation matrix ────────────────────────────────────────────────────────
+corr = pivot.corr()
+corr.round(3).to_csv(OUT_CSV)
+
+# ── PNG table ─────────────────────────────────────────────────────────────────
+regions   = list(corr.columns)
+short     = [SHORT_NAMES[r] for r in regions]
+n         = len(regions)
+
+name_w  = 1.9
+cell_w  = 0.88
+fig_w   = name_w + cell_w * n
+row_h_i = 0.30
+fig_h   = row_h_i * (n + 1) + 0.15
+
+fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+ax.axis("off")
+
+row_h = 1.0 / (n + 1.5)
+
+# Column x positions
+col_widths = [name_w] + [cell_w] * n
+col_xs = []
+x = 0.0
+for w in col_widths:
+    col_xs.append(x / fig_w)
+    x += w
+col_xs.append(1.0)
+
+def row_y(i):
+    return 1.0 - (i + 0.5) * row_h
+
+# Three horizontal rules
+ax.axhline(1.0 - 0.08 * row_h, color="black", linewidth=1.0)
+ax.axhline(row_y(0) - 0.5 * row_h, color="black", linewidth=0.6)
+ax.axhline(row_y(n) - 0.5 * row_h, color="black", linewidth=1.0)
+
+# Header row
+ax.text(col_xs[0] + 0.01, row_y(0), "Region",
+        ha="left", va="center", fontsize=8.5, fontweight="bold",
+        transform=ax.transAxes)
+for j, s in enumerate(short):
+    x_pos = (col_xs[j+1] + col_xs[j+2]) / 2
+    ax.text(x_pos, row_y(0), s, ha="center", va="center",
+            fontsize=8.5, fontweight="bold", transform=ax.transAxes)
+
+# Data rows
+for i, region in enumerate(regions):
+    y_pos = row_y(i + 1)
+    ax.text(col_xs[0] + 0.01, y_pos, region,
+            ha="left", va="center", fontsize=8.5, transform=ax.transAxes)
+    for j, other in enumerate(regions):
+        val = corr.loc[region, other]
+        x_pos = (col_xs[j+1] + col_xs[j+2]) / 2
+        ax.text(x_pos, y_pos, f"{val:.3f}",
+                ha="center", va="center", fontsize=8.5,
+                transform=ax.transAxes)
+
+plt.tight_layout(pad=0.1)
+plt.savefig(OUT_PNG, dpi=220, bbox_inches="tight", facecolor="white")
+print(f"Saved PNG to: {OUT_PNG}")
+print(f"Saved CSV to: {OUT_CSV}")
